@@ -20,7 +20,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::peer::{Peer, PeerV1, PeerV2};
 
-pub const MAGIC: Magic = Magic::BITCOIN;
+pub(crate) const MAGIC: Magic = Magic::BITCOIN;
 const USER_AGENT: &str = "/p2p-observer:0.1.0/";
 
 /// Initial wait before the first reconnect attempt after a failure.
@@ -41,27 +41,10 @@ pub async fn connect_with_retry(addr: &str) {
 async fn retry_loop(addr: &str) {
     let mut backoff = BACKOFF_BASE;
     let mut attempts = 0u32;
-    // Once a peer has successfully spoken v2, we no longer fall back to v1 on subsequent
-    // reconnects. A peer is very unlikely to downgrade from v2 to v1 mid-session, and
-    // skipping the fallback avoids wasting a connection attempt on a protocol the peer
-    // has already proven it doesn't need.
     let mut skip_v1_fallback = false;
 
     loop {
-        let result = if skip_v1_fallback {
-            connect_v2(addr).await
-        } else {
-            match connect_v2(addr).await {
-                ok @ Ok(_) => {
-                    skip_v1_fallback = true;
-                    ok
-                }
-                Err(e) => {
-                    tracing::warn!("v2 failed ({e}), trying v1");
-                    connect_v1(addr).await
-                }
-            }
-        };
+        let result = try_connect(addr, &mut skip_v1_fallback).await;
 
         attempts += 1;
         backoff *= 2;
@@ -92,6 +75,26 @@ async fn retry_loop(addr: &str) {
         }
 
         sleep(backoff).await;
+    }
+}
+
+/// Attempts a v2 connection, falling back to v1 on failure.
+/// Once v2 has succeeded once, `skip_v1_fallback` is set and v1 is never tried again —
+/// a peer is very unlikely to downgrade, and skipping the fallback avoids wasting an
+/// attempt on a protocol the peer has already proven it doesn't need.
+async fn try_connect(addr: &str, skip_v1_fallback: &mut bool) -> Result<Instant> {
+    if *skip_v1_fallback {
+        return connect_v2(addr).await;
+    }
+    match connect_v2(addr).await {
+        ok @ Ok(_) => {
+            *skip_v1_fallback = true;
+            ok
+        }
+        Err(e) => {
+            tracing::warn!("v2 failed ({e}), trying v1");
+            connect_v1(addr).await
+        }
     }
 }
 
@@ -199,10 +202,10 @@ fn build_version() -> NetworkMessage {
             ServiceFlags::NONE,
         ),
         // Since we don't accept inbound connections, we don't have to fear about
-        // connecting to ourself. The peer likely won't use zero to a open connection
+        // connecting to ourself. The peer likely won't use zero to open a connection
         // at the same time, so this should be fine.
         nonce: 0,
-        user_agent: UserAgent::from_nonstandard(&USER_AGENT.to_string()),
+        user_agent: UserAgent::from_nonstandard(USER_AGENT),
         start_height: 0,
         relay: false,
     })
