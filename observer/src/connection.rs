@@ -272,13 +272,13 @@ fn handle_cmpct_block(cmpct: common::p2p::message_compact_blocks::CmpctBlock) {
 }
 
 async fn handle_ping(peer: &mut impl Peer, nonce: u64) -> Result<()> {
-    tracing::debug!(nonce, "ping -> pong");
+    tracing::trace!(nonce, "received ping");
     peer.send(NetworkMessage::Pong(nonce)).await
 }
 
 fn handle_pong(nonce: u64) {
     let rtt_ms = unix_ms().saturating_sub(nonce);
-    tracing::info!(rtt_ms, "pong");
+    tracing::debug!(rtt_ms, "pong");
 }
 
 fn unix_ms() -> u64 {
