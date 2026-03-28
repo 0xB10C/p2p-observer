@@ -7,9 +7,10 @@ use common::{
         message_network::{self, UserAgent},
     },
     tokio::{
+        self,
         io::BufReader,
         net::TcpStream,
-        time::{Duration, sleep},
+        time::{Duration, interval, sleep},
     },
     tracing,
     tracing::Instrument,
@@ -29,6 +30,9 @@ const BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// How many consecutive failed connection attempts to make before giving up.
 /// With BACKOFF_BASE doubling each attempt: 1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s.
 const MAX_RECONNECT_ATTEMPTS: u32 = 8;
+
+/// How often to send a ping to measure round-trip time.
+const PING_INTERVAL: Duration = Duration::from_secs(10);
 
 static PEER_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -172,15 +176,50 @@ async fn version_handshake(peer: &mut impl Peer) -> Result<()> {
 }
 
 async fn message_loop(peer: &mut impl Peer) -> Result<()> {
+    let mut ping_timer = interval(PING_INTERVAL);
+    ping_timer.tick().await; // skip the immediate first tick
+
+    // Note: peer.recv() is not cancel-safe — if the ping timer fires while a read_exact
+    // is mid-header, the partial bytes are lost. In practice this is rare and the worst
+    // outcome is a parse error and reconnect, which is acceptable for an observer.
     loop {
-        match peer.recv().await? {
-            NetworkMessage::Ping(nonce) => {
-                tracing::debug!(nonce, "ping -> pong");
-                peer.send(NetworkMessage::Pong(nonce)).await?;
-            }
-            other => tracing::trace!("received: {:?}", other),
+        tokio::select! {
+            _ = ping_timer.tick() => send_ping(peer).await?,
+            msg = peer.recv() => handle_message(peer, msg?).await?,
         }
     }
+}
+
+async fn send_ping(peer: &mut impl Peer) -> Result<()> {
+    let nonce = unix_ms();
+    tracing::debug!(ts_ms = nonce, "sending ping");
+    peer.send(NetworkMessage::Ping(nonce)).await
+}
+
+async fn handle_message(peer: &mut impl Peer, msg: NetworkMessage) -> Result<()> {
+    match msg {
+        NetworkMessage::Ping(nonce) => handle_ping(peer, nonce).await?,
+        NetworkMessage::Pong(nonce) => handle_pong(nonce),
+        other => tracing::trace!("received: {:?}", other),
+    }
+    Ok(())
+}
+
+async fn handle_ping(peer: &mut impl Peer, nonce: u64) -> Result<()> {
+    tracing::debug!(nonce, "ping -> pong");
+    peer.send(NetworkMessage::Pong(nonce)).await
+}
+
+fn handle_pong(nonce: u64) {
+    let rtt_ms = unix_ms().saturating_sub(nonce);
+    tracing::info!(rtt_ms, "pong");
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn build_version() -> NetworkMessage {
