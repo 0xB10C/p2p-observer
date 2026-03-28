@@ -10,15 +10,17 @@ async fn main() {
         .with_max_level(tracing::Level::DEBUG)
         .init();
 
-    let peers = ["95.217.75.216:8333"];
+    let peers = [
+        "95.217.75.216:8333",
+        "37.205.15.108:8333",
+        "95.217.75.216:8333",
+    ];
 
     let handles: Vec<_> = peers
         .iter()
         .map(|&addr| {
             tokio::spawn(async move {
-                if let Err(e) = connection::connect(addr).await {
-                    tracing::error!(addr, "connection failed: {e:#}");
-                }
+                connection::connect_with_retry(addr).await;
             })
         })
         .collect();
