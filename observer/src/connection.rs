@@ -46,7 +46,7 @@ static PEER_ID: AtomicU64 = AtomicU64::new(0);
 
 pub async fn connect_with_retry(addr: &str) {
     let id = PEER_ID.fetch_add(1, Ordering::Relaxed);
-    let span = tracing::info_span!("peer", id, addr);
+    let span = tracing::info_span!("c", id, addr);
     retry_loop(addr).instrument(span).await
 }
 
@@ -71,18 +71,23 @@ async fn retry_loop(addr: &str) {
                     backoff = BACKOFF_BASE;
                     attempts = 0;
                 }
-                tracing::warn!("connection lost after {uptime:.1?}, reconnecting in {backoff:.1?}");
+                tracing::trace!(
+                    uptime = format!("{:?}", uptime),
+                    "connection lost. reconnecting in {backoff:.1?}"
+                );
             }
             Err(e) => {
-                tracing::warn!(
+                tracing::trace!(
                     attempts,
-                    "failed to connect ({e:#}), retrying in {backoff:.1?}"
+                    backoff_ms = backoff.as_millis(),
+                    error = format!("{:?}", e),
+                    "failed to connect, retrying.."
                 );
             }
         }
 
         if attempts >= MAX_RECONNECT_ATTEMPTS {
-            tracing::error!("giving up after {attempts} attempts");
+            tracing::info!(attempts, "giving up");
             return;
         }
 
@@ -104,7 +109,7 @@ async fn try_connect(addr: &str, skip_v1_fallback: &mut bool) -> Result<Instant>
             ok
         }
         Err(e) => {
-            tracing::warn!("v2 failed ({e}), trying v1");
+            tracing::trace!("v2 failed ({e}), trying v1");
             connect_v1(addr, MAGIC).await
         }
     }
@@ -112,7 +117,7 @@ async fn try_connect(addr: &str, skip_v1_fallback: &mut bool) -> Result<Instant>
 
 /// Returns the `Instant` at which the version handshake completed, once the connection drops.
 async fn connect_v2(addr: &str, magic: Magic) -> Result<Instant> {
-    tracing::info!("connecting (v2) ...");
+    tracing::trace!("connecting (v2) ...");
     let stream = TcpStream::connect(addr).await.context("TCP connect")?;
     let (reader, writer) = stream.into_split();
     let proto = Protocol::new(
@@ -126,11 +131,12 @@ async fn connect_v2(addr: &str, magic: Magic) -> Result<Instant> {
     .await?;
     let mut peer = PeerV2 { proto };
 
-    version_handshake(&mut peer).await?;
+    let version = version_handshake(&mut peer).await?;
     let connected_at = Instant::now();
+    let conn_span = tracing::info_span!("", v = 2, ua = %version.user_agent);
 
-    tracing::info!("v2 connection established");
-    if let Err(e) = message_loop(&mut peer).await {
+    tracing::trace!("v2 connection established");
+    if let Err(e) = message_loop(&mut peer).instrument(conn_span).await {
         tracing::debug!("v2 connection error: {e}");
     }
     Ok(connected_at)
@@ -138,7 +144,7 @@ async fn connect_v2(addr: &str, magic: Magic) -> Result<Instant> {
 
 /// Returns the `Instant` at which the version handshake completed, once the connection drops.
 async fn connect_v1(addr: &str, magic: Magic) -> Result<Instant> {
-    tracing::info!("connecting (v1) ...");
+    tracing::trace!("connecting (v1) ...");
     let stream = TcpStream::connect(addr).await.context("TCP connect")?;
     let (reader, writer) = stream.into_split();
     let mut peer = PeerV1 {
@@ -147,35 +153,36 @@ async fn connect_v1(addr: &str, magic: Magic) -> Result<Instant> {
         writer,
     };
 
-    version_handshake(&mut peer).await?;
+    let version = version_handshake(&mut peer).await?;
     let connected_at = Instant::now();
+    let conn_span = tracing::info_span!("", v = 1, ua = %version.user_agent);
 
-    tracing::info!("v1 connection established");
-    if let Err(e) = message_loop(&mut peer).await {
+    tracing::trace!("v1 connection established");
+    if let Err(e) = message_loop(&mut peer).instrument(conn_span).await {
         tracing::debug!("v1 connection error: {e}");
     }
     Ok(connected_at)
 }
 
-async fn version_handshake(peer: &mut impl Peer) -> Result<()> {
+async fn version_handshake(peer: &mut impl Peer) -> Result<message_network::VersionMessage> {
     peer.send(build_version()).await?;
 
-    let mut got_version = false;
+    let mut peer_version: Option<message_network::VersionMessage> = None;
     let mut got_verack = false;
 
-    while !(got_version && got_verack) {
+    while !(peer_version.is_some() && got_verack) {
         match peer.recv().await? {
             NetworkMessage::Version(v) => {
-                tracing::info!(
+                tracing::debug!(
                     version = u32::from(v.version),
                     ua = v.user_agent.to_string(),
                     "received version"
                 );
                 peer.send(NetworkMessage::Verack).await?;
-                got_version = true;
+                peer_version = Some(v);
             }
             NetworkMessage::Verack => {
-                tracing::info!("handshake complete");
+                tracing::trace!("handshake complete");
                 got_verack = true;
             }
             other => tracing::debug!("ignored during handshake: {:?}", other),
@@ -189,7 +196,7 @@ async fn version_handshake(peer: &mut impl Peer) -> Result<()> {
     }))
     .await?;
 
-    Ok(())
+    Ok(peer_version.expect("loop invariant: version is Some when loop exits"))
 }
 
 async fn message_loop(peer: &mut impl Peer) -> Result<()> {
@@ -209,7 +216,7 @@ async fn message_loop(peer: &mut impl Peer) -> Result<()> {
 
 async fn send_ping(peer: &mut impl Peer) -> Result<()> {
     let nonce = unix_ms();
-    tracing::debug!(ts_ms = nonce, "sending ping");
+    tracing::trace!(ts_ms = nonce, "sending ping");
     peer.send(NetworkMessage::Ping(nonce)).await
 }
 
@@ -220,7 +227,7 @@ async fn handle_message(peer: &mut impl Peer, msg: NetworkMessage) -> Result<()>
         NetworkMessage::Inv(inv) => handle_inv(peer, inv.0).await?,
         NetworkMessage::Headers(headers) => handle_headers(headers.0),
         NetworkMessage::CmpctBlock(cmpct) => handle_cmpct_block(cmpct),
-        other => tracing::trace!("received: {:?}", other),
+        other => tracing::debug!("received: {:?}", other),
     }
     Ok(())
 }
@@ -231,11 +238,11 @@ async fn handle_inv(peer: &mut impl Peer, inv: Vec<Inventory>) -> Result<()> {
     for item in inv {
         match item {
             Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
-                tracing::info!(%hash, "inv: block");
-                getdata.push(Inventory::CompactBlock(hash));
+                tracing::debug!(%hash, "inv: block");
+                getdata.push(Inventory::Block(hash));
             }
             Inventory::CompactBlock(hash) => {
-                tracing::info!(%hash, "inv: compact block");
+                tracing::debug!(%hash, "inv: compact block");
                 getdata.push(Inventory::CompactBlock(hash));
             }
             _ => {}

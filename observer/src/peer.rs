@@ -7,6 +7,7 @@ use common::{
         message::{NetworkMessage, RawNetworkMessage, V2NetworkMessage},
     },
     tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    tracing,
 };
 
 pub trait Peer {
@@ -49,6 +50,7 @@ where
     W: AsyncWrite + Unpin,
 {
     async fn send(&mut self, msg: NetworkMessage) -> Result<()> {
+        tracing::trace!(cmd=%msg.command(), "sending message");
         self.writer
             .write_all(&serialize(&RawNetworkMessage::new(self.magic, msg)))
             .await

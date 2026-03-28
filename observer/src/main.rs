@@ -7,10 +7,12 @@ mod peer;
 async fn main() {
     tracing_subscriber::fmt()
         .with_target(false)
-        .with_max_level(tracing::Level::DEBUG)
+        .with_max_level(tracing::Level::TRACE)
         .init();
 
-    let peers = ["95.217.75.216:8333", "37.205.15.108:8333"];
+    let peers = [
+        "185.175.45.93:8333",
+    ];
 
     let handles: Vec<_> = peers
         .iter()
