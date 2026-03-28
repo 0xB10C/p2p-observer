@@ -4,6 +4,8 @@ use common::{
     p2p::{
         Magic, ProtocolVersion, ServiceFlags, address,
         message::NetworkMessage,
+        message_blockdata::Inventory,
+        message_compact_blocks::SendCmpct,
         message_network::{self, UserAgent},
     },
     tokio::{
@@ -32,7 +34,13 @@ const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_ATTEMPTS: u32 = 8;
 
 /// How often to send a ping to measure round-trip time.
-const PING_INTERVAL: Duration = Duration::from_secs(10);
+const PING_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Whether to request high-bandwidth compact block relay (BIP152).
+/// In high-bandwidth mode the peer sends compact blocks directly without an INV first,
+/// at the cost of higher bandwidth. In low-bandwidth mode (false) the peer sends an INV
+/// and we request the compact block via GETDATA. Low-bandwidth is sufficient for observation.
+const HIGH_BANDWIDTH_COMPACT_BLOCKS: bool = false;
 
 static PEER_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -172,6 +180,14 @@ async fn version_handshake(peer: &mut impl Peer) -> Result<()> {
             other => tracing::debug!("ignored during handshake: {:?}", other),
         }
     }
+
+    // Request compact block announcements (version 2 = segwit).
+    peer.send(NetworkMessage::SendCmpct(SendCmpct {
+        send_compact: HIGH_BANDWIDTH_COMPACT_BLOCKS,
+        version: 2,
+    }))
+    .await?;
+
     Ok(())
 }
 
@@ -200,9 +216,51 @@ async fn handle_message(peer: &mut impl Peer, msg: NetworkMessage) -> Result<()>
     match msg {
         NetworkMessage::Ping(nonce) => handle_ping(peer, nonce).await?,
         NetworkMessage::Pong(nonce) => handle_pong(nonce),
+        NetworkMessage::Inv(inv) => handle_inv(peer, inv.0).await?,
+        NetworkMessage::Headers(headers) => handle_headers(headers.0),
+        NetworkMessage::CmpctBlock(cmpct) => handle_cmpct_block(cmpct),
         other => tracing::trace!("received: {:?}", other),
     }
     Ok(())
+}
+
+async fn handle_inv(peer: &mut impl Peer, inv: Vec<Inventory>) -> Result<()> {
+    let mut getdata = Vec::new();
+
+    for item in inv {
+        match item {
+            Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
+                tracing::info!(%hash, "inv: block");
+                getdata.push(Inventory::CompactBlock(hash));
+            }
+            Inventory::CompactBlock(hash) => {
+                tracing::info!(%hash, "inv: compact block");
+                getdata.push(Inventory::CompactBlock(hash));
+            }
+            _ => {}
+        }
+    }
+
+    if !getdata.is_empty() {
+        peer.send(NetworkMessage::GetData(
+            common::p2p::message::InventoryPayload(getdata),
+        ))
+        .await?;
+    }
+
+    Ok(())
+}
+
+fn handle_headers(headers: Vec<common::bitcoin::block::Header>) {
+    for header in headers {
+        let hash = header.block_hash();
+        tracing::info!(%hash, "header announcement");
+    }
+}
+
+fn handle_cmpct_block(cmpct: common::p2p::message_compact_blocks::CmpctBlock) {
+    let hash = cmpct.compact_block.header.block_hash();
+    tracing::info!(%hash, "compact block");
 }
 
 async fn handle_ping(peer: &mut impl Peer, nonce: u64) -> Result<()> {
