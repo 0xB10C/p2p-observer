@@ -22,6 +22,7 @@ target
 
 .DS_Store
 
+addresses.txt
 
 # Added by cargo
 

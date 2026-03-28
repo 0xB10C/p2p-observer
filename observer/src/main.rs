@@ -10,15 +10,19 @@ async fn main() {
         .with_max_level(tracing::Level::TRACE)
         .init();
 
-    let peers = [
-        "185.175.45.93:8333",
-    ];
+    let content = std::fs::read_to_string("addresses.txt").expect("failed to read addresses.txt");
+    let peers: Vec<String> = content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect();
 
     let handles: Vec<_> = peers
-        .iter()
-        .map(|&addr| {
+        .into_iter()
+        .map(|addr| {
             tokio::spawn(async move {
-                connection::connect_with_retry(addr).await;
+                connection::connect_with_retry(&addr).await;
             })
         })
         .collect();
