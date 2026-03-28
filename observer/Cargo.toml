@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 common = { path = "../common" }
 bip324 = { git = "https://github.com/rust-bitcoin/bip324", package = "bip324", features = ["tokio"] }
+
+[dev-dependencies]
+bitcoind = { package = "corepc-node", git = "https://github.com/rust-bitcoin/corepc", rev = "0b8bea91181c5ab5b6c3f81fea66a51eff15b92b", features = ["30_2", "download"] }
+tokio = { version = "1", features = ["macros", "rt", "net", "io-util"] }

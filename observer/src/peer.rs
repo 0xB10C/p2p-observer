@@ -2,11 +2,12 @@ use bip324::{futures::Protocol, io::Payload};
 use common::anyhow::{Context, Result};
 use common::{
     bitcoin::consensus::{deserialize, serialize},
-    p2p::message::{NetworkMessage, RawNetworkMessage, V2NetworkMessage},
+    p2p::{
+        Magic,
+        message::{NetworkMessage, RawNetworkMessage, V2NetworkMessage},
+    },
     tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
 };
-
-use crate::connection::MAGIC;
 
 pub trait Peer {
     async fn send(&mut self, msg: NetworkMessage) -> Result<()>;
@@ -18,6 +19,7 @@ pub struct PeerV2<R, W> {
 }
 
 pub struct PeerV1<R, W> {
+    pub magic: Magic,
     pub reader: R,
     pub writer: W,
 }
@@ -48,7 +50,7 @@ where
 {
     async fn send(&mut self, msg: NetworkMessage) -> Result<()> {
         self.writer
-            .write_all(&serialize(&RawNetworkMessage::new(MAGIC, msg)))
+            .write_all(&serialize(&RawNetworkMessage::new(self.magic, msg)))
             .await
             .context("v1 write")
     }

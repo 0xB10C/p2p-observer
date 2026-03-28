@@ -96,27 +96,27 @@ async fn retry_loop(addr: &str) {
 /// attempt on a protocol the peer has already proven it doesn't need.
 async fn try_connect(addr: &str, skip_v1_fallback: &mut bool) -> Result<Instant> {
     if *skip_v1_fallback {
-        return connect_v2(addr).await;
+        return connect_v2(addr, MAGIC).await;
     }
-    match connect_v2(addr).await {
+    match connect_v2(addr, MAGIC).await {
         ok @ Ok(_) => {
             *skip_v1_fallback = true;
             ok
         }
         Err(e) => {
             tracing::warn!("v2 failed ({e}), trying v1");
-            connect_v1(addr).await
+            connect_v1(addr, MAGIC).await
         }
     }
 }
 
 /// Returns the `Instant` at which the version handshake completed, once the connection drops.
-async fn connect_v2(addr: &str) -> Result<Instant> {
+async fn connect_v2(addr: &str, magic: Magic) -> Result<Instant> {
     tracing::info!("connecting (v2) ...");
     let stream = TcpStream::connect(addr).await.context("TCP connect")?;
     let (reader, writer) = stream.into_split();
     let proto = Protocol::new(
-        MAGIC,
+        magic,
         Role::Initiator,
         None,
         None,
@@ -137,11 +137,12 @@ async fn connect_v2(addr: &str) -> Result<Instant> {
 }
 
 /// Returns the `Instant` at which the version handshake completed, once the connection drops.
-async fn connect_v1(addr: &str) -> Result<Instant> {
+async fn connect_v1(addr: &str, magic: Magic) -> Result<Instant> {
     tracing::info!("connecting (v1) ...");
     let stream = TcpStream::connect(addr).await.context("TCP connect")?;
     let (reader, writer) = stream.into_split();
     let mut peer = PeerV1 {
+        magic,
         reader: BufReader::new(reader),
         writer,
     };
@@ -278,6 +279,152 @@ fn unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peer::{Peer, PeerV1, PeerV2};
+    use bip324::{Role, futures::Protocol};
+    use common::{
+        p2p::message::NetworkMessage,
+        tokio::{io::BufReader, net::TcpListener},
+        tracing_subscriber,
+    };
+
+    /// Complete the server side of the version handshake.
+    ///
+    /// Waits for the client's VERSION, responds with VERSION + VERACK, then
+    /// drains the client's VERACK and SENDCMPCT before returning.
+    async fn server_handshake(peer: &mut impl Peer) {
+        loop {
+            if let NetworkMessage::Version(_) = peer.recv().await.unwrap() {
+                break;
+            }
+        }
+        peer.send(build_version()).await.unwrap();
+        peer.send(NetworkMessage::Verack).await.unwrap();
+        loop {
+            if let NetworkMessage::Verack = peer.recv().await.unwrap() {
+                break;
+            }
+        }
+        loop {
+            if let NetworkMessage::SendCmpct(_) = peer.recv().await.unwrap() {
+                break;
+            }
+        }
+    }
+
+    fn setup() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .try_init();
+    }
+
+    #[tokio::test]
+    async fn test_v1_handshake_mock() {
+        setup();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, writer) = stream.into_split();
+            let mut peer = PeerV1 {
+                magic: MAGIC,
+                reader: BufReader::new(reader),
+                writer,
+            };
+            server_handshake(&mut peer).await;
+            // Drop → EOF → client message_loop exits → connect_v1 returns Ok
+        });
+
+        let result = connect_v1(&addr, MAGIC).await;
+        server.await.unwrap();
+        assert!(result.is_ok(), "connect_v1 failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_v2_handshake_mock() {
+        setup();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, writer) = stream.into_split();
+            let proto = Protocol::new(
+                MAGIC,
+                Role::Responder,
+                None,
+                None,
+                BufReader::new(reader),
+                writer,
+            )
+            .await
+            .unwrap();
+            let mut peer = PeerV2 { proto };
+            server_handshake(&mut peer).await;
+        });
+
+        let result = connect_v2(&addr, MAGIC).await;
+        server.await.unwrap();
+        assert!(result.is_ok(), "connect_v2 failed: {result:?}");
+    }
+
+    /// Test v1 handshake against a real bitcoind. Only tests the handshake, not the message loop
+    /// (the message loop is already covered by the mock tests).
+    #[tokio::test]
+    async fn test_v1_bitcoind() {
+        setup();
+        let exe = bitcoind::exe_path().unwrap();
+        let mut conf = bitcoind::Conf::default();
+        conf.p2p = bitcoind::P2P::Yes;
+        conf.args.push("-v2transport=0");
+        let node = bitcoind::Node::with_conf(exe, &conf).unwrap();
+        let addr = node.params.p2p_socket.unwrap().to_string();
+
+        let stream = TcpStream::connect(&addr).await.unwrap();
+        let (reader, writer) = stream.into_split();
+        let mut peer = PeerV1 {
+            magic: Magic::REGTEST,
+            reader: BufReader::new(reader),
+            writer,
+        };
+        version_handshake(&mut peer)
+            .await
+            .expect("v1 handshake failed");
+    }
+
+    /// Test v2 (BIP324) handshake against a real bitcoind.
+    #[tokio::test]
+    async fn test_v2_bitcoind() {
+        setup();
+        let exe = bitcoind::exe_path().unwrap();
+        let mut conf = bitcoind::Conf::default();
+        conf.p2p = bitcoind::P2P::Yes;
+        conf.args.push("-v2transport=1");
+        let node = bitcoind::Node::with_conf(exe, &conf).unwrap();
+        let addr = node.params.p2p_socket.unwrap().to_string();
+
+        let stream = TcpStream::connect(&addr).await.unwrap();
+        let (reader, writer) = stream.into_split();
+        let proto = Protocol::new(
+            Magic::REGTEST,
+            Role::Initiator,
+            None,
+            None,
+            BufReader::new(reader),
+            writer,
+        )
+        .await
+        .expect("BIP324 handshake failed");
+        let mut peer = PeerV2 { proto };
+        version_handshake(&mut peer)
+            .await
+            .expect("v2 version handshake failed");
+    }
 }
 
 fn build_version() -> NetworkMessage {
