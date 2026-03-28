@@ -238,11 +238,11 @@ async fn handle_inv(peer: &mut impl Peer, inv: Vec<Inventory>) -> Result<()> {
     for item in inv {
         match item {
             Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
-                tracing::debug!(%hash, "inv: block");
-                getdata.push(Inventory::Block(hash));
+                // log the inv, but don't request the full block
+                tracing::info!(%hash, "inv: block");
             }
             Inventory::CompactBlock(hash) => {
-                tracing::debug!(%hash, "inv: compact block");
+                tracing::info!(%hash, "inv: compact block");
                 getdata.push(Inventory::CompactBlock(hash));
             }
             _ => {}
