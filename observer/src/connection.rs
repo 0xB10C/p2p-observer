@@ -8,8 +8,10 @@ use common::{
     },
     tokio::{io::BufReader, net::TcpStream},
     tracing,
+    tracing::Instrument,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::peer::{Peer, PeerV1, PeerV2};
@@ -17,8 +19,16 @@ use crate::peer::{Peer, PeerV1, PeerV2};
 pub const MAGIC: Magic = Magic::BITCOIN;
 const USER_AGENT: &str = "/p2p-observer:0.1.0/";
 
+static CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
+
 pub async fn connect(addr: &str) -> Result<()> {
-    tracing::info!(addr, "connecting");
+    let id = CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+    let span = tracing::info_span!("connection", id, addr);
+    connect_inner(addr).instrument(span).await
+}
+
+async fn connect_inner(addr: &str) -> Result<()> {
+    tracing::info!("connecting");
     let stream = TcpStream::connect(addr).await.context("TCP connect")?;
     let (reader, writer) = stream.into_split();
 
@@ -33,13 +43,13 @@ pub async fn connect(addr: &str) -> Result<()> {
     .await
     {
         Ok(proto) => {
-            tracing::info!(addr, "v2 connection established");
+            tracing::info!("v2 connection established");
             let mut peer = PeerV2 { proto };
-            version_handshake(addr, &mut peer).await?;
-            message_loop(addr, &mut peer).await?;
+            version_handshake(&mut peer).await?;
+            message_loop(&mut peer).await?;
         }
         Err(e) => {
-            tracing::warn!(addr, "v2 failed ({e}), trying v1");
+            tracing::warn!("v2 failed ({e}), trying v1");
             let stream = TcpStream::connect(addr)
                 .await
                 .context("TCP reconnect for v1")?;
@@ -48,14 +58,14 @@ pub async fn connect(addr: &str) -> Result<()> {
                 reader: BufReader::new(reader),
                 writer,
             };
-            version_handshake(addr, &mut peer).await?;
-            message_loop(addr, &mut peer).await?;
+            version_handshake(&mut peer).await?;
+            message_loop(&mut peer).await?;
         }
     }
     Ok(())
 }
 
-async fn version_handshake(addr: &str, peer: &mut impl Peer) -> Result<()> {
+async fn version_handshake(peer: &mut impl Peer) -> Result<()> {
     peer.send(build_version()).await?;
 
     let mut got_version = false;
@@ -65,7 +75,6 @@ async fn version_handshake(addr: &str, peer: &mut impl Peer) -> Result<()> {
         match peer.recv().await? {
             NetworkMessage::Version(v) => {
                 tracing::info!(
-                    addr,
                     version = u32::from(v.version),
                     ua = v.user_agent.to_string(),
                     "received version"
@@ -74,23 +83,23 @@ async fn version_handshake(addr: &str, peer: &mut impl Peer) -> Result<()> {
                 got_version = true;
             }
             NetworkMessage::Verack => {
-                tracing::info!(addr, "handshake complete");
+                tracing::info!("handshake complete");
                 got_verack = true;
             }
-            other => tracing::debug!(addr, "ignored during handshake: {:?}", other),
+            other => tracing::debug!("ignored during handshake: {:?}", other),
         }
     }
     Ok(())
 }
 
-async fn message_loop(addr: &str, peer: &mut impl Peer) -> Result<()> {
+async fn message_loop(peer: &mut impl Peer) -> Result<()> {
     loop {
         match peer.recv().await? {
             NetworkMessage::Ping(nonce) => {
-                tracing::debug!(addr, nonce, "ping -> pong");
+                tracing::debug!(nonce, "ping -> pong");
                 peer.send(NetworkMessage::Pong(nonce)).await?;
             }
-            other => tracing::info!(addr, "received: {:?}", other),
+            other => tracing::info!("received: {:?}", other),
         }
     }
 }

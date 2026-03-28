@@ -5,7 +5,10 @@ mod peer;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
 
     let peers = ["95.217.75.216:8333"];
 
