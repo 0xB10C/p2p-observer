@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::addresses::{NetAddr, StatusUpdate};
-use crate::peer::{Peer, PeerV1, PeerV2};
+use crate::transport::{Transport, TransportV1, TransportV2};
 
 pub(crate) const MAGIC: Magic = Magic::SIGNET;
 const USER_AGENT: &str = "/p2p-observer:0.1.0/";
@@ -57,8 +57,8 @@ struct HandshakeInfo {
 }
 
 /// A live connection to a peer, created after a successful version handshake.
-struct Connection<P: Peer> {
-    peer: P,
+struct Connection<T: Transport> {
+    transport: T,
     new_addr_tx: mpsc::Sender<Vec<NetAddr>>,
     #[allow(dead_code)]
     handshake_info: HandshakeInfo,
@@ -191,16 +191,16 @@ async fn connect_v2(
         writer,
     )
     .await?;
-    let mut peer = PeerV2 { proto };
+    let mut transport = TransportV2 { proto };
 
-    let info = version_handshake(&mut peer).await?;
+    let info = version_handshake(&mut transport).await?;
     let connected_at = Instant::now();
     let conn_span = tracing::info_span!("", v = 2, ua = %info.version.user_agent);
 
     tracing::trace!("v2 connection established");
-    peer.send(NetworkMessage::GetAddr).await?;
+    transport.send(NetworkMessage::GetAddr).await?;
     let mut conn = Connection {
-        peer,
+        transport,
         new_addr_tx: new_addr_tx.clone(),
         handshake_info: info,
         send_cmpct: None,
@@ -220,20 +220,20 @@ async fn connect_v1(
     tracing::trace!("connecting (v1) ...");
     let stream = TcpStream::connect(addr).await.context("TCP connect")?;
     let (reader, writer) = stream.into_split();
-    let mut peer = PeerV1 {
+    let mut transport = TransportV1 {
         magic,
         reader: BufReader::new(reader),
         writer,
     };
 
-    let info = version_handshake(&mut peer).await?;
+    let info = version_handshake(&mut transport).await?;
     let connected_at = Instant::now();
     let conn_span = tracing::info_span!("", v = 1, ua = %info.version.user_agent);
 
     tracing::trace!("v1 connection established");
-    peer.send(NetworkMessage::GetAddr).await?;
+    transport.send(NetworkMessage::GetAddr).await?;
     let mut conn = Connection {
-        peer,
+        transport,
         new_addr_tx: new_addr_tx.clone(),
         handshake_info: info,
         send_cmpct: None,
@@ -244,8 +244,8 @@ async fn connect_v1(
     Ok(connected_at)
 }
 
-async fn version_handshake(peer: &mut impl Peer) -> Result<HandshakeInfo> {
-    peer.send(build_version()).await?;
+async fn version_handshake(transport: &mut impl Transport) -> Result<HandshakeInfo> {
+    transport.send(build_version()).await?;
 
     let mut peer_version: Option<message_network::VersionMessage> = None;
     let mut got_verack = false;
@@ -253,7 +253,7 @@ async fn version_handshake(peer: &mut impl Peer) -> Result<HandshakeInfo> {
     let mut send_addr_v2 = false;
 
     while !(peer_version.is_some() && got_verack) {
-        match peer.recv().await? {
+        match transport.recv().await? {
             NetworkMessage::Version(v) => {
                 tracing::debug!(
                     version = u32::from(v.version),
@@ -261,8 +261,8 @@ async fn version_handshake(peer: &mut impl Peer) -> Result<HandshakeInfo> {
                     "received version"
                 );
                 // Advertise addrv2 support (BIP155)
-                peer.send(NetworkMessage::SendAddrV2).await?;
-                peer.send(NetworkMessage::Verack).await?;
+                transport.send(NetworkMessage::SendAddrV2).await?;
+                transport.send(NetworkMessage::Verack).await?;
                 peer_version = Some(v);
             }
             NetworkMessage::Verack => {
@@ -282,11 +282,12 @@ async fn version_handshake(peer: &mut impl Peer) -> Result<HandshakeInfo> {
     }
 
     // Request compact block announcements (version 2 = segwit).
-    peer.send(NetworkMessage::SendCmpct(SendCmpct {
-        send_compact: HIGH_BANDWIDTH_COMPACT_BLOCKS,
-        version: 2,
-    }))
-    .await?;
+    transport
+        .send(NetworkMessage::SendCmpct(SendCmpct {
+            send_compact: HIGH_BANDWIDTH_COMPACT_BLOCKS,
+            version: 2,
+        }))
+        .await?;
 
     Ok(HandshakeInfo {
         version: peer_version.expect("loop invariant: version is Some when loop exits"),
@@ -295,7 +296,7 @@ async fn version_handshake(peer: &mut impl Peer) -> Result<HandshakeInfo> {
     })
 }
 
-impl<P: Peer> Connection<P> {
+impl<T: Transport> Connection<T> {
     /// Main message loop — runs until the peer disconnects or an error occurs.
     async fn run(&mut self) -> Result<()> {
         let mut ping_timer = interval(PING_INTERVAL);
@@ -307,7 +308,7 @@ impl<P: Peer> Connection<P> {
         loop {
             tokio::select! {
                 _ = ping_timer.tick() => self.send_ping().await?,
-                msg = self.peer.recv() => self.handle_message(msg?).await?,
+                msg = self.transport.recv() => self.handle_message(msg?).await?,
             }
         }
     }
@@ -315,7 +316,7 @@ impl<P: Peer> Connection<P> {
     async fn send_ping(&mut self) -> Result<()> {
         let nonce = unix_ms();
         tracing::trace!(ts_ms = nonce, "sending ping");
-        self.peer.send(NetworkMessage::Ping(nonce)).await
+        self.transport.send(NetworkMessage::Ping(nonce)).await
     }
 
     async fn handle_message(&mut self, msg: NetworkMessage) -> Result<()> {
@@ -354,7 +355,7 @@ impl<P: Peer> Connection<P> {
         }
 
         if !getdata.is_empty() {
-            self.peer
+            self.transport
                 .send(NetworkMessage::GetData(
                     common::p2p::message::InventoryPayload(getdata),
                 ))
@@ -378,7 +379,7 @@ impl<P: Peer> Connection<P> {
 
     async fn handle_ping(&mut self, nonce: u64) -> Result<()> {
         tracing::trace!(nonce, "received ping");
-        self.peer.send(NetworkMessage::Pong(nonce)).await
+        self.transport.send(NetworkMessage::Pong(nonce)).await
     }
 
     fn handle_pong(&self, nonce: u64) {
@@ -471,7 +472,7 @@ fn build_version() -> NetworkMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer::{Peer, PeerV1, PeerV2};
+    use crate::transport::{Transport, TransportV1, TransportV2};
     use bip324::{Role, futures::Protocol};
     use common::{
         p2p::message::NetworkMessage,
@@ -483,21 +484,21 @@ mod tests {
     ///
     /// Waits for the client's VERSION, responds with VERSION + VERACK, then
     /// drains the client's VERACK and SENDCMPCT before returning.
-    async fn server_handshake(peer: &mut impl Peer) {
+    async fn server_handshake(transport: &mut impl Transport) {
         loop {
-            if let NetworkMessage::Version(_) = peer.recv().await.unwrap() {
+            if let NetworkMessage::Version(_) = transport.recv().await.unwrap() {
                 break;
             }
         }
-        peer.send(build_version()).await.unwrap();
-        peer.send(NetworkMessage::Verack).await.unwrap();
+        transport.send(build_version()).await.unwrap();
+        transport.send(NetworkMessage::Verack).await.unwrap();
         loop {
-            if let NetworkMessage::Verack = peer.recv().await.unwrap() {
+            if let NetworkMessage::Verack = transport.recv().await.unwrap() {
                 break;
             }
         }
         loop {
-            if let NetworkMessage::SendCmpct(_) = peer.recv().await.unwrap() {
+            if let NetworkMessage::SendCmpct(_) = transport.recv().await.unwrap() {
                 break;
             }
         }
@@ -518,12 +519,12 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader, writer) = stream.into_split();
-            let mut peer = PeerV1 {
+            let mut transport = TransportV1 {
                 magic: MAGIC,
                 reader: BufReader::new(reader),
                 writer,
             };
-            server_handshake(&mut peer).await;
+            server_handshake(&mut transport).await;
             // Drop → EOF → client message_loop exits → connect_v1 returns Ok
         });
 
@@ -552,8 +553,8 @@ mod tests {
             )
             .await
             .unwrap();
-            let mut peer = PeerV2 { proto };
-            server_handshake(&mut peer).await;
+            let mut transport = TransportV2 { proto };
+            server_handshake(&mut transport).await;
         });
 
         let (tx, _rx) = mpsc::channel(1);
@@ -576,12 +577,12 @@ mod tests {
 
         let stream = TcpStream::connect(addr).await.unwrap();
         let (reader, writer) = stream.into_split();
-        let mut peer = PeerV1 {
+        let mut transport = TransportV1 {
             magic: Magic::REGTEST,
             reader: BufReader::new(reader),
             writer,
         };
-        version_handshake(&mut peer)
+        version_handshake(&mut transport)
             .await
             .expect("v1 handshake failed");
     }
@@ -609,8 +610,8 @@ mod tests {
         )
         .await
         .expect("BIP324 handshake failed");
-        let mut peer = PeerV2 { proto };
-        version_handshake(&mut peer)
+        let mut transport = TransportV2 { proto };
+        version_handshake(&mut transport)
             .await
             .expect("v2 version handshake failed");
     }

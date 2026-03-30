@@ -10,22 +10,22 @@ use common::{
     tracing,
 };
 
-pub trait Peer {
+pub trait Transport {
     async fn send(&mut self, msg: NetworkMessage) -> Result<()>;
     async fn recv(&mut self) -> Result<NetworkMessage>;
 }
 
-pub struct PeerV2<R, W> {
+pub struct TransportV2<R, W> {
     pub proto: Protocol<R, W>,
 }
 
-pub struct PeerV1<R, W> {
+pub struct TransportV1<R, W> {
     pub magic: Magic,
     pub reader: R,
     pub writer: W,
 }
 
-impl<R, W> Peer for PeerV2<R, W>
+impl<R, W> Transport for TransportV2<R, W>
 where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
@@ -44,7 +44,7 @@ where
     }
 }
 
-impl<R, W> Peer for PeerV1<R, W>
+impl<R, W> Transport for TransportV1<R, W>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,

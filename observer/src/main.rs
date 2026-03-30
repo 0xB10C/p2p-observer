@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 mod addresses;
 mod connection;
-mod peer;
+mod transport;
 
 #[tokio::main]
 async fn main() {
