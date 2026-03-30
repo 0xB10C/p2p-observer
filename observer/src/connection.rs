@@ -3,6 +3,7 @@ use common::{
     anyhow::{Context, Result},
     p2p::{
         Magic, ProtocolVersion, ServiceFlags, address,
+        address::{AddrV2Message, Address},
         message::NetworkMessage,
         message_blockdata::Inventory,
         message_compact_blocks::SendCmpct,
@@ -12,6 +13,7 @@ use common::{
         self,
         io::BufReader,
         net::TcpStream,
+        sync::mpsc,
         time::{Duration, interval, sleep},
     },
     tracing,
@@ -21,6 +23,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::addresses::{NetAddr, StatusUpdate};
 use crate::peer::{Peer, PeerV1, PeerV2};
 
 pub(crate) const MAGIC: Magic = Magic::BITCOIN;
@@ -44,25 +47,46 @@ const HIGH_BANDWIDTH_COMPACT_BLOCKS: bool = false;
 
 static PEER_ID: AtomicU64 = AtomicU64::new(0);
 
-pub async fn connect_with_retry(addr: &str) {
+pub async fn connect_with_retry(
+    addr: NetAddr,
+    status_tx: mpsc::Sender<StatusUpdate>,
+    new_addr_tx: mpsc::Sender<Vec<NetAddr>>,
+) {
     let id = PEER_ID.fetch_add(1, Ordering::Relaxed);
-    let span = tracing::info_span!("c", id, addr);
-    retry_loop(addr).instrument(span).await
+    let span = tracing::info_span!("c", id, addr = %addr);
+
+    async move {
+        let Some(socket_addr) = addr.to_socket_addr() else {
+            tracing::debug!("no TCP address, skipping");
+            let _ = status_tx.send(StatusUpdate::TaskDone(addr)).await;
+            return;
+        };
+        retry_loop(&addr, socket_addr, status_tx, new_addr_tx).await
+    }
+    .instrument(span)
+    .await
 }
 
-async fn retry_loop(addr: &str) {
+async fn retry_loop(
+    addr: &NetAddr,
+    socket_addr: SocketAddr,
+    status_tx: mpsc::Sender<StatusUpdate>,
+    new_addr_tx: mpsc::Sender<Vec<NetAddr>>,
+) {
     let mut backoff = BACKOFF_BASE;
     let mut attempts = 0u32;
     let mut skip_v1_fallback = false;
+    let mut ever_connected = false;
 
     loop {
-        let result = try_connect(addr, &mut skip_v1_fallback).await;
+        let result = try_connect(socket_addr, &mut skip_v1_fallback, &new_addr_tx).await;
 
         attempts += 1;
         backoff *= 2;
 
         match result {
             Ok(connected_at) => {
+                ever_connected = true;
                 let uptime = connected_at.elapsed();
                 // Only reset backoff if the connection was stable long enough — otherwise
                 // a peer that immediately evicts us after the handshake would reset the
@@ -71,6 +95,12 @@ async fn retry_loop(addr: &str) {
                     backoff = BACKOFF_BASE;
                     attempts = 0;
                 }
+                let _ = status_tx
+                    .send(StatusUpdate::LastSeen {
+                        addr: addr.clone(),
+                        at: unix_secs(),
+                    })
+                    .await;
                 tracing::trace!(
                     uptime = format!("{:?}", uptime),
                     "connection lost. reconnecting in {backoff:.1?}"
@@ -88,35 +118,47 @@ async fn retry_loop(addr: &str) {
 
         if attempts >= MAX_RECONNECT_ATTEMPTS {
             tracing::info!(attempts, "giving up");
-            return;
+            if !ever_connected {
+                let _ = status_tx.send(StatusUpdate::Offline(addr.clone())).await;
+            }
+            break;
         }
 
         sleep(backoff).await;
     }
+    let _ = status_tx.send(StatusUpdate::TaskDone(addr.clone())).await;
 }
 
 /// Attempts a v2 connection, falling back to v1 on failure.
 /// Once v2 has succeeded once, `skip_v1_fallback` is set and v1 is never tried again —
 /// a peer is very unlikely to downgrade, and skipping the fallback avoids wasting an
 /// attempt on a protocol the peer has already proven it doesn't need.
-async fn try_connect(addr: &str, skip_v1_fallback: &mut bool) -> Result<Instant> {
+async fn try_connect(
+    addr: SocketAddr,
+    skip_v1_fallback: &mut bool,
+    new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
+) -> Result<Instant> {
     if *skip_v1_fallback {
-        return connect_v2(addr, MAGIC).await;
+        return connect_v2(addr, MAGIC, new_addr_tx).await;
     }
-    match connect_v2(addr, MAGIC).await {
+    match connect_v2(addr, MAGIC, new_addr_tx).await {
         ok @ Ok(_) => {
             *skip_v1_fallback = true;
             ok
         }
         Err(e) => {
             tracing::trace!("v2 failed ({e}), trying v1");
-            connect_v1(addr, MAGIC).await
+            connect_v1(addr, MAGIC, new_addr_tx).await
         }
     }
 }
 
 /// Returns the `Instant` at which the version handshake completed, once the connection drops.
-async fn connect_v2(addr: &str, magic: Magic) -> Result<Instant> {
+async fn connect_v2(
+    addr: SocketAddr,
+    magic: Magic,
+    new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
+) -> Result<Instant> {
     tracing::trace!("connecting (v2) ...");
     let stream = TcpStream::connect(addr).await.context("TCP connect")?;
     let (reader, writer) = stream.into_split();
@@ -136,14 +178,22 @@ async fn connect_v2(addr: &str, magic: Magic) -> Result<Instant> {
     let conn_span = tracing::info_span!("", v = 2, ua = %version.user_agent);
 
     tracing::trace!("v2 connection established");
-    if let Err(e) = message_loop(&mut peer).instrument(conn_span).await {
+    peer.send(NetworkMessage::GetAddr).await?;
+    if let Err(e) = message_loop(&mut peer, new_addr_tx)
+        .instrument(conn_span)
+        .await
+    {
         tracing::debug!("v2 connection error: {e}");
     }
     Ok(connected_at)
 }
 
 /// Returns the `Instant` at which the version handshake completed, once the connection drops.
-async fn connect_v1(addr: &str, magic: Magic) -> Result<Instant> {
+async fn connect_v1(
+    addr: SocketAddr,
+    magic: Magic,
+    new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
+) -> Result<Instant> {
     tracing::trace!("connecting (v1) ...");
     let stream = TcpStream::connect(addr).await.context("TCP connect")?;
     let (reader, writer) = stream.into_split();
@@ -158,7 +208,11 @@ async fn connect_v1(addr: &str, magic: Magic) -> Result<Instant> {
     let conn_span = tracing::info_span!("", v = 1, ua = %version.user_agent);
 
     tracing::trace!("v1 connection established");
-    if let Err(e) = message_loop(&mut peer).instrument(conn_span).await {
+    peer.send(NetworkMessage::GetAddr).await?;
+    if let Err(e) = message_loop(&mut peer, new_addr_tx)
+        .instrument(conn_span)
+        .await
+    {
         tracing::debug!("v1 connection error: {e}");
     }
     Ok(connected_at)
@@ -189,6 +243,9 @@ async fn version_handshake(peer: &mut impl Peer) -> Result<message_network::Vers
         }
     }
 
+    // Advertise addrv2 support (BIP155).
+    peer.send(NetworkMessage::SendAddrV2).await?;
+
     // Request compact block announcements (version 2 = segwit).
     peer.send(NetworkMessage::SendCmpct(SendCmpct {
         send_compact: HIGH_BANDWIDTH_COMPACT_BLOCKS,
@@ -199,7 +256,10 @@ async fn version_handshake(peer: &mut impl Peer) -> Result<message_network::Vers
     Ok(peer_version.expect("loop invariant: version is Some when loop exits"))
 }
 
-async fn message_loop(peer: &mut impl Peer) -> Result<()> {
+async fn message_loop(
+    peer: &mut impl Peer,
+    new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
+) -> Result<()> {
     let mut ping_timer = interval(PING_INTERVAL);
     ping_timer.tick().await; // skip the immediate first tick
 
@@ -209,7 +269,7 @@ async fn message_loop(peer: &mut impl Peer) -> Result<()> {
     loop {
         tokio::select! {
             _ = ping_timer.tick() => send_ping(peer).await?,
-            msg = peer.recv() => handle_message(peer, msg?).await?,
+            msg = peer.recv() => handle_message(peer, msg?, new_addr_tx).await?,
         }
     }
 }
@@ -220,13 +280,19 @@ async fn send_ping(peer: &mut impl Peer) -> Result<()> {
     peer.send(NetworkMessage::Ping(nonce)).await
 }
 
-async fn handle_message(peer: &mut impl Peer, msg: NetworkMessage) -> Result<()> {
+async fn handle_message(
+    peer: &mut impl Peer,
+    msg: NetworkMessage,
+    new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
+) -> Result<()> {
     match msg {
         NetworkMessage::Ping(nonce) => handle_ping(peer, nonce).await?,
         NetworkMessage::Pong(nonce) => handle_pong(nonce),
         NetworkMessage::Inv(inv) => handle_inv(peer, inv.0).await?,
         NetworkMessage::Headers(headers) => handle_headers(headers.0),
         NetworkMessage::CmpctBlock(cmpct) => handle_cmpct_block(cmpct),
+        NetworkMessage::Addr(payload) => handle_addr(&payload.0, new_addr_tx),
+        NetworkMessage::AddrV2(payload) => handle_addrv2(&payload.0, new_addr_tx),
         other => tracing::debug!("received: {:?}", other),
     }
     Ok(())
@@ -281,11 +347,40 @@ fn handle_pong(nonce: u64) {
     tracing::debug!(rtt_ms, "pong");
 }
 
+fn handle_addr(addrs: &[(u32, Address)], new_addr_tx: &mpsc::Sender<Vec<NetAddr>>) {
+    tracing::trace!(num = addrs.len(), "received addr");
+    let converted: Vec<NetAddr> = addrs
+        .iter()
+        .filter_map(|(_, a)| NetAddr::try_from(a).ok())
+        .collect();
+    if !converted.is_empty() {
+        let _ = new_addr_tx.try_send(converted);
+    }
+}
+
+fn handle_addrv2(addrs: &[AddrV2Message], new_addr_tx: &mpsc::Sender<Vec<NetAddr>>) {
+    tracing::trace!(num = addrs.len(), "received addrv2");
+    let converted: Vec<NetAddr> = addrs
+        .iter()
+        .filter_map(|m| NetAddr::try_from(m).ok())
+        .collect();
+    if !converted.is_empty() {
+        let _ = new_addr_tx.try_send(converted);
+    }
+}
+
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -295,7 +390,7 @@ mod tests {
     use bip324::{Role, futures::Protocol};
     use common::{
         p2p::message::NetworkMessage,
-        tokio::{io::BufReader, net::TcpListener},
+        tokio::{io::BufReader, net::TcpListener, sync::mpsc},
         tracing_subscriber,
     };
 
@@ -333,7 +428,7 @@ mod tests {
     async fn test_v1_handshake_mock() {
         setup();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
+        let addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -347,7 +442,8 @@ mod tests {
             // Drop → EOF → client message_loop exits → connect_v1 returns Ok
         });
 
-        let result = connect_v1(&addr, MAGIC).await;
+        let (tx, _rx) = mpsc::channel(1);
+        let result = connect_v1(addr, MAGIC, &tx).await;
         server.await.unwrap();
         assert!(result.is_ok(), "connect_v1 failed: {result:?}");
     }
@@ -356,7 +452,7 @@ mod tests {
     async fn test_v2_handshake_mock() {
         setup();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
+        let addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -375,7 +471,8 @@ mod tests {
             server_handshake(&mut peer).await;
         });
 
-        let result = connect_v2(&addr, MAGIC).await;
+        let (tx, _rx) = mpsc::channel(1);
+        let result = connect_v2(addr, MAGIC, &tx).await;
         server.await.unwrap();
         assert!(result.is_ok(), "connect_v2 failed: {result:?}");
     }
@@ -390,9 +487,9 @@ mod tests {
         conf.p2p = bitcoind::P2P::Yes;
         conf.args.push("-v2transport=0");
         let node = bitcoind::Node::with_conf(exe, &conf).unwrap();
-        let addr = node.params.p2p_socket.unwrap().to_string();
+        let addr = node.params.p2p_socket.unwrap();
 
-        let stream = TcpStream::connect(&addr).await.unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
         let (reader, writer) = stream.into_split();
         let mut peer = PeerV1 {
             magic: Magic::REGTEST,
@@ -413,9 +510,9 @@ mod tests {
         conf.p2p = bitcoind::P2P::Yes;
         conf.args.push("-v2transport=1");
         let node = bitcoind::Node::with_conf(exe, &conf).unwrap();
-        let addr = node.params.p2p_socket.unwrap().to_string();
+        let addr = node.params.p2p_socket.unwrap();
 
-        let stream = TcpStream::connect(&addr).await.unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
         let (reader, writer) = stream.into_split();
         let proto = Protocol::new(
             Magic::REGTEST,

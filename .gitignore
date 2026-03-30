@@ -23,6 +23,7 @@ target
 .DS_Store
 
 addresses.txt
+addresses.json
 
 # Added by cargo
 
