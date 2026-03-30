@@ -134,6 +134,23 @@ async fn retry_loop(
                         .await;
                     break;
                 }
+
+                if !ever_connected {
+                    if is_connection_refused(&e) {
+                        tracing::info!("connection refused on first attempt, not retrying");
+                        let _ = status_tx
+                            .send(StatusUpdate::ConnectionRefused(addr.clone()))
+                            .await;
+                        break;
+                    } else if is_host_unreachable(&e) {
+                        tracing::info!("host unreachable on first attempt, not retrying");
+                        let _ = status_tx
+                            .send(StatusUpdate::HostUnreachable(addr.clone()))
+                            .await;
+                        break;
+                    }
+                }
+
                 tracing::trace!(
                     attempts,
                     backoff_ms = backoff.as_millis(),
@@ -174,6 +191,11 @@ async fn try_connect(
             ok
         }
         Err(e) => {
+            // If we run into a TCP connection error, we don't need to
+            // retry a v1 connection.
+            if is_tcp_connect_error(&e) {
+                return Err(e);
+            }
             tracing::trace!("v2 failed ({e}), trying v1");
             connect_v1(addr, MAGIC, new_addr_tx).await
         }
@@ -434,12 +456,31 @@ impl<T: Transport> Connection<T> {
     }
 }
 
-/// Check if the root cause of the error is an "network unreachable" OS error.
+/// Check if the root cause of the error is a "network unreachable" OS error.
 fn is_network_unreachable(err: &common::anyhow::Error) -> bool {
+    has_io_error_kind(err, std::io::ErrorKind::NetworkUnreachable)
+}
+
+/// Check if the root cause of the error is a "no route to host" OS error.
+fn is_host_unreachable(err: &common::anyhow::Error) -> bool {
+    has_io_error_kind(err, std::io::ErrorKind::HostUnreachable)
+}
+
+/// Check if the error is a TCP-level connect failure (e.g. connection refused)
+/// where falling back to a different transport version would not help.
+fn is_tcp_connect_error(err: &common::anyhow::Error) -> bool {
+    is_connection_refused(err) || is_network_unreachable(err) || is_host_unreachable(err)
+}
+
+fn is_connection_refused(err: &common::anyhow::Error) -> bool {
+    has_io_error_kind(err, std::io::ErrorKind::ConnectionRefused)
+}
+
+fn has_io_error_kind(err: &common::anyhow::Error, kind: std::io::ErrorKind) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
-            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NetworkUnreachable)
+            .is_some_and(|io_err| io_err.kind() == kind)
     })
 }
 

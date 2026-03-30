@@ -150,6 +150,11 @@ pub enum AddrStatus {
     /// Unix timestamp (seconds) of the last successful connection.
     LastSeen(u64),
     Offline,
+    /// The host is reachable but the port is closed (TCP RST). The Bitcoin
+    /// node is likely not running or not listening on this port.
+    ConnectionRefused,
+    /// The host is not reachable.
+    HostUnreachable,
     /// The network for this address is unreachable (e.g. no IPv6 connectivity).
     NetworkUnreachable,
 }
@@ -170,6 +175,10 @@ pub enum StatusUpdate {
         at: u64,
     },
     Offline(NetAddr),
+    /// The host is reachable but the port is closed (TCP RST).
+    ConnectionRefused(NetAddr),
+    /// The host is not reachable.
+    HostUnreachable(NetAddr),
     /// The network for this address is unreachable (e.g. no IPv6 connectivity).
     NetworkUnreachable(NetAddr),
     /// Sent when the task for an address exits; clears `active_task`.
@@ -298,6 +307,16 @@ impl AddrStore {
             StatusUpdate::Offline(addr) => {
                 if let Some(entry) = self.entries.get_mut(&addr) {
                     entry.status = AddrStatus::Offline;
+                }
+            }
+            StatusUpdate::ConnectionRefused(addr) => {
+                if let Some(entry) = self.entries.get_mut(&addr) {
+                    entry.status = AddrStatus::ConnectionRefused;
+                }
+            }
+            StatusUpdate::HostUnreachable(addr) => {
+                if let Some(entry) = self.entries.get_mut(&addr) {
+                    entry.status = AddrStatus::HostUnreachable;
                 }
             }
             StatusUpdate::NetworkUnreachable(addr) => {
