@@ -26,7 +26,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::addresses::{NetAddr, StatusUpdate};
 use crate::peer::{Peer, PeerV1, PeerV2};
 
-pub(crate) const MAGIC: Magic = Magic::BITCOIN;
+pub(crate) const MAGIC: Magic = Magic::SIGNET;
 const USER_AGENT: &str = "/p2p-observer:0.1.0/";
 
 /// Initial wait before the first reconnect attempt after a failure.
@@ -46,6 +46,26 @@ const PING_INTERVAL: Duration = Duration::from_secs(120);
 const HIGH_BANDWIDTH_COMPACT_BLOCKS: bool = false;
 
 static PEER_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Information collected from the peer during the version handshake.
+struct HandshakeInfo {
+    version: message_network::VersionMessage,
+    #[allow(dead_code)]
+    send_headers: bool,
+    #[allow(dead_code)]
+    send_addr_v2: bool,
+}
+
+/// A live connection to a peer, created after a successful version handshake.
+struct Connection<P: Peer> {
+    peer: P,
+    new_addr_tx: mpsc::Sender<Vec<NetAddr>>,
+    #[allow(dead_code)]
+    handshake_info: HandshakeInfo,
+    /// Last SendCmpct received from the peer.
+    #[allow(dead_code)]
+    send_cmpct: Option<SendCmpct>,
+}
 
 pub async fn connect_with_retry(
     addr: NetAddr,
@@ -173,16 +193,19 @@ async fn connect_v2(
     .await?;
     let mut peer = PeerV2 { proto };
 
-    let version = version_handshake(&mut peer).await?;
+    let info = version_handshake(&mut peer).await?;
     let connected_at = Instant::now();
-    let conn_span = tracing::info_span!("", v = 2, ua = %version.user_agent);
+    let conn_span = tracing::info_span!("", v = 2, ua = %info.version.user_agent);
 
     tracing::trace!("v2 connection established");
     peer.send(NetworkMessage::GetAddr).await?;
-    if let Err(e) = message_loop(&mut peer, new_addr_tx)
-        .instrument(conn_span)
-        .await
-    {
+    let mut conn = Connection {
+        peer,
+        new_addr_tx: new_addr_tx.clone(),
+        handshake_info: info,
+        send_cmpct: None,
+    };
+    if let Err(e) = conn.run().instrument(conn_span).await {
         tracing::debug!("v2 connection error: {e}");
     }
     Ok(connected_at)
@@ -203,26 +226,31 @@ async fn connect_v1(
         writer,
     };
 
-    let version = version_handshake(&mut peer).await?;
+    let info = version_handshake(&mut peer).await?;
     let connected_at = Instant::now();
-    let conn_span = tracing::info_span!("", v = 1, ua = %version.user_agent);
+    let conn_span = tracing::info_span!("", v = 1, ua = %info.version.user_agent);
 
     tracing::trace!("v1 connection established");
     peer.send(NetworkMessage::GetAddr).await?;
-    if let Err(e) = message_loop(&mut peer, new_addr_tx)
-        .instrument(conn_span)
-        .await
-    {
+    let mut conn = Connection {
+        peer,
+        new_addr_tx: new_addr_tx.clone(),
+        handshake_info: info,
+        send_cmpct: None,
+    };
+    if let Err(e) = conn.run().instrument(conn_span).await {
         tracing::debug!("v1 connection error: {e}");
     }
     Ok(connected_at)
 }
 
-async fn version_handshake(peer: &mut impl Peer) -> Result<message_network::VersionMessage> {
+async fn version_handshake(peer: &mut impl Peer) -> Result<HandshakeInfo> {
     peer.send(build_version()).await?;
 
     let mut peer_version: Option<message_network::VersionMessage> = None;
     let mut got_verack = false;
+    let mut send_headers = false;
+    let mut send_addr_v2 = false;
 
     while !(peer_version.is_some() && got_verack) {
         match peer.recv().await? {
@@ -232,6 +260,8 @@ async fn version_handshake(peer: &mut impl Peer) -> Result<message_network::Vers
                     ua = v.user_agent.to_string(),
                     "received version"
                 );
+                // Advertise addrv2 support (BIP155)
+                peer.send(NetworkMessage::SendAddrV2).await?;
                 peer.send(NetworkMessage::Verack).await?;
                 peer_version = Some(v);
             }
@@ -239,12 +269,17 @@ async fn version_handshake(peer: &mut impl Peer) -> Result<message_network::Vers
                 tracing::trace!("handshake complete");
                 got_verack = true;
             }
+            NetworkMessage::SendHeaders => {
+                tracing::debug!("received sendheaders (during version handshake)");
+                send_headers = true;
+            }
+            NetworkMessage::SendAddrV2 => {
+                tracing::debug!("received sendaddrv2 (during version handshake)");
+                send_addr_v2 = true;
+            }
             other => tracing::debug!("ignored during handshake: {:?}", other),
         }
     }
-
-    // Advertise addrv2 support (BIP155).
-    peer.send(NetworkMessage::SendAddrV2).await?;
 
     // Request compact block announcements (version 2 = segwit).
     peer.send(NetworkMessage::SendCmpct(SendCmpct {
@@ -253,119 +288,141 @@ async fn version_handshake(peer: &mut impl Peer) -> Result<message_network::Vers
     }))
     .await?;
 
-    Ok(peer_version.expect("loop invariant: version is Some when loop exits"))
+    Ok(HandshakeInfo {
+        version: peer_version.expect("loop invariant: version is Some when loop exits"),
+        send_headers,
+        send_addr_v2,
+    })
 }
 
-async fn message_loop(
-    peer: &mut impl Peer,
-    new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
-) -> Result<()> {
-    let mut ping_timer = interval(PING_INTERVAL);
-    ping_timer.tick().await; // skip the immediate first tick
+impl<P: Peer> Connection<P> {
+    /// Main message loop — runs until the peer disconnects or an error occurs.
+    async fn run(&mut self) -> Result<()> {
+        let mut ping_timer = interval(PING_INTERVAL);
+        ping_timer.tick().await; // skip the immediate first tick
 
-    // Note: peer.recv() is not cancel-safe — if the ping timer fires while a read_exact
-    // is mid-header, the partial bytes are lost. In practice this is rare and the worst
-    // outcome is a parse error and reconnect, which is acceptable for an observer.
-    loop {
-        tokio::select! {
-            _ = ping_timer.tick() => send_ping(peer).await?,
-            msg = peer.recv() => handle_message(peer, msg?, new_addr_tx).await?,
-        }
-    }
-}
-
-async fn send_ping(peer: &mut impl Peer) -> Result<()> {
-    let nonce = unix_ms();
-    tracing::trace!(ts_ms = nonce, "sending ping");
-    peer.send(NetworkMessage::Ping(nonce)).await
-}
-
-async fn handle_message(
-    peer: &mut impl Peer,
-    msg: NetworkMessage,
-    new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
-) -> Result<()> {
-    match msg {
-        NetworkMessage::Ping(nonce) => handle_ping(peer, nonce).await?,
-        NetworkMessage::Pong(nonce) => handle_pong(nonce),
-        NetworkMessage::Inv(inv) => handle_inv(peer, inv.0).await?,
-        NetworkMessage::Headers(headers) => handle_headers(headers.0),
-        NetworkMessage::CmpctBlock(cmpct) => handle_cmpct_block(cmpct),
-        NetworkMessage::Addr(payload) => handle_addr(&payload.0, new_addr_tx),
-        NetworkMessage::AddrV2(payload) => handle_addrv2(&payload.0, new_addr_tx),
-        other => tracing::debug!("received: {:?}", other),
-    }
-    Ok(())
-}
-
-async fn handle_inv(peer: &mut impl Peer, inv: Vec<Inventory>) -> Result<()> {
-    let mut getdata = Vec::new();
-
-    for item in inv {
-        match item {
-            Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
-                // log the inv, but don't request the full block
-                tracing::info!(%hash, "inv: block");
+        // Note: peer.recv() is not cancel-safe — if the ping timer fires while a read_exact
+        // is mid-header, the partial bytes are lost. In practice this is rare and the worst
+        // outcome is a parse error and reconnect, which is acceptable for an observer.
+        loop {
+            tokio::select! {
+                _ = ping_timer.tick() => self.send_ping().await?,
+                msg = self.peer.recv() => self.handle_message(msg?).await?,
             }
-            Inventory::CompactBlock(hash) => {
-                tracing::info!(%hash, "inv: compact block");
-                getdata.push(Inventory::CompactBlock(hash));
-            }
-            _ => {}
         }
     }
 
-    if !getdata.is_empty() {
-        peer.send(NetworkMessage::GetData(
-            common::p2p::message::InventoryPayload(getdata),
-        ))
-        .await?;
+    async fn send_ping(&mut self) -> Result<()> {
+        let nonce = unix_ms();
+        tracing::trace!(ts_ms = nonce, "sending ping");
+        self.peer.send(NetworkMessage::Ping(nonce)).await
     }
 
-    Ok(())
-}
-
-fn handle_headers(headers: Vec<common::bitcoin::block::Header>) {
-    for header in headers {
-        let hash = header.block_hash();
-        tracing::info!(%hash, "header announcement");
+    async fn handle_message(&mut self, msg: NetworkMessage) -> Result<()> {
+        match msg {
+            NetworkMessage::Ping(nonce) => self.handle_ping(nonce).await?,
+            NetworkMessage::Pong(nonce) => self.handle_pong(nonce),
+            NetworkMessage::Inv(inv) => self.handle_inv(inv.0).await?,
+            NetworkMessage::Headers(headers) => self.handle_headers(headers.0),
+            NetworkMessage::CmpctBlock(cmpct) => self.handle_cmpct_block(cmpct),
+            NetworkMessage::Addr(payload) => self.handle_addr(&payload.0),
+            NetworkMessage::AddrV2(payload) => self.handle_addrv2(&payload.0),
+            NetworkMessage::SendCmpct(sc) => self.handle_send_cmpct(sc),
+            // Not expected after the version handshake.
+            NetworkMessage::SendHeaders => self.handle_send_headers(),
+            NetworkMessage::SendAddrV2 => self.handle_send_addr_v2(),
+            other => tracing::debug!("received: {:?}", other),
+        }
+        Ok(())
     }
-}
 
-fn handle_cmpct_block(cmpct: common::p2p::message_compact_blocks::CmpctBlock) {
-    let hash = cmpct.compact_block.header.block_hash();
-    tracing::info!(%hash, "compact block");
-}
+    async fn handle_inv(&mut self, inv: Vec<Inventory>) -> Result<()> {
+        let mut getdata = Vec::new();
 
-async fn handle_ping(peer: &mut impl Peer, nonce: u64) -> Result<()> {
-    tracing::trace!(nonce, "received ping");
-    peer.send(NetworkMessage::Pong(nonce)).await
-}
+        for item in inv {
+            match item {
+                Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
+                    // log the inv, but don't request the full block
+                    tracing::info!(%hash, "inv: block");
+                }
+                Inventory::CompactBlock(hash) => {
+                    tracing::info!(%hash, "inv: compact block");
+                    getdata.push(Inventory::CompactBlock(hash));
+                }
+                _ => {}
+            }
+        }
 
-fn handle_pong(nonce: u64) {
-    let rtt_ms = unix_ms().saturating_sub(nonce);
-    tracing::debug!(rtt_ms, "pong");
-}
+        if !getdata.is_empty() {
+            self.peer
+                .send(NetworkMessage::GetData(
+                    common::p2p::message::InventoryPayload(getdata),
+                ))
+                .await?;
+        }
 
-fn handle_addr(addrs: &[(u32, Address)], new_addr_tx: &mpsc::Sender<Vec<NetAddr>>) {
-    tracing::trace!(num = addrs.len(), "received addr");
-    let converted: Vec<NetAddr> = addrs
-        .iter()
-        .filter_map(|(_, a)| NetAddr::try_from(a).ok())
-        .collect();
-    if !converted.is_empty() {
-        let _ = new_addr_tx.try_send(converted);
+        Ok(())
     }
-}
 
-fn handle_addrv2(addrs: &[AddrV2Message], new_addr_tx: &mpsc::Sender<Vec<NetAddr>>) {
-    tracing::trace!(num = addrs.len(), "received addrv2");
-    let converted: Vec<NetAddr> = addrs
-        .iter()
-        .filter_map(|m| NetAddr::try_from(m).ok())
-        .collect();
-    if !converted.is_empty() {
-        let _ = new_addr_tx.try_send(converted);
+    fn handle_headers(&self, headers: Vec<common::bitcoin::block::Header>) {
+        for header in headers {
+            let hash = header.block_hash();
+            tracing::info!(%hash, "header announcement");
+        }
+    }
+
+    fn handle_cmpct_block(&self, cmpct: common::p2p::message_compact_blocks::CmpctBlock) {
+        let hash = cmpct.compact_block.header.block_hash();
+        tracing::info!(%hash, "compact block");
+    }
+
+    async fn handle_ping(&mut self, nonce: u64) -> Result<()> {
+        tracing::trace!(nonce, "received ping");
+        self.peer.send(NetworkMessage::Pong(nonce)).await
+    }
+
+    fn handle_pong(&self, nonce: u64) {
+        let rtt_ms = unix_ms().saturating_sub(nonce);
+        tracing::debug!(rtt_ms, "pong");
+    }
+
+    fn handle_addr(&self, addrs: &[(u32, Address)]) {
+        tracing::trace!(num = addrs.len(), "received addr");
+        let converted: Vec<NetAddr> = addrs
+            .iter()
+            .filter_map(|(_, a)| NetAddr::try_from(a).ok())
+            .collect();
+        if !converted.is_empty() {
+            let _ = self.new_addr_tx.try_send(converted);
+        }
+    }
+
+    fn handle_addrv2(&self, addrs: &[AddrV2Message]) {
+        tracing::trace!(num = addrs.len(), "received addrv2");
+        let converted: Vec<NetAddr> = addrs
+            .iter()
+            .filter_map(|m| NetAddr::try_from(m).ok())
+            .collect();
+        if !converted.is_empty() {
+            let _ = self.new_addr_tx.try_send(converted);
+        }
+    }
+
+    fn handle_send_cmpct(&mut self, sc: SendCmpct) {
+        tracing::debug!(
+            send_compact = sc.send_compact,
+            version = sc.version,
+            "received sendcmpct"
+        );
+        self.send_cmpct = Some(sc);
+    }
+
+    fn handle_send_headers(&self) {
+        tracing::warn!("received sendheaders outside of handshake");
+    }
+
+    fn handle_send_addr_v2(&self) {
+        tracing::warn!("received sendaddrv2 outside of handshake");
     }
 }
 
