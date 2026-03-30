@@ -1,0 +1,10 @@
+name: Common setup for p2p-observer nix-based workflows
+description: Install nix
+
+runs:
+  using: composite
+  steps:
+    - name: Install Nix
+      uses: cachix/install-nix-action@v31
+      with:
+        nix_path: nixpkgs=channel:nixos-25.11

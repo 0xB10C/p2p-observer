@@ -383,6 +383,34 @@ fn unix_secs() -> u64 {
         .as_secs()
 }
 
+fn build_version() -> NetworkMessage {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs() as i64;
+
+    NetworkMessage::Version(message_network::VersionMessage {
+        version: ProtocolVersion::WTXID_RELAY_VERSION,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp,
+        receiver: address::Address::new(
+            &SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            ServiceFlags::NONE,
+        ),
+        sender: address::Address::new(
+            &SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            ServiceFlags::NONE,
+        ),
+        // Since we don't accept inbound connections, we don't have to fear about
+        // connecting to ourself. The peer likely won't use zero to open a connection
+        // at the same time, so this should be fine.
+        nonce: 0,
+        user_agent: UserAgent::from_nonstandard(USER_AGENT),
+        start_height: 0,
+        relay: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,32 +557,4 @@ mod tests {
             .await
             .expect("v2 version handshake failed");
     }
-}
-
-fn build_version() -> NetworkMessage {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_secs() as i64;
-
-    NetworkMessage::Version(message_network::VersionMessage {
-        version: ProtocolVersion::WTXID_RELAY_VERSION,
-        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
-        timestamp,
-        receiver: address::Address::new(
-            &SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            ServiceFlags::NONE,
-        ),
-        sender: address::Address::new(
-            &SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            ServiceFlags::NONE,
-        ),
-        // Since we don't accept inbound connections, we don't have to fear about
-        // connecting to ourself. The peer likely won't use zero to open a connection
-        // at the same time, so this should be fine.
-        nonce: 0,
-        user_agent: UserAgent::from_nonstandard(USER_AGENT),
-        start_height: 0,
-        relay: false,
-    })
 }
