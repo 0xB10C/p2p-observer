@@ -127,6 +127,13 @@ async fn retry_loop(
                 );
             }
             Err(e) => {
+                if is_network_unreachable(&e) {
+                    tracing::info!("network unreachable, not retrying");
+                    let _ = status_tx
+                        .send(StatusUpdate::NetworkUnreachable(addr.clone()))
+                        .await;
+                    break;
+                }
                 tracing::trace!(
                     attempts,
                     backoff_ms = backoff.as_millis(),
@@ -425,6 +432,15 @@ impl<T: Transport> Connection<T> {
     fn handle_send_addr_v2(&self) {
         tracing::warn!("received sendaddrv2 outside of handshake");
     }
+}
+
+/// Check if the root cause of the error is an "network unreachable" OS error.
+fn is_network_unreachable(err: &common::anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NetworkUnreachable)
+    })
 }
 
 fn unix_ms() -> u64 {

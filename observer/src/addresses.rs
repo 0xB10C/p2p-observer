@@ -150,6 +150,8 @@ pub enum AddrStatus {
     /// Unix timestamp (seconds) of the last successful connection.
     LastSeen(u64),
     Offline,
+    /// The network for this address is unreachable (e.g. no IPv6 connectivity).
+    NetworkUnreachable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +170,8 @@ pub enum StatusUpdate {
         at: u64,
     },
     Offline(NetAddr),
+    /// The network for this address is unreachable (e.g. no IPv6 connectivity).
+    NetworkUnreachable(NetAddr),
     /// Sent when the task for an address exits; clears `active_task`.
     TaskDone(NetAddr),
 }
@@ -294,6 +298,11 @@ impl AddrStore {
             StatusUpdate::Offline(addr) => {
                 if let Some(entry) = self.entries.get_mut(&addr) {
                     entry.status = AddrStatus::Offline;
+                }
+            }
+            StatusUpdate::NetworkUnreachable(addr) => {
+                if let Some(entry) = self.entries.get_mut(&addr) {
+                    entry.status = AddrStatus::NetworkUnreachable;
                 }
             }
             StatusUpdate::TaskDone(addr) => {
