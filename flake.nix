@@ -23,9 +23,22 @@
               pkgs.clippy
               pkgs.rustfmt
               pkgs.rust-analyzer
+              pkgs.cargo-tarpaulin
 
+              # for integration tests
+              pkgs.bitcoind
               pkgs.nats-server
             ];
+
+            shellHook = ''
+              # during the integration tests, don't try to download a bitcoind binary
+              # use the nix one instead
+              export BITCOIND_SKIP_DOWNLOAD=1
+              export BITCOIND_EXE=${pkgs.bitcoind}/bin/bitcoind
+
+              # Use for running integration tests
+              export NATS_SERVER_BINARY="${pkgs.nats-server}/bin/nats-server"
+            '';
           };
         });
     };
