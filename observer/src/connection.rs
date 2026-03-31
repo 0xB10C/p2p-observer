@@ -107,7 +107,7 @@ async fn retry_loop(
                     backoff = BACKOFF_BASE;
                     attempts = 0;
                 }
-                tracing::info!(target: TARGET,
+                tracing::warn!(target: TARGET,
                     uptime = format!("{:?}", uptime),
                     "connection lost. reconnecting in {backoff:.1?}"
                 );
