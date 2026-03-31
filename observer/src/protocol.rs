@@ -112,9 +112,16 @@ pub(crate) async fn version_handshake(transport: &mut impl Transport) -> Result<
                     ua = v.user_agent.to_string(),
                     "received version"
                 );
-                // Advertise addrv2 support (BIP155).
-                transport.send(NetworkMessage::SendAddrV2).await?;
+                // utreexod (btcd-based, version 70013, ua "/btcwire:0.5.0/utreexod:0.5.0/")
+                // rejects any message between version and verack, including
+                // sendaddrv2. Skip it for this peer to avoid a "reject" disconnect.
+                let skip_sendaddrv2 = u32::from(v.version) == 70013
+                    && v.user_agent.to_string() == "/btcwire:0.5.0/utreexod:0.5.0/";
+                if !skip_sendaddrv2 {
+                    transport.send(NetworkMessage::SendAddrV2).await?;
+                }
                 transport.send(NetworkMessage::Verack).await?;
+
                 peer_version = Some(v);
             }
             NetworkMessage::Verack => {

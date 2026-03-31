@@ -40,7 +40,18 @@ where
 
     async fn recv(&mut self) -> Result<NetworkMessage> {
         let payload = self.proto.read().await.context("v2 read")?;
-        let msg: V2NetworkMessage = deserialize(payload.contents()).context("v2 deserialize")?;
+        let contents = payload.contents();
+        let msg: V2NetworkMessage = match deserialize(contents) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(target: TARGET,
+                    len = contents.len(),
+                    hex = contents[..contents.len().min(64)].iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    "v2 deserialize failed: {e}"
+                );
+                return Err(e).context("v2 deserialize");
+            }
+        };
         Ok(msg.into_payload())
     }
 }
@@ -74,7 +85,19 @@ where
             .await
             .context("v1 payload read")?;
 
-        let raw: RawNetworkMessage = deserialize(&buf).context("v1 deserialize")?;
+        let raw: RawNetworkMessage = match deserialize(&buf) {
+            Ok(m) => m,
+            Err(e) => {
+                let cmd = String::from_utf8_lossy(&header[4..16]);
+                tracing::warn!(target: TARGET,
+                    cmd = %cmd.trim_end_matches('\0'),
+                    payload_len,
+                    hex = buf[24..buf.len().min(88)].iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    "v1 deserialize failed: {e}"
+                );
+                return Err(e).context("v1 deserialize");
+            }
+        };
         Ok(raw.into_payload())
     }
 }
