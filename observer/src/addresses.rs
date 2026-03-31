@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -145,13 +145,7 @@ pub fn parse_addr(s: &str) -> Option<NetAddr> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(crate = "common::serde")]
-pub enum AddrStatus {
-    Unknown,
-    /// Unix timestamp (seconds) of the last successful connection.
-    LastSeen(u64),
-    Offline,
-    /// The host is reachable but the port is closed (TCP RST). The Bitcoin
-    /// node is likely not running or not listening on this port.
+pub enum BadReason {
     ConnectionRefused,
     /// The host is not reachable.
     HostUnreachable,
@@ -161,37 +155,29 @@ pub enum AddrStatus {
     TimedOut,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(crate = "common::serde")]
-pub struct AddrEntry {
-    pub addr: NetAddr,
-    pub status: AddrStatus,
-    /// True while a tokio task is active for this address. Not persisted.
-    #[serde(skip)]
-    pub active_task: bool,
-}
-
 pub enum StatusUpdate {
-    LastSeen {
+    Good {
         addr: NetAddr,
         at: u64,
     },
-    Offline(NetAddr),
-    /// The host is reachable but the port is closed (TCP RST).
-    ConnectionRefused(NetAddr),
-    /// The host is not reachable.
-    HostUnreachable(NetAddr),
-    /// The network for this address is unreachable (e.g. no IPv6 connectivity).
-    NetworkUnreachable(NetAddr),
-    /// TCP connection timed out — the node may be firewalled or the IP unoccupied.
-    TimedOut(NetAddr),
-    /// Sent when the task for an address exits; clears `active_task`.
-    TaskDone(NetAddr),
+    Bad {
+        addr: NetAddr,
+        at: u64,
+        reason: BadReason,
+    },
 }
 
+const MAX_UNKNOWN: usize = 10_000;
+const MAX_GOOD: usize = 500_000;
+const MAX_BAD: usize = 100_000;
+
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "common::serde")]
 pub struct AddrStore {
-    entries: HashMap<NetAddr, AddrEntry>,
-    max_size: usize,
+    unknown: HashSet<NetAddr>,
+    good: HashMap<NetAddr, u64>,
+    bad: HashMap<NetAddr, (u64, BadReason)>,
+    #[serde(skip)]
     persist_path: PathBuf,
 }
 
@@ -199,13 +185,10 @@ impl AddrStore {
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(s) => {
-                let entries: Vec<AddrEntry> =
+                let mut store: AddrStore =
                     serde_json::from_str(&s).context("parse address store")?;
-                Ok(Self {
-                    entries: entries.into_iter().map(|e| (e.addr.clone(), e)).collect(),
-                    max_size: 10_000,
-                    persist_path: path.to_owned(),
-                })
+                store.persist_path = path.to_owned();
+                Ok(store)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::empty(path)),
             Err(e) => Err(e).context("read address store"),
@@ -214,149 +197,112 @@ impl AddrStore {
 
     pub fn empty(path: &Path) -> Self {
         Self {
-            entries: HashMap::new(),
-            max_size: 10_000,
+            unknown: HashSet::new(),
+            good: HashMap::new(),
+            bad: HashMap::new(),
             persist_path: path.to_owned(),
         }
     }
 
     pub fn save(&self) -> Result<()> {
-        let entries: Vec<&AddrEntry> = self.entries.values().collect();
-        let json = serde_json::to_string(&entries).context("serialize address store")?;
+        let json = serde_json::to_string(self).context("serialize address store")?;
         std::fs::write(&self.persist_path, json).context("write address store")
     }
 
-    /// Insert a new address. Returns `false` if already present, not routable, or the store is at capacity.
+    /// Insert a new address as Unknown. Returns `false` if already present in
+    /// any table, not routable, or the unknown table is at capacity.
     pub fn insert(&mut self, addr: NetAddr) -> bool {
         if !addr.is_routable() {
             return false;
         }
-        if self.entries.contains_key(&addr) {
+        if self.unknown.contains(&addr)
+            || self.good.contains_key(&addr)
+            || self.bad.contains_key(&addr)
+        {
             return false;
         }
-        if self.entries.len() >= self.max_size {
-            // TODO: evict oldest Offline entry
+        if self.unknown.len() >= MAX_UNKNOWN {
             return false;
         }
-        self.entries.insert(
-            addr.clone(),
-            AddrEntry {
-                addr: addr.clone(),
-                status: AddrStatus::Unknown,
-                active_task: false,
-            },
+        self.unknown.insert(addr.clone());
+        tracing::debug!(
+            %addr,
+            unknown = self.unknown.len(),
+            good = self.good.len(),
+            bad = self.bad.len(),
+            "new address"
         );
-        let active = self.entries.values().filter(|e| e.active_task).count();
-        tracing::debug!(%addr, total = self.entries.len(), active, "new address");
         true
     }
 
-    /// Returns up to `n` addresses to connect to.
+    /// Returns up to `n` addresses to connect to, excluding those in `active`.
     ///
-    /// Three buckets in priority order:
-    ///   1. `Unknown`   — never attempted, preferred over all others (up to half the batch)
-    ///   2. `LastSeen`  — previously connected, oldest first (up to half the batch)
-    ///   3. Known-bad   — `Offline`, `ConnectionRefused`, `HostUnreachable`, `TimedOut` —
-    ///      only fills slots left over after the first two buckets are exhausted
+    /// Priority order:
+    ///   1. Unknown — up to half the batch
+    ///   2. Good — oldest-seen first, up to half the batch
+    ///   3. Bad — fills remaining slots
     ///
-    /// Only addresses with a TCP socket address and no active task are returned.
-    pub fn get_batch(&self, n: usize) -> Vec<NetAddr> {
+    /// Only addresses with a TCP socket address are returned.
+    pub fn get_batch(&self, n: usize, active: &HashSet<NetAddr>) -> Vec<NetAddr> {
         let half = n / 2;
 
-        let base_filter = |e: &&AddrEntry| !e.active_task && e.addr.to_socket_addr().is_some();
+        let base = |addr: &NetAddr| !active.contains(addr) && addr.to_socket_addr().is_some();
 
-        let fresh: Vec<&AddrEntry> = self
-            .entries
-            .values()
-            .filter(|e| base_filter(e) && matches!(e.status, AddrStatus::Unknown))
+        let fresh: Vec<&NetAddr> = self.unknown.iter().filter(|a| base(a)).collect();
+
+        let mut seen: Vec<(&NetAddr, u64)> = self
+            .good
+            .iter()
+            .filter(|(a, _)| base(a))
+            .map(|(a, &ts)| (a, ts))
             .collect();
+        seen.sort_by_key(|(_, ts)| *ts);
 
-        let mut seen: Vec<&AddrEntry> = self
-            .entries
-            .values()
-            .filter(|e| base_filter(e) && matches!(e.status, AddrStatus::LastSeen(_)))
-            .collect();
+        let stale: Vec<&NetAddr> = self.bad.keys().filter(|a| base(a)).collect();
 
-        let stale: Vec<&AddrEntry> = self
-            .entries
-            .values()
-            .filter(|e| {
-                base_filter(e)
-                    && matches!(
-                        e.status,
-                        AddrStatus::Offline
-                            | AddrStatus::ConnectionRefused
-                            | AddrStatus::HostUnreachable
-                            | AddrStatus::TimedOut
-                    )
-            })
-            .collect();
-
-        // Oldest first
-        seen.sort_by_key(|e| match e.status {
-            AddrStatus::LastSeen(t) => t,
-            _ => 0,
-        });
-
-        // Fill Unknown and LastSeen with a 50/50 split, overflowing to each other.
         let from_seen_initial = seen.len().min(half);
         let from_fresh = fresh.len().min(n - from_seen_initial);
         let from_seen = seen.len().min(n - from_fresh);
-        // Known-bad only fills slots left over once Unknown and LastSeen are exhausted.
         let from_stale = stale.len().min(n - from_fresh - from_seen);
 
         let mut result = Vec::with_capacity(from_fresh + from_seen + from_stale);
-        result.extend(fresh[..from_fresh].iter().map(|e| e.addr.clone()));
-        result.extend(seen[..from_seen].iter().map(|e| e.addr.clone()));
-        result.extend(stale[..from_stale].iter().map(|e| e.addr.clone()));
+        result.extend(fresh[..from_fresh].iter().cloned().cloned());
+        result.extend(seen[..from_seen].iter().map(|(a, _)| (*a).clone()));
+        result.extend(stale[..from_stale].iter().cloned().cloned());
         result
     }
 
-    pub fn entries_len(&self) -> usize {
-        self.entries.len()
+    pub fn unknown_len(&self) -> usize {
+        self.unknown.len()
     }
 
-    pub fn mark_task_started(&mut self, addr: &NetAddr) {
-        if let Some(entry) = self.entries.get_mut(addr) {
-            entry.active_task = true;
-        }
+    pub fn good_len(&self) -> usize {
+        self.good.len()
+    }
+
+    pub fn bad_len(&self) -> usize {
+        self.bad.len()
+    }
+
+    /// Remove the address from whichever table it's in.
+    fn remove(&mut self, addr: &NetAddr) {
+        self.unknown.remove(addr);
+        self.good.remove(addr);
+        self.bad.remove(addr);
     }
 
     pub fn apply_update(&mut self, update: StatusUpdate) {
         match update {
-            StatusUpdate::LastSeen { addr, at } => {
-                if let Some(entry) = self.entries.get_mut(&addr) {
-                    entry.status = AddrStatus::LastSeen(at);
+            StatusUpdate::Good { addr, at } => {
+                self.remove(&addr);
+                if self.good.len() < MAX_GOOD {
+                    self.good.insert(addr, at);
                 }
             }
-            StatusUpdate::Offline(addr) => {
-                if let Some(entry) = self.entries.get_mut(&addr) {
-                    entry.status = AddrStatus::Offline;
-                }
-            }
-            StatusUpdate::ConnectionRefused(addr) => {
-                if let Some(entry) = self.entries.get_mut(&addr) {
-                    entry.status = AddrStatus::ConnectionRefused;
-                }
-            }
-            StatusUpdate::HostUnreachable(addr) => {
-                if let Some(entry) = self.entries.get_mut(&addr) {
-                    entry.status = AddrStatus::HostUnreachable;
-                }
-            }
-            StatusUpdate::NetworkUnreachable(addr) => {
-                if let Some(entry) = self.entries.get_mut(&addr) {
-                    entry.status = AddrStatus::NetworkUnreachable;
-                }
-            }
-            StatusUpdate::TimedOut(addr) => {
-                if let Some(entry) = self.entries.get_mut(&addr) {
-                    entry.status = AddrStatus::TimedOut;
-                }
-            }
-            StatusUpdate::TaskDone(addr) => {
-                if let Some(entry) = self.entries.get_mut(&addr) {
-                    entry.active_task = false;
+            StatusUpdate::Bad { addr, at, reason } => {
+                self.remove(&addr);
+                if self.bad.len() < MAX_BAD {
+                    self.bad.insert(addr, (at, reason));
                 }
             }
         }

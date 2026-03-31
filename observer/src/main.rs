@@ -1,4 +1,5 @@
 use common::{p2p::Magic, tokio, tracing, tracing_subscriber};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MAGIC: Magic = Magic::SIGNET;
@@ -44,24 +45,46 @@ async fn main() {
     tokio::spawn(addresses::run(store.clone(), status_rx, new_addr_rx));
 
     let mut connect_timer = tokio::time::interval(tokio::time::Duration::from_secs(10));
-    let mut task_handles = Vec::new();
+    let mut active_addrs: HashSet<addresses::NetAddr> = HashSet::new();
+    let mut task_handles: Vec<(addresses::NetAddr, tokio::task::JoinHandle<()>)> = Vec::new();
 
     loop {
         tokio::select! {
             _ = connect_timer.tick() => {
+                // Reap finished tasks.
+                task_handles.retain(|(addr, handle)| {
+                    if handle.is_finished() {
+                        active_addrs.remove(addr);
+                        false
+                    } else {
+                        true
+                    }
+                });
+
                 let active = ACTIVE_TASKS.load(Ordering::Relaxed);
                 let connected = IN_MESSAGE_LOOP.load(Ordering::Relaxed);
-                let total = store.lock().unwrap().entries_len();
-                tracing::error!(total, active, connected, "stats");
+                let s = store.lock().unwrap();
+                tracing::error!(
+                    unknown = s.unknown_len(),
+                    good = s.good_len(),
+                    bad = s.bad_len(),
+                    active,
+                    connected,
+                    "stats"
+                );
+                let opening = active - connected;
+                let max_new = 100usize.saturating_sub(opening);
+                let batch = s.get_batch(max_new, &active_addrs);
+                drop(s);
 
-                let batch = store.lock().unwrap().get_batch(10);
                 for addr in batch {
-                    store.lock().unwrap().mark_task_started(&addr);
+                    active_addrs.insert(addr.clone());
                     let status_tx = status_tx.clone();
                     let new_addr_tx = new_addr_tx.clone();
-                    task_handles.push(tokio::spawn(async move {
-                        connection::connect_with_retry(addr, MAGIC, status_tx, new_addr_tx).await;
-                    }));
+                    let a = addr.clone();
+                    task_handles.push((addr, tokio::spawn(async move {
+                        connection::connect_with_retry(a, MAGIC, status_tx, new_addr_tx).await;
+                    })));
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -71,7 +94,7 @@ async fn main() {
         }
     }
 
-    for h in task_handles {
+    for (_, h) in task_handles {
         h.abort();
     }
 }

@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::addresses::{NetAddr, StatusUpdate};
+use crate::addresses::{BadReason, NetAddr, StatusUpdate};
 use crate::protocol::run_session;
 use crate::transport::{TransportV1, TransportV2};
 
@@ -51,7 +51,6 @@ pub async fn connect_with_retry(
         crate::ACTIVE_TASKS.fetch_add(1, Ordering::Relaxed);
         let Some(socket_addr) = addr.to_socket_addr() else {
             tracing::debug!("no TCP address, skipping");
-            let _ = status_tx.send(StatusUpdate::TaskDone(addr)).await;
             crate::ACTIVE_TASKS.fetch_sub(1, Ordering::Relaxed);
             return;
         };
@@ -84,6 +83,12 @@ async fn retry_loop(
         match result {
             Ok(connected_at) => {
                 ever_connected = true;
+                let _ = status_tx
+                    .send(StatusUpdate::Good {
+                        addr: addr.clone(),
+                        at: unix_secs(),
+                    })
+                    .await;
                 let uptime = connected_at.elapsed();
                 // Only reset backoff if the connection was stable long enough — otherwise
                 // a peer that immediately evicts us after the handshake would reset the
@@ -92,23 +97,21 @@ async fn retry_loop(
                     backoff = BACKOFF_BASE;
                     attempts = 0;
                 }
-                let _ = status_tx
-                    .send(StatusUpdate::LastSeen {
-                        addr: addr.clone(),
-                        at: unix_secs(),
-                    })
-                    .await;
                 tracing::trace!(
                     uptime = format!("{:?}", uptime),
                     "connection lost. reconnecting in {backoff:.1?}"
                 );
             }
             Err(e) => {
+                let bad = |reason| StatusUpdate::Bad {
+                    addr: addr.clone(),
+                    at: unix_secs(),
+                    reason,
+                };
+
                 if is_network_unreachable(&e) {
                     tracing::info!("network unreachable, not retrying");
-                    let _ = status_tx
-                        .send(StatusUpdate::NetworkUnreachable(addr.clone()))
-                        .await;
+                    let _ = status_tx.send(bad(BadReason::NetworkUnreachable)).await;
                     break;
                 }
 
@@ -116,7 +119,7 @@ async fn retry_loop(
                     timeout_attempts += 1;
                     if !ever_connected && timeout_attempts >= MAX_TIMEOUT_ATTEMPTS_UNSEEN {
                         tracing::info!(timeout_attempts, "timed out repeatedly, not retrying");
-                        let _ = status_tx.send(StatusUpdate::TimedOut(addr.clone())).await;
+                        let _ = status_tx.send(bad(BadReason::TimedOut)).await;
                         break;
                     }
                 } else {
@@ -126,15 +129,11 @@ async fn retry_loop(
                 if !ever_connected {
                     if is_connection_refused(&e) {
                         tracing::info!("connection refused on first attempt, not retrying");
-                        let _ = status_tx
-                            .send(StatusUpdate::ConnectionRefused(addr.clone()))
-                            .await;
+                        let _ = status_tx.send(bad(BadReason::ConnectionRefused)).await;
                         break;
                     } else if is_host_unreachable(&e) {
                         tracing::info!("host unreachable on first attempt, not retrying");
-                        let _ = status_tx
-                            .send(StatusUpdate::HostUnreachable(addr.clone()))
-                            .await;
+                        let _ = status_tx.send(bad(BadReason::HostUnreachable)).await;
                         break;
                     }
                 }
@@ -150,15 +149,11 @@ async fn retry_loop(
 
         if attempts >= MAX_RECONNECT_ATTEMPTS {
             tracing::info!(attempts, "giving up");
-            if !ever_connected {
-                let _ = status_tx.send(StatusUpdate::Offline(addr.clone())).await;
-            }
             break;
         }
 
         sleep(backoff).await;
     }
-    let _ = status_tx.send(StatusUpdate::TaskDone(addr.clone())).await;
 }
 
 /// Attempts a v2 connection, falling back to v1 on failure.
