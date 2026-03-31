@@ -17,6 +17,7 @@ use common::{
     tracing::Instrument,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::addresses::NetAddr;
@@ -74,9 +75,11 @@ pub(crate) async fn run_session(
         handshake_info: info,
         send_cmpct: None,
     };
+    crate::IN_MESSAGE_LOOP.fetch_add(1, Ordering::Relaxed);
     if let Err(e) = conn.run().instrument(conn_span).await {
         tracing::debug!("connection error: {e}");
     }
+    crate::IN_MESSAGE_LOOP.fetch_sub(1, Ordering::Relaxed);
     Ok(connected_at)
 }
 

@@ -1,8 +1,14 @@
 use common::{p2p::Magic, tokio, tracing, tracing_subscriber};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MAGIC: Magic = Magic::SIGNET;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+/// Number of connection tasks currently running (connecting, retrying, or in message loop).
+pub(crate) static ACTIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
+/// Number of connections that have completed the handshake and are in the main message loop.
+pub(crate) static IN_MESSAGE_LOOP: AtomicUsize = AtomicUsize::new(0);
 
 mod addresses;
 mod connection;
@@ -43,6 +49,11 @@ async fn main() {
     loop {
         tokio::select! {
             _ = connect_timer.tick() => {
+                let active = ACTIVE_TASKS.load(Ordering::Relaxed);
+                let connected = IN_MESSAGE_LOOP.load(Ordering::Relaxed);
+                let total = store.lock().unwrap().entries_len();
+                tracing::error!(total, active, connected, "stats");
+
                 let batch = store.lock().unwrap().get_batch(10);
                 for addr in batch {
                     store.lock().unwrap().mark_task_started(&addr);

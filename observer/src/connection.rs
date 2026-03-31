@@ -48,12 +48,15 @@ pub async fn connect_with_retry(
     let span = tracing::info_span!("c", id, addr = %addr);
 
     async move {
+        crate::ACTIVE_TASKS.fetch_add(1, Ordering::Relaxed);
         let Some(socket_addr) = addr.to_socket_addr() else {
             tracing::debug!("no TCP address, skipping");
             let _ = status_tx.send(StatusUpdate::TaskDone(addr)).await;
+            crate::ACTIVE_TASKS.fetch_sub(1, Ordering::Relaxed);
             return;
         };
-        retry_loop(&addr, socket_addr, magic, status_tx, new_addr_tx).await
+        retry_loop(&addr, socket_addr, magic, status_tx, new_addr_tx).await;
+        crate::ACTIVE_TASKS.fetch_sub(1, Ordering::Relaxed);
     }
     .instrument(span)
     .await

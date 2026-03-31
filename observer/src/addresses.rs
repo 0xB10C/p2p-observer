@@ -247,7 +247,7 @@ impl AddrStore {
             },
         );
         let active = self.entries.values().filter(|e| e.active_task).count();
-        tracing::error!(%addr, total = self.entries.len(), active, "new address");
+        tracing::debug!(%addr, total = self.entries.len(), active, "new address");
         true
     }
 
@@ -310,6 +310,10 @@ impl AddrStore {
         result.extend(seen[..from_seen].iter().map(|e| e.addr.clone()));
         result.extend(stale[..from_stale].iter().map(|e| e.addr.clone()));
         result
+    }
+
+    pub fn entries_len(&self) -> usize {
+        self.entries.len()
     }
 
     pub fn mark_task_started(&mut self, addr: &NetAddr) {
