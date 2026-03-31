@@ -257,7 +257,7 @@ impl AddrStore {
     ///   1. `Unknown`   — never attempted, preferred over all others (up to half the batch)
     ///   2. `LastSeen`  — previously connected, oldest first (up to half the batch)
     ///   3. Known-bad   — `Offline`, `ConnectionRefused`, `HostUnreachable`, `TimedOut` —
-    ///                    only fills slots left over after the first two buckets are exhausted
+    ///      only fills slots left over after the first two buckets are exhausted
     ///
     /// Only addresses with a TCP socket address and no active task are returned.
     pub fn get_batch(&self, n: usize) -> Vec<NetAddr> {
