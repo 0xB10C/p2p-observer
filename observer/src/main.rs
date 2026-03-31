@@ -1,9 +1,12 @@
-use common::{tokio, tracing, tracing_subscriber};
+use common::{p2p::Magic, tokio, tracing, tracing_subscriber};
+
+const MAGIC: Magic = Magic::SIGNET;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 mod addresses;
 mod connection;
+mod protocol;
 mod transport;
 
 #[tokio::main]
@@ -46,7 +49,7 @@ async fn main() {
                     let status_tx = status_tx.clone();
                     let new_addr_tx = new_addr_tx.clone();
                     task_handles.push(tokio::spawn(async move {
-                        connection::connect_with_retry(addr, status_tx, new_addr_tx).await;
+                        connection::connect_with_retry(addr, MAGIC, status_tx, new_addr_tx).await;
                     }));
                 }
             }
