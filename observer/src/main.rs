@@ -107,4 +107,8 @@ async fn main() {
     for (_, h) in task_handles {
         h.abort();
     }
+
+    if let Err(e) = store.lock().unwrap().save() {
+        tracing::warn!(target: TARGET_MAIN, "failed to persist address store on shutdown: {e}");
+    }
 }

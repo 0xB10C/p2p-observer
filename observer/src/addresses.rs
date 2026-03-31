@@ -144,7 +144,7 @@ pub fn parse_addr(s: &str) -> Option<NetAddr> {
 
 // ── Store types ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(crate = "common::serde")]
 pub enum BadReason {
     ConnectionRefused,
@@ -172,24 +172,34 @@ const MAX_UNKNOWN: usize = 10_000;
 const MAX_GOOD: usize = 500_000;
 const MAX_BAD: usize = 100_000;
 
-#[derive(Serialize, Deserialize)]
-#[serde(crate = "common::serde")]
 pub struct AddrStore {
     unknown: HashSet<NetAddr>,
     good: HashMap<NetAddr, u64>,
     bad: HashMap<NetAddr, (u64, BadReason)>,
-    #[serde(skip)]
     persist_path: PathBuf,
+}
+
+/// On-disk representation — uses Vecs since NetAddr can't be a JSON object key.
+#[derive(Serialize, Deserialize)]
+#[serde(crate = "common::serde")]
+struct StoreDisk {
+    unknown: Vec<NetAddr>,
+    good: Vec<(NetAddr, u64)>,
+    bad: Vec<(NetAddr, u64, BadReason)>,
 }
 
 impl AddrStore {
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(s) => {
-                let mut store: AddrStore =
+                let disk: StoreDisk =
                     serde_json::from_str(&s).context("parse address store")?;
-                store.persist_path = path.to_owned();
-                Ok(store)
+                Ok(Self {
+                    unknown: disk.unknown.into_iter().collect(),
+                    good: disk.good.into_iter().collect(),
+                    bad: disk.bad.into_iter().map(|(a, t, r)| (a, (t, r))).collect(),
+                    persist_path: path.to_owned(),
+                })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::empty(path)),
             Err(e) => Err(e).context("read address store"),
@@ -206,8 +216,20 @@ impl AddrStore {
     }
 
     pub fn save(&self) -> Result<()> {
-        let json = serde_json::to_string(self).context("serialize address store")?;
-        std::fs::write(&self.persist_path, json).context("write address store")
+        let disk = StoreDisk {
+            unknown: self.unknown.iter().cloned().collect(),
+            good: self.good.iter().map(|(a, &t)| (a.clone(), t)).collect(),
+            bad: self.bad.iter().map(|(a, (t, r))| (a.clone(), *t, r.clone())).collect(),
+        };
+        let json = serde_json::to_string(&disk).context("serialize address store")?;
+        std::fs::write(&self.persist_path, json).context("write address store")?;
+        tracing::info!(target: TARGET,
+            unknown = self.unknown.len(),
+            good = self.good.len(),
+            bad = self.bad.len(),
+            "address store saved"
+        );
+        Ok(())
     }
 
     /// Insert new addresses as Unknown. Returns the number of addresses inserted.
