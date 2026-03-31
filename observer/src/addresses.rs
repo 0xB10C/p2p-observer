@@ -209,30 +209,26 @@ impl AddrStore {
         std::fs::write(&self.persist_path, json).context("write address store")
     }
 
-    /// Insert a new address as Unknown. Returns `false` if already present in
-    /// any table, not routable, or the unknown table is at capacity.
-    pub fn insert(&mut self, addr: NetAddr) -> bool {
-        if !addr.is_routable() {
-            return false;
+    /// Insert new addresses as Unknown. Returns the number of addresses inserted.
+    pub fn insert_batch(&mut self, addrs: Vec<NetAddr>) -> usize {
+        let mut inserted = 0;
+        for addr in addrs {
+            if !addr.is_routable() {
+                continue;
+            }
+            if self.unknown.contains(&addr)
+                || self.good.contains_key(&addr)
+                || self.bad.contains_key(&addr)
+            {
+                continue;
+            }
+            if self.unknown.len() >= MAX_UNKNOWN {
+                break;
+            }
+            self.unknown.insert(addr);
+            inserted += 1;
         }
-        if self.unknown.contains(&addr)
-            || self.good.contains_key(&addr)
-            || self.bad.contains_key(&addr)
-        {
-            return false;
-        }
-        if self.unknown.len() >= MAX_UNKNOWN {
-            return false;
-        }
-        self.unknown.insert(addr.clone());
-        tracing::debug!(
-            %addr,
-            unknown = self.unknown.len(),
-            good = self.good.len(),
-            bad = self.bad.len(),
-            "new address"
-        );
-        true
+        inserted
     }
 
     /// Returns up to `n` addresses to connect to, excluding those in `active`.
@@ -332,10 +328,7 @@ pub async fn run(
                 store.lock().unwrap().apply_update(update);
             }
             Some(addrs) = new_addr_rx.recv() => {
-                let mut s = store.lock().unwrap();
-                for addr in addrs {
-                    s.insert(addr);
-                }
+                store.lock().unwrap().insert_batch(addrs);
             }
         }
     }

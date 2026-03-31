@@ -31,12 +31,13 @@ async fn main() {
     {
         let content =
             std::fs::read_to_string("addresses.txt").expect("failed to read addresses.txt");
-        let mut s = store.lock().unwrap();
-        for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            if let Some(addr) = addresses::parse_addr(line) {
-                s.insert(addr);
-            }
-        }
+        let addrs: Vec<_> = content
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .filter_map(addresses::parse_addr)
+            .collect();
+        store.lock().unwrap().insert_batch(addrs);
     }
 
     let (status_tx, status_rx) = tokio::sync::mpsc::channel(256);
