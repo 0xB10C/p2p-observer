@@ -77,7 +77,15 @@ async fn retry_loop(
     let mut ever_connected = false;
 
     loop {
-        let result = try_connect(socket_addr, magic, &mut skip_v1_fallback, &new_addr_tx).await;
+        let result = try_connect(
+            addr,
+            socket_addr,
+            magic,
+            &mut skip_v1_fallback,
+            &status_tx,
+            &new_addr_tx,
+        )
+        .await;
 
         attempts += 1;
         backoff *= 2;
@@ -163,15 +171,17 @@ async fn retry_loop(
 /// a peer is very unlikely to downgrade, and skipping the fallback avoids wasting an
 /// attempt on a protocol the peer has already proven it doesn't need.
 async fn try_connect(
-    addr: SocketAddr,
+    net_addr: &NetAddr,
+    socket_addr: SocketAddr,
     magic: Magic,
     skip_v1_fallback: &mut bool,
+    status_tx: &mpsc::Sender<StatusUpdate>,
     new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
 ) -> Result<Instant> {
     if *skip_v1_fallback {
-        return connect_v2(addr, magic, new_addr_tx).await;
+        return connect_v2(net_addr, socket_addr, magic, status_tx, new_addr_tx).await;
     }
-    match connect_v2(addr, magic, new_addr_tx).await {
+    match connect_v2(net_addr, socket_addr, magic, status_tx, new_addr_tx).await {
         ok @ Ok(_) => {
             *skip_v1_fallback = true;
             ok
@@ -183,18 +193,20 @@ async fn try_connect(
                 return Err(e);
             }
             tracing::trace!(target: TARGET, "v2 failed ({e}), trying v1");
-            connect_v1(addr, magic, new_addr_tx).await
+            connect_v1(net_addr, socket_addr, magic, status_tx, new_addr_tx).await
         }
     }
 }
 
 async fn connect_v2(
-    addr: SocketAddr,
+    net_addr: &NetAddr,
+    socket_addr: SocketAddr,
     magic: Magic,
+    status_tx: &mpsc::Sender<StatusUpdate>,
     new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
 ) -> Result<Instant> {
     tracing::trace!(target: TARGET, "connecting (v2) ...");
-    let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(addr))
+    let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
         .await
         .context("TCP connect timeout")?
         .context("TCP connect")?;
@@ -208,16 +220,18 @@ async fn connect_v2(
         writer,
     )
     .await?;
-    run_session(TransportV2 { proto }, 2, new_addr_tx).await
+    run_session(TransportV2 { proto }, 2, net_addr, status_tx, new_addr_tx).await
 }
 
 async fn connect_v1(
-    addr: SocketAddr,
+    net_addr: &NetAddr,
+    socket_addr: SocketAddr,
     magic: Magic,
+    status_tx: &mpsc::Sender<StatusUpdate>,
     new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
 ) -> Result<Instant> {
     tracing::trace!(target: TARGET, "connecting (v1) ...");
-    let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(addr))
+    let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
         .await
         .context("TCP connect timeout")?
         .context("TCP connect")?;
@@ -229,6 +243,8 @@ async fn connect_v1(
             writer,
         },
         1,
+        net_addr,
+        status_tx,
         new_addr_tx,
     )
     .await
@@ -342,8 +358,10 @@ mod tests {
             // Drop → EOF → client message loop exits → connect_v1 returns Ok
         });
 
+        let net_addr = NetAddr::Ipv4("127.0.0.1".parse().unwrap(), addr.port());
+        let (status_tx, _status_rx) = mpsc::channel(1);
         let (tx, _rx) = mpsc::channel(1);
-        let result = connect_v1(addr, MAGIC, &tx).await;
+        let result = connect_v1(&net_addr, addr, MAGIC, &status_tx, &tx).await;
         server.await.unwrap();
         assert!(result.is_ok(), "connect_v1 failed: {result:?}");
     }
@@ -371,8 +389,10 @@ mod tests {
             server_handshake(&mut transport).await;
         });
 
+        let net_addr = NetAddr::Ipv4("127.0.0.1".parse().unwrap(), addr.port());
+        let (status_tx, _status_rx) = mpsc::channel(1);
         let (tx, _rx) = mpsc::channel(1);
-        let result = connect_v2(addr, MAGIC, &tx).await;
+        let result = connect_v2(&net_addr, addr, MAGIC, &status_tx, &tx).await;
         server.await.unwrap();
         assert!(result.is_ok(), "connect_v2 failed: {result:?}");
     }

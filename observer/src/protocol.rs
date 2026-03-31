@@ -20,7 +20,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::addresses::NetAddr;
+use crate::addresses::{NetAddr, StatusUpdate};
 use crate::transport::Transport;
 
 use crate::TARGET_PROTOCOL as TARGET;
@@ -63,12 +63,20 @@ struct Connection<T: Transport> {
 pub(crate) async fn run_session(
     mut transport: impl Transport,
     v: u8,
+    addr: &NetAddr,
+    status_tx: &mpsc::Sender<StatusUpdate>,
     new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
 ) -> Result<Instant> {
     let info = version_handshake(&mut transport).await?;
     let connected_at = Instant::now();
     let conn_span = tracing::info_span!(target: TARGET, "", v = v, ua = %info.version.user_agent);
 
+    let _ = status_tx
+        .send(StatusUpdate::Good {
+            addr: addr.clone(),
+            at: unix_secs(),
+        })
+        .await;
     tracing::trace!(target: TARGET, "connection established");
     transport.send(NetworkMessage::GetAddr).await?;
     let mut conn = Connection {
@@ -293,6 +301,13 @@ fn unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]

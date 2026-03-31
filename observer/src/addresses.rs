@@ -192,8 +192,7 @@ impl AddrStore {
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(s) => {
-                let disk: StoreDisk =
-                    serde_json::from_str(&s).context("parse address store")?;
+                let disk: StoreDisk = serde_json::from_str(&s).context("parse address store")?;
                 Ok(Self {
                     unknown: disk.unknown.into_iter().collect(),
                     good: disk.good.into_iter().collect(),
@@ -219,7 +218,11 @@ impl AddrStore {
         let disk = StoreDisk {
             unknown: self.unknown.iter().cloned().collect(),
             good: self.good.iter().map(|(a, &t)| (a.clone(), t)).collect(),
-            bad: self.bad.iter().map(|(a, (t, r))| (a.clone(), *t, r.clone())).collect(),
+            bad: self
+                .bad
+                .iter()
+                .map(|(a, (t, r))| (a.clone(), *t, *r))
+                .collect(),
         };
         let json = serde_json::to_string(&disk).context("serialize address store")?;
         std::fs::write(&self.persist_path, json).context("write address store")?;
