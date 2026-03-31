@@ -52,6 +52,9 @@ struct Connection<T: Transport> {
     /// Last SendCmpct received from the peer.
     #[allow(dead_code)]
     send_cmpct: Option<SendCmpct>,
+    /// Minimum fee rate the peer will accept for relay (BIP133).
+    #[allow(dead_code)]
+    fee_filter: Option<common::bitcoin::FeeRate>,
 }
 
 /// Run the Bitcoin P2P session on an already-established transport.
@@ -84,6 +87,7 @@ pub(crate) async fn run_session(
         new_addr_tx: new_addr_tx.clone(),
         handshake_info: info,
         send_cmpct: None,
+        fee_filter: None,
     };
     crate::IN_MESSAGE_LOOP.fetch_add(1, Ordering::Relaxed);
     if let Err(e) = conn.run().instrument(conn_span).await {
@@ -172,6 +176,7 @@ impl<T: Transport> Connection<T> {
             NetworkMessage::Addr(payload) => self.handle_addr(&payload.0),
             NetworkMessage::AddrV2(payload) => self.handle_addrv2(&payload.0),
             NetworkMessage::SendCmpct(sc) => self.handle_send_cmpct(sc),
+            NetworkMessage::FeeFilter(rate) => self.handle_fee_filter(rate),
             NetworkMessage::GetHeaders(_) => self.handle_get_headers().await?,
             NetworkMessage::SendHeaders => self.handle_send_headers(),
             NetworkMessage::SendAddrV2 => self.handle_send_addr_v2(),
@@ -258,6 +263,11 @@ impl<T: Transport> Connection<T> {
             "received sendcmpct"
         );
         self.send_cmpct = Some(sc);
+    }
+
+    fn handle_fee_filter(&mut self, rate: common::bitcoin::FeeRate) {
+        tracing::debug!(target: TARGET, rate=rate.to_sat_per_vb_ceil(), "received feefilter");
+        self.fee_filter = Some(rate);
     }
 
     async fn handle_get_headers(&mut self) -> Result<()> {
