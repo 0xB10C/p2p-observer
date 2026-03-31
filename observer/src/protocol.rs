@@ -172,9 +172,10 @@ impl<T: Transport> Connection<T> {
             NetworkMessage::Addr(payload) => self.handle_addr(&payload.0),
             NetworkMessage::AddrV2(payload) => self.handle_addrv2(&payload.0),
             NetworkMessage::SendCmpct(sc) => self.handle_send_cmpct(sc),
+            NetworkMessage::GetHeaders(_) => self.handle_get_headers().await?,
             NetworkMessage::SendHeaders => self.handle_send_headers(),
             NetworkMessage::SendAddrV2 => self.handle_send_addr_v2(),
-            other => tracing::debug!(target: TARGET, "received: {:?}", other),
+            other => tracing::trace!(target: TARGET, "received: {:?}", other),
         }
         Ok(())
     }
@@ -257,6 +258,15 @@ impl<T: Transport> Connection<T> {
             "received sendcmpct"
         );
         self.send_cmpct = Some(sc);
+    }
+
+    async fn handle_get_headers(&mut self) -> Result<()> {
+        tracing::debug!(target: TARGET, "received getheaders, responding with empty headers");
+        self.transport
+            .send(NetworkMessage::Headers(
+                common::p2p::message::HeadersMessage(vec![]),
+            ))
+            .await
     }
 
     fn handle_send_headers(&self) {
