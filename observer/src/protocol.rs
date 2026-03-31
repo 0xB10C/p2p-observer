@@ -37,8 +37,6 @@ const HIGH_BANDWIDTH_COMPACT_BLOCKS: bool = false;
 pub(crate) struct HandshakeInfo {
     pub(crate) version: message_network::VersionMessage,
     #[allow(dead_code)]
-    pub(crate) send_headers: bool,
-    #[allow(dead_code)]
     pub(crate) send_addr_v2: bool,
 }
 
@@ -87,7 +85,6 @@ pub(crate) async fn version_handshake(transport: &mut impl Transport) -> Result<
 
     let mut peer_version: Option<message_network::VersionMessage> = None;
     let mut got_verack = false;
-    let mut send_headers = false;
     let mut send_addr_v2 = false;
 
     while !(peer_version.is_some() && got_verack) {
@@ -107,10 +104,6 @@ pub(crate) async fn version_handshake(transport: &mut impl Transport) -> Result<
                 tracing::trace!("handshake complete");
                 got_verack = true;
             }
-            NetworkMessage::SendHeaders => {
-                tracing::debug!("received sendheaders (during version handshake)");
-                send_headers = true;
-            }
             NetworkMessage::SendAddrV2 => {
                 tracing::debug!("received sendaddrv2 (during version handshake)");
                 send_addr_v2 = true;
@@ -129,7 +122,6 @@ pub(crate) async fn version_handshake(transport: &mut impl Transport) -> Result<
 
     Ok(HandshakeInfo {
         version: peer_version.expect("loop invariant: version is Some when loop exits"),
-        send_headers,
         send_addr_v2,
     })
 }
@@ -167,7 +159,6 @@ impl<T: Transport> Connection<T> {
             NetworkMessage::Addr(payload) => self.handle_addr(&payload.0),
             NetworkMessage::AddrV2(payload) => self.handle_addrv2(&payload.0),
             NetworkMessage::SendCmpct(sc) => self.handle_send_cmpct(sc),
-            // Not expected after the version handshake.
             NetworkMessage::SendHeaders => self.handle_send_headers(),
             NetworkMessage::SendAddrV2 => self.handle_send_addr_v2(),
             other => tracing::debug!("received: {:?}", other),
@@ -256,7 +247,7 @@ impl<T: Transport> Connection<T> {
     }
 
     fn handle_send_headers(&self) {
-        tracing::warn!("received sendheaders outside of handshake");
+        tracing::debug!("received sendheaders");
     }
 
     fn handle_send_addr_v2(&self) {
