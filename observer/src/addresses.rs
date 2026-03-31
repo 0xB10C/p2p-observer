@@ -157,6 +157,8 @@ pub enum AddrStatus {
     HostUnreachable,
     /// The network for this address is unreachable (e.g. no IPv6 connectivity).
     NetworkUnreachable,
+    /// TCP connection timed out — the node may be firewalled or the IP unoccupied.
+    TimedOut,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +183,8 @@ pub enum StatusUpdate {
     HostUnreachable(NetAddr),
     /// The network for this address is unreachable (e.g. no IPv6 connectivity).
     NetworkUnreachable(NetAddr),
+    /// TCP connection timed out — the node may be firewalled or the IP unoccupied.
+    TimedOut(NetAddr),
     /// Sent when the task for an address exits; clears `active_task`.
     TaskDone(NetAddr),
 }
@@ -249,29 +253,42 @@ impl AddrStore {
 
     /// Returns up to `n` addresses to connect to.
     ///
-    /// Tries a 50/50 split between Offline/Unknown addresses and LastSeen addresses
-    /// (oldest-first). If one bucket runs short the remaining slots come from the other.
+    /// Three buckets in priority order:
+    ///   1. `Unknown`   — never attempted, preferred over all others (up to half the batch)
+    ///   2. `LastSeen`  — previously connected, oldest first (up to half the batch)
+    ///   3. Known-bad   — `Offline`, `ConnectionRefused`, `HostUnreachable`, `TimedOut` —
+    ///                    only fills slots left over after the first two buckets are exhausted
+    ///
     /// Only addresses with a TCP socket address and no active task are returned.
     pub fn get_batch(&self, n: usize) -> Vec<NetAddr> {
         let half = n / 2;
 
-        let offline: Vec<&AddrEntry> = self
+        let base_filter = |e: &&AddrEntry| !e.active_task && e.addr.to_socket_addr().is_some();
+
+        let fresh: Vec<&AddrEntry> = self
             .entries
             .values()
-            .filter(|e| {
-                !e.active_task
-                    && e.addr.to_socket_addr().is_some()
-                    && matches!(e.status, AddrStatus::Offline | AddrStatus::Unknown)
-            })
+            .filter(|e| base_filter(e) && matches!(e.status, AddrStatus::Unknown))
             .collect();
 
         let mut seen: Vec<&AddrEntry> = self
             .entries
             .values()
+            .filter(|e| base_filter(e) && matches!(e.status, AddrStatus::LastSeen(_)))
+            .collect();
+
+        let stale: Vec<&AddrEntry> = self
+            .entries
+            .values()
             .filter(|e| {
-                !e.active_task
-                    && e.addr.to_socket_addr().is_some()
-                    && matches!(e.status, AddrStatus::LastSeen(_))
+                base_filter(e)
+                    && matches!(
+                        e.status,
+                        AddrStatus::Offline
+                            | AddrStatus::ConnectionRefused
+                            | AddrStatus::HostUnreachable
+                            | AddrStatus::TimedOut
+                    )
             })
             .collect();
 
@@ -281,13 +298,17 @@ impl AddrStore {
             _ => 0,
         });
 
+        // Fill Unknown and LastSeen with a 50/50 split, overflowing to each other.
         let from_seen_initial = seen.len().min(half);
-        let from_offline = offline.len().min(n - from_seen_initial);
-        let from_seen = seen.len().min(n - from_offline);
+        let from_fresh = fresh.len().min(n - from_seen_initial);
+        let from_seen = seen.len().min(n - from_fresh);
+        // Known-bad only fills slots left over once Unknown and LastSeen are exhausted.
+        let from_stale = stale.len().min(n - from_fresh - from_seen);
 
-        let mut result = Vec::with_capacity(from_offline + from_seen);
-        result.extend(offline[..from_offline].iter().map(|e| e.addr.clone()));
+        let mut result = Vec::with_capacity(from_fresh + from_seen + from_stale);
+        result.extend(fresh[..from_fresh].iter().map(|e| e.addr.clone()));
         result.extend(seen[..from_seen].iter().map(|e| e.addr.clone()));
+        result.extend(stale[..from_stale].iter().map(|e| e.addr.clone()));
         result
     }
 
@@ -322,6 +343,11 @@ impl AddrStore {
             StatusUpdate::NetworkUnreachable(addr) => {
                 if let Some(entry) = self.entries.get_mut(&addr) {
                     entry.status = AddrStatus::NetworkUnreachable;
+                }
+            }
+            StatusUpdate::TimedOut(addr) => {
+                if let Some(entry) = self.entries.get_mut(&addr) {
+                    entry.status = AddrStatus::TimedOut;
                 }
             }
             StatusUpdate::TaskDone(addr) => {

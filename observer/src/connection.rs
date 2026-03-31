@@ -14,7 +14,7 @@ use common::{
         io::BufReader,
         net::TcpStream,
         sync::mpsc,
-        time::{Duration, interval, sleep},
+        time::{Duration, interval, sleep, timeout},
     },
     tracing,
     tracing::Instrument,
@@ -35,6 +35,15 @@ const BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// How many consecutive failed connection attempts to make before giving up.
 /// With BACKOFF_BASE doubling each attempt: 1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s.
 const MAX_RECONNECT_ATTEMPTS: u32 = 8;
+
+/// Timeout for TCP connection attempts. The OS default (several minutes with SYN retransmits)
+/// is far too long when managing many connections.
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many consecutive TCP timeouts to tolerate before giving up on a peer we have
+/// never successfully connected to. Timeouts are a softer signal than ConnectionRefused
+/// (the node might be firewalled), so we allow a small number of retries before giving up.
+const MAX_TIMEOUT_ATTEMPTS_UNSEEN: u32 = 2;
 
 /// How often to send a ping to measure round-trip time.
 const PING_INTERVAL: Duration = Duration::from_secs(120);
@@ -95,6 +104,7 @@ async fn retry_loop(
 ) {
     let mut backoff = BACKOFF_BASE;
     let mut attempts = 0u32;
+    let mut timeout_attempts = 0u32;
     let mut skip_v1_fallback = false;
     let mut ever_connected = false;
 
@@ -133,6 +143,17 @@ async fn retry_loop(
                         .send(StatusUpdate::NetworkUnreachable(addr.clone()))
                         .await;
                     break;
+                }
+
+                if is_timed_out(&e) {
+                    timeout_attempts += 1;
+                    if !ever_connected && timeout_attempts >= MAX_TIMEOUT_ATTEMPTS_UNSEEN {
+                        tracing::info!(timeout_attempts, "timed out repeatedly, not retrying");
+                        let _ = status_tx.send(StatusUpdate::TimedOut(addr.clone())).await;
+                        break;
+                    }
+                } else {
+                    timeout_attempts = 0;
                 }
 
                 if !ever_connected {
@@ -209,7 +230,10 @@ async fn connect_v2(
     new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
 ) -> Result<Instant> {
     tracing::trace!("connecting (v2) ...");
-    let stream = TcpStream::connect(addr).await.context("TCP connect")?;
+    let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .context("TCP connect timeout")?
+        .context("TCP connect")?;
     let (reader, writer) = stream.into_split();
     let proto = Protocol::new(
         magic,
@@ -247,7 +271,10 @@ async fn connect_v1(
     new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
 ) -> Result<Instant> {
     tracing::trace!("connecting (v1) ...");
-    let stream = TcpStream::connect(addr).await.context("TCP connect")?;
+    let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .context("TCP connect timeout")?
+        .context("TCP connect")?;
     let (reader, writer) = stream.into_split();
     let mut transport = TransportV1 {
         magic,
@@ -469,11 +496,23 @@ fn is_host_unreachable(err: &common::anyhow::Error) -> bool {
 /// Check if the error is a TCP-level connect failure (e.g. connection refused)
 /// where falling back to a different transport version would not help.
 fn is_tcp_connect_error(err: &common::anyhow::Error) -> bool {
-    is_connection_refused(err) || is_network_unreachable(err) || is_host_unreachable(err)
+    is_connection_refused(err)
+        || is_network_unreachable(err)
+        || is_host_unreachable(err)
+        || is_timed_out(err)
 }
 
 fn is_connection_refused(err: &common::anyhow::Error) -> bool {
     has_io_error_kind(err, std::io::ErrorKind::ConnectionRefused)
+}
+
+fn is_timed_out(err: &common::anyhow::Error) -> bool {
+    // Our explicit tokio::time::timeout fired.
+    if err.chain().any(|c| c.is::<tokio::time::error::Elapsed>()) {
+        return true;
+    }
+    // OS-level timeout (rare when our explicit timeout is shorter, but possible).
+    has_io_error_kind(err, std::io::ErrorKind::TimedOut)
 }
 
 fn has_io_error_kind(err: &common::anyhow::Error, kind: std::io::ErrorKind) -> bool {
