@@ -1,3 +1,4 @@
+use crate::TARGET_PROTOCOL as TARGET;
 use bip324::{futures::Protocol, io::Payload};
 use common::anyhow::{Context, Result};
 use common::{
@@ -50,7 +51,7 @@ where
     W: AsyncWrite + Unpin,
 {
     async fn send(&mut self, msg: NetworkMessage) -> Result<()> {
-        tracing::trace!(cmd=%msg.command(), "sending message");
+        tracing::trace!(target: TARGET, cmd=%msg.command(), "sending message");
         self.writer
             .write_all(&serialize(&RawNetworkMessage::new(self.magic, msg)))
             .await

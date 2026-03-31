@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::TARGET_ADDRESSES as TARGET;
 use common::{
     anyhow::{Context, Result},
     p2p::address::{AddrV2, AddrV2Message, Address},
@@ -321,7 +322,7 @@ pub async fn run(
         tokio::select! {
             _ = persist_timer.tick() => {
                 if let Err(e) = store.lock().unwrap().save() {
-                    tracing::warn!("failed to persist address store: {e}");
+                    tracing::warn!(target: TARGET, "failed to persist address store: {e}");
                 }
             }
             Some(update) = status_rx.recv() => {

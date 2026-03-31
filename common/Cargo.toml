@@ -11,4 +11,4 @@ bitcoin = { git = "https://github.com/rust-bitcoin/rust-bitcoin", rev = "16cc257
 p2p = { package = "bitcoin-p2p-messages", git = "https://github.com/rust-bitcoin/rust-bitcoin", rev = "16cc257c3695dea0e7301a5fa9cab44b8ed60598" }
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

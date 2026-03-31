@@ -20,6 +20,8 @@ use crate::addresses::{BadReason, NetAddr, StatusUpdate};
 use crate::protocol::run_session;
 use crate::transport::{TransportV1, TransportV2};
 
+use crate::TARGET_CONNECTION as TARGET;
+
 /// Initial wait before the first reconnect attempt after a failure.
 /// Doubles on each consecutive failure, reset to this value after a successful connection.
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -45,12 +47,12 @@ pub async fn connect_with_retry(
     new_addr_tx: mpsc::Sender<Vec<NetAddr>>,
 ) {
     let id = PEER_ID.fetch_add(1, Ordering::Relaxed);
-    let span = tracing::info_span!("c", id, addr = %addr);
+    let span = tracing::debug_span!(target: TARGET, "c", id, addr = %addr);
 
     async move {
         crate::ACTIVE_TASKS.fetch_add(1, Ordering::Relaxed);
         let Some(socket_addr) = addr.to_socket_addr() else {
-            tracing::debug!("no TCP address, skipping");
+            tracing::debug!(target: TARGET, "no TCP address, skipping");
             crate::ACTIVE_TASKS.fetch_sub(1, Ordering::Relaxed);
             return;
         };
@@ -97,7 +99,7 @@ async fn retry_loop(
                     backoff = BACKOFF_BASE;
                     attempts = 0;
                 }
-                tracing::trace!(
+                tracing::info!(target: TARGET,
                     uptime = format!("{:?}", uptime),
                     "connection lost. reconnecting in {backoff:.1?}"
                 );
@@ -110,7 +112,7 @@ async fn retry_loop(
                 };
 
                 if is_network_unreachable(&e) {
-                    tracing::info!("network unreachable, not retrying");
+                    tracing::debug!(target: TARGET, "network unreachable, not retrying");
                     let _ = status_tx.send(bad(BadReason::NetworkUnreachable)).await;
                     break;
                 }
@@ -118,7 +120,7 @@ async fn retry_loop(
                 if is_timed_out(&e) {
                     timeout_attempts += 1;
                     if !ever_connected && timeout_attempts >= MAX_TIMEOUT_ATTEMPTS_UNSEEN {
-                        tracing::info!(timeout_attempts, "timed out repeatedly, not retrying");
+                        tracing::debug!(target: TARGET, timeout_attempts, "timed out repeatedly, not retrying");
                         let _ = status_tx.send(bad(BadReason::TimedOut)).await;
                         break;
                     }
@@ -128,17 +130,17 @@ async fn retry_loop(
 
                 if !ever_connected {
                     if is_connection_refused(&e) {
-                        tracing::info!("connection refused on first attempt, not retrying");
+                        tracing::debug!(target: TARGET, "connection refused on first attempt, not retrying");
                         let _ = status_tx.send(bad(BadReason::ConnectionRefused)).await;
                         break;
                     } else if is_host_unreachable(&e) {
-                        tracing::info!("host unreachable on first attempt, not retrying");
+                        tracing::debug!(target: TARGET, "host unreachable on first attempt, not retrying");
                         let _ = status_tx.send(bad(BadReason::HostUnreachable)).await;
                         break;
                     }
                 }
 
-                tracing::trace!(
+                tracing::trace!(target: TARGET,
                     attempts,
                     backoff_ms = backoff.as_millis(),
                     error = format!("{:?}", e),
@@ -148,7 +150,7 @@ async fn retry_loop(
         }
 
         if attempts >= MAX_RECONNECT_ATTEMPTS {
-            tracing::info!(attempts, "giving up");
+            tracing::debug!(target: TARGET, attempts, "giving up");
             break;
         }
 
@@ -180,7 +182,7 @@ async fn try_connect(
             if is_tcp_connect_error(&e) {
                 return Err(e);
             }
-            tracing::trace!("v2 failed ({e}), trying v1");
+            tracing::trace!(target: TARGET, "v2 failed ({e}), trying v1");
             connect_v1(addr, magic, new_addr_tx).await
         }
     }
@@ -191,7 +193,7 @@ async fn connect_v2(
     magic: Magic,
     new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
 ) -> Result<Instant> {
-    tracing::trace!("connecting (v2) ...");
+    tracing::trace!(target: TARGET, "connecting (v2) ...");
     let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(addr))
         .await
         .context("TCP connect timeout")?
@@ -214,7 +216,7 @@ async fn connect_v1(
     magic: Magic,
     new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
 ) -> Result<Instant> {
-    tracing::trace!("connecting (v1) ...");
+    tracing::trace!(target: TARGET, "connecting (v1) ...");
     let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(addr))
         .await
         .context("TCP connect timeout")?

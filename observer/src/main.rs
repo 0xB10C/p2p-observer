@@ -3,6 +3,12 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MAGIC: Magic = Magic::SIGNET;
+
+pub(crate) const TARGET_CONNECTION: &str = "connection";
+pub(crate) const TARGET_PROTOCOL: &str = "protocol";
+pub(crate) const TARGET_ADDRESSES: &str = "addresses";
+pub(crate) const TARGET_MAIN: &str = "main";
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -18,9 +24,12 @@ mod transport;
 
 #[tokio::main]
 async fn main() {
+    let filter = tracing_subscriber::EnvFilter::new(format!(
+        "{TARGET_MAIN}=debug,{TARGET_CONNECTION}=info,{TARGET_PROTOCOL}=debug,{TARGET_ADDRESSES}=debug"
+    ));
     tracing_subscriber::fmt()
-        .with_target(false)
-        .with_max_level(tracing::Level::TRACE)
+        .with_target(true)
+        .with_env_filter(filter)
         .init();
 
     let store_path = Path::new("addresses.json");
@@ -65,7 +74,7 @@ async fn main() {
                 let active = ACTIVE_TASKS.load(Ordering::Relaxed);
                 let connected = IN_MESSAGE_LOOP.load(Ordering::Relaxed);
                 let s = store.lock().unwrap();
-                tracing::error!(
+                tracing::info!(target: TARGET_MAIN,
                     unknown = s.unknown_len(),
                     good = s.good_len(),
                     bad = s.bad_len(),
@@ -89,7 +98,7 @@ async fn main() {
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                tracing::info!("shutting down");
+                tracing::info!(target: TARGET_MAIN, "shutting down");
                 break;
             }
         }

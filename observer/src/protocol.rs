@@ -23,6 +23,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::addresses::NetAddr;
 use crate::transport::Transport;
 
+use crate::TARGET_PROTOCOL as TARGET;
+
 pub(crate) const USER_AGENT: &str = "/p2p-observer:0.1.0/";
 
 /// How often to send a ping to measure round-trip time.
@@ -65,9 +67,9 @@ pub(crate) async fn run_session(
 ) -> Result<Instant> {
     let info = version_handshake(&mut transport).await?;
     let connected_at = Instant::now();
-    let conn_span = tracing::info_span!("", v = v, ua = %info.version.user_agent);
+    let conn_span = tracing::info_span!(target: TARGET, "", v = v, ua = %info.version.user_agent);
 
-    tracing::trace!("connection established");
+    tracing::trace!(target: TARGET, "connection established");
     transport.send(NetworkMessage::GetAddr).await?;
     let mut conn = Connection {
         transport,
@@ -77,7 +79,7 @@ pub(crate) async fn run_session(
     };
     crate::IN_MESSAGE_LOOP.fetch_add(1, Ordering::Relaxed);
     if let Err(e) = conn.run().instrument(conn_span).await {
-        tracing::debug!("connection error: {e}");
+        tracing::debug!(target: TARGET, "connection error: {e}");
     }
     crate::IN_MESSAGE_LOOP.fetch_sub(1, Ordering::Relaxed);
     Ok(connected_at)
@@ -93,7 +95,7 @@ pub(crate) async fn version_handshake(transport: &mut impl Transport) -> Result<
     while !(peer_version.is_some() && got_verack) {
         match transport.recv().await? {
             NetworkMessage::Version(v) => {
-                tracing::debug!(
+                tracing::debug!(target: TARGET,
                     version = u32::from(v.version),
                     ua = v.user_agent.to_string(),
                     "received version"
@@ -104,14 +106,14 @@ pub(crate) async fn version_handshake(transport: &mut impl Transport) -> Result<
                 peer_version = Some(v);
             }
             NetworkMessage::Verack => {
-                tracing::trace!("handshake complete");
+                tracing::trace!(target: TARGET, "handshake complete");
                 got_verack = true;
             }
             NetworkMessage::SendAddrV2 => {
-                tracing::debug!("received sendaddrv2 (during version handshake)");
+                tracing::trace!(target: TARGET, "received sendaddrv2 (during version handshake)");
                 send_addr_v2 = true;
             }
-            other => tracing::debug!("ignored during handshake: {:?}", other),
+            other => tracing::warn!(target: TARGET, "ignored during handshake: {:?}", other),
         }
     }
 
@@ -148,7 +150,7 @@ impl<T: Transport> Connection<T> {
 
     async fn send_ping(&mut self) -> Result<()> {
         let nonce = unix_ms();
-        tracing::trace!(ts_ms = nonce, "sending ping");
+        tracing::trace!(target: TARGET, ts_ms = nonce, "sending ping");
         self.transport.send(NetworkMessage::Ping(nonce)).await
     }
 
@@ -164,7 +166,7 @@ impl<T: Transport> Connection<T> {
             NetworkMessage::SendCmpct(sc) => self.handle_send_cmpct(sc),
             NetworkMessage::SendHeaders => self.handle_send_headers(),
             NetworkMessage::SendAddrV2 => self.handle_send_addr_v2(),
-            other => tracing::debug!("received: {:?}", other),
+            other => tracing::debug!(target: TARGET, "received: {:?}", other),
         }
         Ok(())
     }
@@ -175,10 +177,10 @@ impl<T: Transport> Connection<T> {
         for item in inv {
             match item {
                 Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
-                    tracing::info!(%hash, "inv: block");
+                    tracing::info!(target: TARGET, %hash, "inv: block");
                 }
                 Inventory::CompactBlock(hash) => {
-                    tracing::info!(%hash, "inv: compact block");
+                    tracing::info!(target: TARGET, %hash, "inv: compact block");
                     getdata.push(Inventory::CompactBlock(hash));
                 }
                 _ => {}
@@ -199,49 +201,49 @@ impl<T: Transport> Connection<T> {
     fn handle_headers(&self, headers: Vec<common::bitcoin::block::Header>) {
         for header in headers {
             let hash = header.block_hash();
-            tracing::info!(%hash, "header announcement");
+            tracing::info!(target: TARGET, %hash, "header announcement");
         }
     }
 
     fn handle_cmpct_block(&self, cmpct: common::p2p::message_compact_blocks::CmpctBlock) {
         let hash = cmpct.compact_block.header.block_hash();
-        tracing::info!(%hash, "compact block");
+        tracing::info!(target: TARGET, %hash, "compact block");
     }
 
     async fn handle_ping(&mut self, nonce: u64) -> Result<()> {
-        tracing::trace!(nonce, "received ping");
+        tracing::trace!(target: TARGET, nonce, "received ping");
         self.transport.send(NetworkMessage::Pong(nonce)).await
     }
 
     fn handle_pong(&self, nonce: u64) {
         let rtt_ms = unix_ms().saturating_sub(nonce);
-        tracing::debug!(rtt_ms, "pong");
+        tracing::debug!(target: TARGET, rtt_ms, "pong");
     }
 
     fn handle_addr(&self, addrs: &[(u32, Address)]) {
-        tracing::trace!(num = addrs.len(), "received addr");
         let converted: Vec<NetAddr> = addrs
             .iter()
             .filter_map(|(_, a)| NetAddr::try_from(a).ok())
             .collect();
+        tracing::debug!(target: TARGET, received = addrs.len(), parsed = converted.len(), "addr");
         if !converted.is_empty() {
             let _ = self.new_addr_tx.try_send(converted);
         }
     }
 
     fn handle_addrv2(&self, addrs: &[AddrV2Message]) {
-        tracing::trace!(num = addrs.len(), "received addrv2");
         let converted: Vec<NetAddr> = addrs
             .iter()
             .filter_map(|m| NetAddr::try_from(m).ok())
             .collect();
+        tracing::debug!(target: TARGET, received = addrs.len(), parsed = converted.len(), "addrv2");
         if !converted.is_empty() {
             let _ = self.new_addr_tx.try_send(converted);
         }
     }
 
     fn handle_send_cmpct(&mut self, sc: SendCmpct) {
-        tracing::debug!(
+        tracing::debug!(target: TARGET,
             send_compact = sc.send_compact,
             version = sc.version,
             "received sendcmpct"
@@ -250,11 +252,11 @@ impl<T: Transport> Connection<T> {
     }
 
     fn handle_send_headers(&self) {
-        tracing::debug!("received sendheaders");
+        tracing::debug!(target: TARGET, "received sendheaders");
     }
 
     fn handle_send_addr_v2(&self) {
-        tracing::warn!("received sendaddrv2 outside of handshake");
+        tracing::warn!(target: TARGET, "received sendaddrv2 outside of handshake");
     }
 }
 
