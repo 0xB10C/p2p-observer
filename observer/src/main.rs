@@ -53,7 +53,8 @@ async fn main() {
 }
 
 fn init_store(cfg: &settings::Config) -> Arc<Mutex<addresses::AddrStore>> {
-    let store_path = Path::new("addresses.json");
+    let filename = format!("addresses-{}.json", cfg.network);
+    let store_path = Path::new(&filename);
     let store = Arc::new(Mutex::new(
         addresses::AddrStore::load(store_path).expect("failed to load address store"),
     ));
