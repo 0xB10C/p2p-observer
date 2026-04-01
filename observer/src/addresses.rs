@@ -351,39 +351,69 @@ impl AddrStore {
     /// Returns up to `n` addresses to connect to, excluding those in `active`.
     ///
     /// Priority order:
-    ///   1. Unknown — up to half the batch
-    ///   2. Good — oldest-seen first, up to half the batch
-    ///   3. Bad — fills remaining slots
+    ///   1. Good — oldest-seen first. Then:
+    ///   2. Unknown. Then:
+    ///   3. Bad — fill remaining slots.
     ///
     /// Only addresses with a TCP socket address are returned.
     pub fn get_batch(&self, n: usize, active: &HashSet<PeerAddr>) -> Vec<PeerAddr> {
-        let half = n / 2;
+        let mut batch = Vec::with_capacity(n);
 
         let base =
             |peer: &PeerAddr| !active.contains(&peer) && peer.addr.to_socket_addr().is_some();
 
-        let fresh: Vec<&PeerAddr> = self.unknown.iter().filter(|a| base(a)).collect();
-
-        let mut seen: Vec<(&PeerAddr, u64)> = self
+        let mut good: Vec<(&PeerAddr, u64)> = self
             .good
             .iter()
             .filter(|(a, _)| base(a))
             .map(|(a, &ts)| (a, ts))
             .collect();
-        seen.sort_by_key(|(_, ts)| *ts);
+        good.sort_by_key(|(_, ts)| *ts);
 
-        let stale: Vec<&PeerAddr> = self.bad.keys().filter(|a| base(a)).collect();
+        // first, fill up with good ones
+        let good_fill = std::cmp::min(n, good.len());
+        batch.extend(good[..good_fill].iter().map(|(peer, _)| (*peer).clone()));
+        if batch.len() == n {
+            tracing::debug!(target: TARGET,
+                good=good_fill,
+                "returned batch with only good addresses:"
+            );
+            return batch;
+        }
+        assert!(
+            batch.len() <= n,
+            "batch has {} entries while {} are allowed",
+            batch.len(),
+            n
+        );
 
-        let from_seen_initial = seen.len().min(half);
-        let from_fresh = fresh.len().min(n - from_seen_initial);
-        let from_seen = seen.len().min(n - from_fresh);
-        let from_stale = stale.len().min(n - from_fresh - from_seen);
+        // then, fill up with unknown
+        let unknown: Vec<&PeerAddr> = self.unknown.iter().filter(|a| base(a)).collect();
+        let unknown_fill = std::cmp::min(n - batch.len(), unknown.len());
+        batch.extend(unknown[..unknown_fill].iter().map(|a| (*a).clone()));
+        if batch.len() == n {
+            tracing::debug!(target: TARGET,
+                good=good_fill,
+                unknown=unknown_fill,
+                "returned batch with good and unknown addresses:"
+            );
+            return batch;
+        }
+        assert!(batch.len() <= n);
 
-        let mut result = Vec::with_capacity(from_fresh + from_seen + from_stale);
-        result.extend(fresh[..from_fresh].iter().map(|a| (*a).clone()));
-        result.extend(seen[..from_seen].iter().map(|(a, _)| (*a).clone()));
-        result.extend(stale[..from_stale].iter().map(|a| (*a).clone()));
-        result
+        // then, fill up with bad ones
+        let bad: Vec<&PeerAddr> = self.bad.keys().filter(|a| base(a)).collect();
+        let bad_fill = std::cmp::min(n - batch.len(), bad.len());
+        batch.extend(bad[..bad_fill].iter().map(|a| (*a).clone()));
+        tracing::debug!(target: TARGET,
+            good=good_fill,
+            unknown=unknown_fill,
+            bad=bad_fill,
+            "returned batch with good, unknown, and bad addresses:"
+        );
+        assert!(batch.len() <= n);
+
+        batch
     }
 
     pub fn unknown_len(&self) -> usize {
