@@ -247,6 +247,8 @@ pub enum StatusUpdate {
 const MAX_UNKNOWN: usize = 100_000;
 const MAX_GOOD: usize = 500_000;
 const MAX_BAD: usize = 100_000;
+/// Minimum seconds to wait before retrying a bad address.
+const BAD_RETRY_INTERVAL_SECS: u64 = 3600;
 
 pub struct AddrStore {
     unknown: HashSet<PeerAddr>,
@@ -404,8 +406,17 @@ impl AddrStore {
         }
         assert!(batch.len() <= n);
 
-        // then, fill up with bad ones
-        let bad: Vec<&PeerAddr> = self.bad.keys().filter(|a| base(a)).collect();
+        // then, fill up with bad ones — skip addresses tried less than BAD_RETRY_INTERVAL_SECS ago
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let bad: Vec<&PeerAddr> = self
+            .bad
+            .iter()
+            .filter(|(a, (ts, _))| base(a) && now.saturating_sub(*ts) >= BAD_RETRY_INTERVAL_SECS)
+            .map(|(a, _)| a)
+            .collect();
         let bad_fill = std::cmp::min(n - batch.len(), bad.len());
         batch.extend(bad[..bad_fill].iter().map(|a| (*a).clone()));
         tracing::debug!(target: TARGET,
