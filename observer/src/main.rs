@@ -26,10 +26,6 @@ mod transport;
 async fn main() {
     let cfg = settings::Config::load().expect("failed to load config");
     let magic = cfg.magic().expect("invalid network in config");
-    let session_cfg = protocol::SessionConfig {
-        ping_interval: common::tokio::time::Duration::from_secs(cfg.ping_interval_secs),
-        user_agent: cfg.user_agent.clone(),
-    };
 
     let filter = tracing_subscriber::EnvFilter::new(cfg.log_levels.to_filter_string());
     tracing_subscriber::fmt()
@@ -47,7 +43,7 @@ async fn main() {
 
     tokio::spawn(addresses::run(store.clone(), status_rx, new_addr_rx));
 
-    run_loop(&store, magic, session_cfg, status_tx, new_addr_tx).await;
+    run_loop(&store, magic, cfg, status_tx, new_addr_tx).await;
 
     if let Err(e) = store.lock().unwrap().save() {
         tracing::warn!(target: TARGET_MAIN, "failed to persist address store on shutdown: {e}");
@@ -73,13 +69,18 @@ fn init_store(cfg: &settings::Config) -> Arc<Mutex<addresses::AddrStore>> {
 async fn run_loop(
     store: &Arc<Mutex<addresses::AddrStore>>,
     magic: common::p2p::Magic,
-    session_cfg: protocol::SessionConfig,
+    cfg: settings::Config,
     status_tx: tokio::sync::mpsc::Sender<addresses::StatusUpdate>,
     new_addr_tx: tokio::sync::mpsc::Sender<Vec<addresses::PeerAddr>>,
 ) {
-    let mut connect_timer = tokio::time::interval(tokio::time::Duration::from_secs(10));
+    let mut connect_timer = tokio::time::interval(tokio::time::Duration::from_secs(1));
     let mut active_addrs: HashSet<addresses::PeerAddr> = HashSet::new();
     let mut task_handles: Vec<(addresses::PeerAddr, tokio::task::JoinHandle<()>)> = Vec::new();
+
+    let session_cfg = protocol::SessionConfig {
+        ping_interval: common::tokio::time::Duration::from_secs(cfg.ping_interval_secs),
+        user_agent: cfg.user_agent.clone(),
+    };
 
     loop {
         tokio::select! {
@@ -105,9 +106,8 @@ async fn run_loop(
                     connected,
                     "stats"
                 );
-                let opening = active.saturating_sub(connected);
-                let max_new = 100usize.saturating_sub(opening);
-                let batch = s.get_batch(max_new, &active_addrs);
+
+                let batch = s.get_batch(cfg.connections_per_second as usize, &active_addrs);
                 drop(s);
 
                 for addr in batch {

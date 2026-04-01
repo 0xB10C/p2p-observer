@@ -7,6 +7,9 @@ network: signet
 # How often to send a ping to connected peers, in seconds.
 ping_interval_secs: 120
 
+# How many new connection tasks should be spawned per second.
+connections_per_second: 1
+
 # Initial peers to connect to. The observer will discover more via ADDR/ADDRV2
 # messages and does not need many bootstrap addresses to get started.
 bootstrap_addrs:

@@ -14,6 +14,9 @@ pub struct Config {
     #[serde(default)]
     pub log_levels: LogLevels,
 
+    #[serde(default = "connections_per_second")]
+    pub connections_per_second: u64,
+
     #[serde(default = "default_ping_interval_secs")]
     pub ping_interval_secs: u64,
 
@@ -71,6 +74,9 @@ fn default_network() -> String {
 fn default_ping_interval_secs() -> u64 {
     120
 }
+fn connections_per_second() -> u64 {
+    10
+}
 fn default_user_agent() -> String {
     crate::protocol::USER_AGENT.to_owned()
 }
@@ -92,6 +98,7 @@ impl Default for Config {
         Self {
             network: default_network(),
             log_levels: LogLevels::default(),
+            connections_per_second: connections_per_second(),
             ping_interval_secs: default_ping_interval_secs(),
             user_agent: default_user_agent(),
             bootstrap_addrs: Vec::new(),
@@ -157,6 +164,7 @@ mod tests {
         let cfg = parse_str("");
         assert_eq!(cfg.network, "signet");
         assert_eq!(cfg.ping_interval_secs, 120);
+        assert_eq!(cfg.connections_per_second, 10);
         assert_eq!(cfg.user_agent, crate::protocol::USER_AGENT);
         assert!(cfg.bootstrap_addrs.is_empty());
         assert_eq!(cfg.log_levels.main, "debug");
@@ -170,6 +178,7 @@ mod tests {
         let cfg = parse_str(
             r#"
                 network: mainnet
+                connections_per_second: 20
                 ping_interval_secs: 60
                 user_agent: "/test:1.0/"
                 bootstrap_addrs:
@@ -183,6 +192,7 @@ mod tests {
             "#,
         );
         assert_eq!(cfg.network, "mainnet");
+        assert_eq!(cfg.connections_per_second, 20);
         assert_eq!(cfg.ping_interval_secs, 60);
         assert_eq!(cfg.user_agent, "/test:1.0/");
         assert_eq!(cfg.bootstrap_addrs, vec!["1.2.3.4:8333", "5.6.7.8:8333"]);
