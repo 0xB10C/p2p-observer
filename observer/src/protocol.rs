@@ -91,7 +91,7 @@ pub(crate) async fn run_session(
         })
         .await;
     tracing::trace!(target: TARGET, "connection established");
-    writer.send(NetworkMessage::GetAddr).await?;
+
     let mut conn = Connection {
         reader,
         writer,
@@ -173,13 +173,16 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         let mut ping_timer = interval(self.ping_interval);
         ping_timer.tick().await; // skip the immediate first tick
 
-        // Request compact block announcements (version 2 = segwit).
+        // tell this peer we want to get compact blocks from it
         self.writer
             .send(NetworkMessage::SendCmpct(SendCmpct {
                 send_compact: HIGH_BANDWIDTH_COMPACT_BLOCKS,
                 version: 2,
             }))
             .await?;
+
+        // request addresses from this peer
+        self.writer.send(NetworkMessage::GetAddr).await?;
 
         // recv() is cancel-safe: both v1 and v2 readers preserve partial read
         // state across cancellations, so the ping timer can fire without losing bytes.
