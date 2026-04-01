@@ -7,6 +7,7 @@ edition = "2024"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+config = { version = "0.15", features = ["yaml"] }
 bitcoin = { git = "https://github.com/rust-bitcoin/rust-bitcoin", rev = "16cc257c3695dea0e7301a5fa9cab44b8ed60598" }
 p2p = { package = "bitcoin-p2p-messages", git = "https://github.com/rust-bitcoin/rust-bitcoin", rev = "16cc257c3695dea0e7301a5fa9cab44b8ed60598" }
 anyhow = "1"

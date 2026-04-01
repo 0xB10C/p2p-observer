@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::addresses::{BadReason, NetAddr, StatusUpdate};
-use crate::protocol::run_session;
+use crate::protocol::{SessionConfig, run_session};
 use crate::transport::{TransportV1, TransportV2};
 
 use crate::TARGET_CONNECTION as TARGET;
@@ -43,6 +43,7 @@ static PEER_ID: AtomicU64 = AtomicU64::new(0);
 pub async fn connect_with_retry(
     addr: NetAddr,
     magic: Magic,
+    cfg: SessionConfig,
     status_tx: mpsc::Sender<StatusUpdate>,
     new_addr_tx: mpsc::Sender<Vec<NetAddr>>,
 ) {
@@ -56,7 +57,7 @@ pub async fn connect_with_retry(
             crate::ACTIVE_TASKS.fetch_sub(1, Ordering::Relaxed);
             return;
         };
-        retry_loop(&addr, socket_addr, magic, status_tx, new_addr_tx).await;
+        retry_loop(&addr, socket_addr, magic, &cfg, status_tx, new_addr_tx).await;
         crate::ACTIVE_TASKS.fetch_sub(1, Ordering::Relaxed);
     }
     .instrument(span)
@@ -67,6 +68,7 @@ async fn retry_loop(
     addr: &NetAddr,
     socket_addr: SocketAddr,
     magic: Magic,
+    cfg: &SessionConfig,
     status_tx: mpsc::Sender<StatusUpdate>,
     new_addr_tx: mpsc::Sender<Vec<NetAddr>>,
 ) {
@@ -81,6 +83,7 @@ async fn retry_loop(
             addr,
             socket_addr,
             magic,
+            cfg,
             &mut skip_v1_fallback,
             &status_tx,
             &new_addr_tx,
@@ -174,14 +177,15 @@ async fn try_connect(
     net_addr: &NetAddr,
     socket_addr: SocketAddr,
     magic: Magic,
+    cfg: &SessionConfig,
     skip_v1_fallback: &mut bool,
     status_tx: &mpsc::Sender<StatusUpdate>,
     new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
 ) -> Result<Instant> {
     if *skip_v1_fallback {
-        return connect_v2(net_addr, socket_addr, magic, status_tx, new_addr_tx).await;
+        return connect_v2(net_addr, socket_addr, magic, cfg, status_tx, new_addr_tx).await;
     }
-    match connect_v2(net_addr, socket_addr, magic, status_tx, new_addr_tx).await {
+    match connect_v2(net_addr, socket_addr, magic, cfg, status_tx, new_addr_tx).await {
         ok @ Ok(_) => {
             *skip_v1_fallback = true;
             ok
@@ -193,7 +197,7 @@ async fn try_connect(
                 return Err(e);
             }
             tracing::trace!(target: TARGET, "v2 failed ({e}), trying v1");
-            connect_v1(net_addr, socket_addr, magic, status_tx, new_addr_tx).await
+            connect_v1(net_addr, socket_addr, magic, cfg, status_tx, new_addr_tx).await
         }
     }
 }
@@ -202,6 +206,7 @@ async fn connect_v2(
     net_addr: &NetAddr,
     socket_addr: SocketAddr,
     magic: Magic,
+    cfg: &SessionConfig,
     status_tx: &mpsc::Sender<StatusUpdate>,
     new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
 ) -> Result<Instant> {
@@ -220,13 +225,22 @@ async fn connect_v2(
         writer,
     )
     .await?;
-    run_session(TransportV2 { proto }, 2, net_addr, status_tx, new_addr_tx).await
+    run_session(
+        TransportV2 { proto },
+        2,
+        net_addr,
+        cfg,
+        status_tx,
+        new_addr_tx,
+    )
+    .await
 }
 
 async fn connect_v1(
     net_addr: &NetAddr,
     socket_addr: SocketAddr,
     magic: Magic,
+    cfg: &SessionConfig,
     status_tx: &mpsc::Sender<StatusUpdate>,
     new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
 ) -> Result<Instant> {
@@ -244,6 +258,7 @@ async fn connect_v1(
         },
         1,
         net_addr,
+        cfg,
         status_tx,
         new_addr_tx,
     )
@@ -318,7 +333,10 @@ mod tests {
                 break;
             }
         }
-        transport.send(build_version()).await.unwrap();
+        transport
+            .send(build_version(crate::protocol::USER_AGENT))
+            .await
+            .unwrap();
         transport.send(NetworkMessage::Verack).await.unwrap();
         loop {
             if let NetworkMessage::Verack = transport.recv().await.unwrap() {
@@ -361,7 +379,11 @@ mod tests {
         let net_addr = NetAddr::Ipv4("127.0.0.1".parse().unwrap(), addr.port());
         let (status_tx, _status_rx) = mpsc::channel(1);
         let (tx, _rx) = mpsc::channel(1);
-        let result = connect_v1(&net_addr, addr, MAGIC, &status_tx, &tx).await;
+        let cfg = SessionConfig {
+            ping_interval: Duration::from_secs(120),
+            user_agent: crate::protocol::USER_AGENT.to_owned(),
+        };
+        let result = connect_v1(&net_addr, addr, MAGIC, &cfg, &status_tx, &tx).await;
         server.await.unwrap();
         assert!(result.is_ok(), "connect_v1 failed: {result:?}");
     }
@@ -392,7 +414,11 @@ mod tests {
         let net_addr = NetAddr::Ipv4("127.0.0.1".parse().unwrap(), addr.port());
         let (status_tx, _status_rx) = mpsc::channel(1);
         let (tx, _rx) = mpsc::channel(1);
-        let result = connect_v2(&net_addr, addr, MAGIC, &status_tx, &tx).await;
+        let cfg = SessionConfig {
+            ping_interval: Duration::from_secs(120),
+            user_agent: crate::protocol::USER_AGENT.to_owned(),
+        };
+        let result = connect_v2(&net_addr, addr, MAGIC, &cfg, &status_tx, &tx).await;
         server.await.unwrap();
         assert!(result.is_ok(), "connect_v2 failed: {result:?}");
     }

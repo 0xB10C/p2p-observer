@@ -1,8 +1,6 @@
-use common::{p2p::Magic, tokio, tracing, tracing_subscriber};
+use common::{tokio, tracing, tracing_subscriber};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-const MAGIC: Magic = Magic::SIGNET;
 
 pub(crate) const TARGET_CONNECTION: &str = "connection";
 pub(crate) const TARGET_PROTOCOL: &str = "protocol";
@@ -21,13 +19,19 @@ mod addresses;
 mod connection;
 mod logging;
 mod protocol;
+mod settings;
 mod transport;
 
 #[tokio::main]
 async fn main() {
-    let filter = tracing_subscriber::EnvFilter::new(format!(
-        "{TARGET_MAIN}=debug,{TARGET_CONNECTION}=info,{TARGET_PROTOCOL}=debug,{TARGET_ADDRESSES}=debug"
-    ));
+    let cfg = settings::Config::load().expect("failed to load config");
+    let magic = cfg.magic().expect("invalid network in config");
+    let session_cfg = protocol::SessionConfig {
+        ping_interval: common::tokio::time::Duration::from_secs(cfg.ping_interval_secs),
+        user_agent: cfg.user_agent.clone(),
+    };
+
+    let filter = tracing_subscriber::EnvFilter::new(cfg.log_levels.to_filter_string());
     tracing_subscriber::fmt()
         .with_target(true)
         .fmt_fields(logging::PlainFields)
@@ -40,13 +44,10 @@ async fn main() {
     ));
 
     {
-        let content =
-            std::fs::read_to_string("addresses.txt").expect("failed to read addresses.txt");
-        let addrs: Vec<_> = content
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .filter_map(addresses::parse_addr)
+        let addrs: Vec<_> = cfg
+            .bootstrap_addrs
+            .iter()
+            .filter_map(|s| addresses::parse_addr(s))
             .collect();
         store.lock().unwrap().insert_batch(addrs);
     }
@@ -94,8 +95,9 @@ async fn main() {
                     let status_tx = status_tx.clone();
                     let new_addr_tx = new_addr_tx.clone();
                     let a = addr.clone();
+                    let cfg = session_cfg.clone();
                     task_handles.push((addr, tokio::spawn(async move {
-                        connection::connect_with_retry(a, MAGIC, status_tx, new_addr_tx).await;
+                        connection::connect_with_retry(a, magic, cfg, status_tx, new_addr_tx).await;
                     })));
                 }
             }

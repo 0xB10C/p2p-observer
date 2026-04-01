@@ -27,8 +27,11 @@ use crate::TARGET_PROTOCOL as TARGET;
 
 pub(crate) const USER_AGENT: &str = "/p2p-observer:0.1.0/";
 
-/// How often to send a ping to measure round-trip time.
-const PING_INTERVAL: Duration = Duration::from_secs(120);
+#[derive(Clone)]
+pub(crate) struct SessionConfig {
+    pub(crate) ping_interval: Duration,
+    pub(crate) user_agent: String,
+}
 
 /// Whether to request high-bandwidth compact block relay (BIP152).
 /// In high-bandwidth mode the peer sends compact blocks directly without an INV first,
@@ -58,6 +61,7 @@ struct Connection<T: Transport> {
     /// Minimum fee rate the peer will accept for relay (BIP133).
     #[allow(dead_code)]
     fee_filter: Option<common::bitcoin::FeeRate>,
+    ping_interval: Duration,
 }
 
 /// Run the Bitcoin P2P session on an already-established transport.
@@ -70,10 +74,11 @@ pub(crate) async fn run_session(
     mut transport: impl Transport,
     v: u8,
     addr: &NetAddr,
+    cfg: &SessionConfig,
     status_tx: &mpsc::Sender<StatusUpdate>,
     new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
 ) -> Result<Instant> {
-    let info = version_handshake(&mut transport).await?;
+    let info = version_handshake(&mut transport, &cfg.user_agent).await?;
     let connected_at = Instant::now();
     let conn_span = tracing::info_span!(target: TARGET, "", v = v, ua = %info.version.user_agent);
 
@@ -91,6 +96,7 @@ pub(crate) async fn run_session(
         handshake_info: info,
         send_cmpct: None,
         fee_filter: None,
+        ping_interval: cfg.ping_interval,
     };
     crate::IN_MESSAGE_LOOP.fetch_add(1, Ordering::Relaxed);
     if let Err(e) = conn.run().instrument(conn_span).await {
@@ -100,8 +106,11 @@ pub(crate) async fn run_session(
     Ok(connected_at)
 }
 
-pub(crate) async fn version_handshake(transport: &mut impl Transport) -> Result<HandshakeInfo> {
-    transport.send(build_version()).await?;
+pub(crate) async fn version_handshake(
+    transport: &mut impl Transport,
+    user_agent: &str,
+) -> Result<HandshakeInfo> {
+    transport.send(build_version(user_agent)).await?;
 
     let mut peer_version: Option<message_network::VersionMessage> = None;
     let mut got_verack = false;
@@ -165,7 +174,7 @@ pub(crate) async fn version_handshake(transport: &mut impl Transport) -> Result<
 impl<T: Transport> Connection<T> {
     /// Main message loop — runs until the peer disconnects or an error occurs.
     async fn run(&mut self) -> Result<()> {
-        let mut ping_timer = interval(PING_INTERVAL);
+        let mut ping_timer = interval(self.ping_interval);
         ping_timer.tick().await; // skip the immediate first tick
 
         // Note: transport.recv() is not cancel-safe — if the ping timer fires while a
@@ -307,7 +316,7 @@ impl<T: Transport> Connection<T> {
     }
 }
 
-pub(crate) fn build_version() -> NetworkMessage {
+pub(crate) fn build_version(user_agent: &str) -> NetworkMessage {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
@@ -329,7 +338,7 @@ pub(crate) fn build_version() -> NetworkMessage {
         // connecting to ourself. The peer likely won't use zero to open a connection
         // at the same time, so this should be fine.
         nonce: 0,
-        user_agent: UserAgent::from_nonstandard(USER_AGENT),
+        user_agent: UserAgent::from_nonstandard(user_agent),
         start_height: 0,
         relay: false,
     })
@@ -384,7 +393,7 @@ mod tests {
             reader: BufReader::new(reader),
             writer,
         };
-        version_handshake(&mut transport)
+        version_handshake(&mut transport, USER_AGENT)
             .await
             .expect("v1 handshake failed");
     }
@@ -413,7 +422,7 @@ mod tests {
         .await
         .expect("BIP324 handshake failed");
         let mut transport = TransportV2 { proto };
-        version_handshake(&mut transport)
+        version_handshake(&mut transport, USER_AGENT)
             .await
             .expect("v2 version handshake failed");
     }

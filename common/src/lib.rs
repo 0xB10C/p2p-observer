@@ -1,6 +1,7 @@
 // re-exports
 pub extern crate anyhow;
 pub extern crate bitcoin;
+pub extern crate config;
 pub extern crate p2p;
 pub extern crate serde;
 pub extern crate serde_json;
