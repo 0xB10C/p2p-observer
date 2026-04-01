@@ -38,26 +38,42 @@ async fn main() {
         .with_env_filter(filter)
         .init();
 
-    let store_path = Path::new("addresses.json");
-    let store = Arc::new(Mutex::new(
-        addresses::AddrStore::load(store_path).expect("failed to load address store"),
-    ));
-
-    {
-        let addrs: Vec<_> = cfg
-            .bootstrap_addrs
-            .iter()
-            .filter_map(|s| addresses::parse_addr(s))
-            .collect();
-        store.lock().unwrap().insert_batch(addrs);
-    }
+    let store = init_store(&cfg);
 
     let (status_tx, status_rx) = tokio::sync::mpsc::channel(256);
     let (new_addr_tx, new_addr_rx) = tokio::sync::mpsc::channel(256);
 
     tokio::spawn(addresses::run(store.clone(), status_rx, new_addr_rx));
 
-    let mut connect_timer = tokio::time::interval(tokio::time::Duration::from_secs(10));
+    run_loop(&store, magic, session_cfg, status_tx, new_addr_tx).await;
+
+    if let Err(e) = store.lock().unwrap().save() {
+        tracing::warn!(target: TARGET_MAIN, "failed to persist address store on shutdown: {e}");
+    }
+}
+
+fn init_store(cfg: &settings::Config) -> Arc<Mutex<addresses::AddrStore>> {
+    let store_path = Path::new("addresses.json");
+    let store = Arc::new(Mutex::new(
+        addresses::AddrStore::load(store_path).expect("failed to load address store"),
+    ));
+    let addrs: Vec<_> = cfg
+        .bootstrap_addrs
+        .iter()
+        .filter_map(|s| addresses::parse_addr(s))
+        .collect();
+    store.lock().unwrap().insert_batch(addrs);
+    store
+}
+
+async fn run_loop(
+    store: &Arc<Mutex<addresses::AddrStore>>,
+    magic: common::p2p::Magic,
+    session_cfg: protocol::SessionConfig,
+    status_tx: tokio::sync::mpsc::Sender<addresses::StatusUpdate>,
+    new_addr_tx: tokio::sync::mpsc::Sender<Vec<addresses::NetAddr>>,
+) {
+    let mut connect_timer = tokio::time::interval(tokio::time::Duration::from_secs(1));
     let mut active_addrs: HashSet<addresses::NetAddr> = HashSet::new();
     let mut task_handles: Vec<(addresses::NetAddr, tokio::task::JoinHandle<()>)> = Vec::new();
 
@@ -110,9 +126,5 @@ async fn main() {
 
     for (_, h) in task_handles {
         h.abort();
-    }
-
-    if let Err(e) = store.lock().unwrap().save() {
-        tracing::warn!(target: TARGET_MAIN, "failed to persist address store on shutdown: {e}");
     }
 }
