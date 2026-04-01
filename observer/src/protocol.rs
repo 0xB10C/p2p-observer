@@ -21,7 +21,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::addresses::{NetAddr, PeerAddr, StatusUpdate};
-use crate::transport::Transport;
+use crate::transport::{TransportReader, TransportWriter};
 
 use crate::TARGET_PROTOCOL as TARGET;
 
@@ -50,8 +50,9 @@ pub(crate) struct HandshakeInfo {
 }
 
 /// A live connection to a peer, created after a successful version handshake.
-struct Connection<T: Transport> {
-    transport: T,
+struct Connection<R: TransportReader, W: TransportWriter> {
+    reader: R,
+    writer: W,
     new_addr_tx: mpsc::Sender<Vec<PeerAddr>>,
     #[allow(dead_code)]
     handshake_info: HandshakeInfo,
@@ -71,14 +72,15 @@ struct Connection<T: Transport> {
 ///
 /// `v` is the transport version (1 or 2) used only for the tracing span.
 pub(crate) async fn run_session(
-    mut transport: impl Transport,
+    mut reader: impl TransportReader,
+    mut writer: impl TransportWriter,
     v: u8,
     addr: &NetAddr,
     cfg: &SessionConfig,
     status_tx: &mpsc::Sender<StatusUpdate>,
     new_addr_tx: &mpsc::Sender<Vec<PeerAddr>>,
 ) -> Result<Instant> {
-    let info = version_handshake(&mut transport, &cfg.user_agent).await?;
+    let info = version_handshake(&mut reader, &mut writer, &cfg.user_agent).await?;
     let connected_at = Instant::now();
     let conn_span = tracing::info_span!(target: TARGET, "", v = v, ua = %info.version.user_agent);
 
@@ -89,9 +91,10 @@ pub(crate) async fn run_session(
         })
         .await;
     tracing::trace!(target: TARGET, "connection established");
-    transport.send(NetworkMessage::GetAddr).await?;
+    writer.send(NetworkMessage::GetAddr).await?;
     let mut conn = Connection {
-        transport,
+        reader,
+        writer,
         new_addr_tx: new_addr_tx.clone(),
         handshake_info: info,
         send_cmpct: None,
@@ -107,10 +110,11 @@ pub(crate) async fn run_session(
 }
 
 pub(crate) async fn version_handshake(
-    transport: &mut impl Transport,
+    reader: &mut impl TransportReader,
+    writer: &mut impl TransportWriter,
     user_agent: &str,
 ) -> Result<HandshakeInfo> {
-    transport.send(build_version(user_agent)).await?;
+    writer.send(build_version(user_agent)).await?;
 
     let mut peer_version: Option<message_network::VersionMessage> = None;
     let mut got_verack = false;
@@ -118,7 +122,7 @@ pub(crate) async fn version_handshake(
     let mut wtxid_relay = false;
 
     while !(peer_version.is_some() && got_verack) {
-        match transport.recv().await? {
+        match reader.recv().await? {
             NetworkMessage::Version(v) => {
                 tracing::debug!(target: TARGET,
                     version = u32::from(v.version),
@@ -131,12 +135,12 @@ pub(crate) async fn version_handshake(
                 let skip_sendaddrv2 = u32::from(v.version) == 70013
                     && v.user_agent.to_string() == "/btcwire:0.5.0/utreexod:0.5.0/";
                 if !skip_sendaddrv2 {
-                    transport.send(NetworkMessage::SendAddrV2).await?;
+                    writer.send(NetworkMessage::SendAddrV2).await?;
                 }
                 if v.version >= ProtocolVersion::WTXID_RELAY_VERSION {
-                    transport.send(NetworkMessage::WtxidRelay).await?;
+                    writer.send(NetworkMessage::WtxidRelay).await?;
                 }
-                transport.send(NetworkMessage::Verack).await?;
+                writer.send(NetworkMessage::Verack).await?;
 
                 peer_version = Some(v);
             }
@@ -163,27 +167,26 @@ pub(crate) async fn version_handshake(
     })
 }
 
-impl<T: Transport> Connection<T> {
+impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     /// Main message loop — runs until the peer disconnects or an error occurs.
     async fn run(&mut self) -> Result<()> {
         let mut ping_timer = interval(self.ping_interval);
         ping_timer.tick().await; // skip the immediate first tick
 
         // Request compact block announcements (version 2 = segwit).
-        self.transport
+        self.writer
             .send(NetworkMessage::SendCmpct(SendCmpct {
                 send_compact: HIGH_BANDWIDTH_COMPACT_BLOCKS,
                 version: 2,
             }))
             .await?;
 
-        // Note: transport.recv() is not cancel-safe — if the ping timer fires while a
-        // read_exact is mid-header, the partial bytes are lost. In practice this is rare
-        // and the worst outcome is a parse error and reconnect, acceptable for an observer.
+        // recv() is cancel-safe: both v1 and v2 readers preserve partial read
+        // state across cancellations, so the ping timer can fire without losing bytes.
         loop {
             tokio::select! {
                 _ = ping_timer.tick() => self.send_ping().await?,
-                msg = self.transport.recv() => self.handle_message(msg?).await?,
+                msg = self.reader.recv() => self.handle_message(msg?).await?,
             }
         }
     }
@@ -191,7 +194,7 @@ impl<T: Transport> Connection<T> {
     async fn send_ping(&mut self) -> Result<()> {
         let nonce = unix_ms();
         tracing::trace!(target: TARGET, ts_ms = nonce, "sending ping");
-        self.transport.send(NetworkMessage::Ping(nonce)).await
+        self.writer.send(NetworkMessage::Ping(nonce)).await
     }
 
     async fn handle_message(&mut self, msg: NetworkMessage) -> Result<()> {
@@ -230,7 +233,7 @@ impl<T: Transport> Connection<T> {
         }
 
         if !getdata.is_empty() {
-            self.transport
+            self.writer
                 .send(NetworkMessage::GetData(
                     common::p2p::message::InventoryPayload(getdata),
                 ))
@@ -254,7 +257,7 @@ impl<T: Transport> Connection<T> {
 
     async fn handle_ping(&mut self, nonce: u64) -> Result<()> {
         tracing::trace!(target: TARGET, nonce, "received ping");
-        self.transport.send(NetworkMessage::Pong(nonce)).await
+        self.writer.send(NetworkMessage::Pong(nonce)).await
     }
 
     fn handle_pong(&self, nonce: u64) {
@@ -300,7 +303,7 @@ impl<T: Transport> Connection<T> {
 
     async fn handle_get_headers(&mut self) -> Result<()> {
         tracing::debug!(target: TARGET, "received getheaders, responding with empty headers");
-        self.transport
+        self.writer
             .send(NetworkMessage::Headers(
                 common::p2p::message::HeadersMessage(vec![]),
             ))
@@ -361,7 +364,9 @@ fn unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{TransportV1, TransportV2};
+    use crate::transport::{
+        TransportV1Reader, TransportV1Writer, TransportV2Reader, TransportV2Writer,
+    };
     use bip324::{Role, futures::Protocol};
     use common::{
         p2p::Magic,
@@ -388,12 +393,12 @@ mod tests {
 
         let stream = TcpStream::connect(addr).await.unwrap();
         let (reader, writer) = stream.into_split();
-        let mut transport = TransportV1 {
+        let mut r = TransportV1Reader::new(BufReader::new(reader));
+        let mut w = TransportV1Writer {
             magic: Magic::REGTEST,
-            reader: BufReader::new(reader),
             writer,
         };
-        version_handshake(&mut transport, USER_AGENT)
+        version_handshake(&mut r, &mut w, USER_AGENT)
             .await
             .expect("v1 handshake failed");
     }
@@ -421,8 +426,10 @@ mod tests {
         )
         .await
         .expect("BIP324 handshake failed");
-        let mut transport = TransportV2 { proto };
-        version_handshake(&mut transport, USER_AGENT)
+        let (pr, pw) = proto.into_split();
+        let mut r = TransportV2Reader { reader: pr };
+        let mut w = TransportV2Writer { writer: pw };
+        version_handshake(&mut r, &mut w, USER_AGENT)
             .await
             .expect("v2 version handshake failed");
     }

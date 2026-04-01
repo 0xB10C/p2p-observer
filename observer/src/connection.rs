@@ -18,7 +18,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::addresses::{BadReason, NetAddr, PeerAddr, StatusUpdate};
 use crate::protocol::{SessionConfig, run_session};
-use crate::transport::{TransportV1, TransportV2};
+use crate::transport::{
+    TransportV1Reader, TransportV1Writer, TransportV2Reader, TransportV2Writer,
+};
 use common::p2p::ServiceFlags;
 
 use crate::TARGET_CONNECTION as TARGET;
@@ -244,8 +246,10 @@ async fn connect_v2(
         writer,
     )
     .await?;
+    let (pr, pw) = proto.into_split();
     run_session(
-        TransportV2 { proto },
+        TransportV2Reader { reader: pr },
+        TransportV2Writer { writer: pw },
         2,
         net_addr,
         cfg,
@@ -270,11 +274,8 @@ async fn connect_v1(
         .context("TCP connect")?;
     let (reader, writer) = stream.into_split();
     run_session(
-        TransportV1 {
-            magic,
-            reader: BufReader::new(reader),
-            writer,
-        },
+        TransportV1Reader::new(BufReader::new(reader)),
+        TransportV1Writer { magic, writer },
         1,
         net_addr,
         cfg,
@@ -337,7 +338,10 @@ fn unix_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::protocol::build_version;
-    use crate::transport::{Transport, TransportV1, TransportV2};
+    use crate::transport::{
+        TransportReader, TransportV1Reader, TransportV1Writer, TransportV2Reader,
+        TransportV2Writer, TransportWriter,
+    };
     use bip324::{Role, futures::Protocol};
     use common::{
         p2p::message::NetworkMessage,
@@ -346,24 +350,27 @@ mod tests {
     };
 
     /// Complete the server side of the version handshake.
-    async fn server_handshake(transport: &mut impl Transport) {
+    async fn server_handshake(
+        reader: &mut impl TransportReader,
+        writer: &mut impl TransportWriter,
+    ) {
         loop {
-            if let NetworkMessage::Version(_) = transport.recv().await.unwrap() {
+            if let NetworkMessage::Version(_) = reader.recv().await.unwrap() {
                 break;
             }
         }
-        transport
+        writer
             .send(build_version(crate::protocol::USER_AGENT))
             .await
             .unwrap();
-        transport.send(NetworkMessage::Verack).await.unwrap();
+        writer.send(NetworkMessage::Verack).await.unwrap();
         loop {
-            if let NetworkMessage::Verack = transport.recv().await.unwrap() {
+            if let NetworkMessage::Verack = reader.recv().await.unwrap() {
                 break;
             }
         }
         loop {
-            if let NetworkMessage::SendCmpct(_) = transport.recv().await.unwrap() {
+            if let NetworkMessage::SendCmpct(_) = reader.recv().await.unwrap() {
                 break;
             }
         }
@@ -386,12 +393,12 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader, writer) = stream.into_split();
-            let mut transport = TransportV1 {
+            let mut r = TransportV1Reader::new(BufReader::new(reader));
+            let mut w = TransportV1Writer {
                 magic: MAGIC,
-                reader: BufReader::new(reader),
                 writer,
             };
-            server_handshake(&mut transport).await;
+            server_handshake(&mut r, &mut w).await;
             // Drop → EOF → client message loop exits → connect_v1 returns Ok
         });
 
@@ -426,8 +433,10 @@ mod tests {
             )
             .await
             .unwrap();
-            let mut transport = TransportV2 { proto };
-            server_handshake(&mut transport).await;
+            let (pr, pw) = proto.into_split();
+            let mut r = TransportV2Reader { reader: pr };
+            let mut w = TransportV2Writer { writer: pw };
+            server_handshake(&mut r, &mut w).await;
         });
 
         let net_addr = NetAddr::Ipv4("127.0.0.1".parse().unwrap(), addr.port());
