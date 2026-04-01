@@ -4,7 +4,7 @@ use common::{
         ProtocolVersion, ServiceFlags, address,
         address::{AddrV2Message, Address},
         message::NetworkMessage,
-        message_blockdata::Inventory,
+        message_blockdata::{GetHeadersMessage, Inventory},
         message_compact_blocks::SendCmpct,
         message_network::{self, UserAgent},
     },
@@ -18,9 +18,11 @@ use common::{
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::addresses::{NetAddr, StatusUpdate};
+use crate::headertree::HeaderTree;
 use crate::transport::Transport;
 
 use crate::TARGET_PROTOCOL as TARGET;
@@ -31,6 +33,7 @@ pub(crate) const USER_AGENT: &str = "/p2p-observer:0.1.0/";
 pub(crate) struct SessionConfig {
     pub(crate) ping_interval: Duration,
     pub(crate) user_agent: String,
+    pub(crate) headers: Arc<RwLock<HeaderTree>>,
 }
 
 /// Whether to request high-bandwidth compact block relay (BIP152).
@@ -53,6 +56,7 @@ pub(crate) struct HandshakeInfo {
 struct Connection<T: Transport> {
     transport: T,
     new_addr_tx: mpsc::Sender<Vec<NetAddr>>,
+    headers: Arc<RwLock<HeaderTree>>,
     #[allow(dead_code)]
     handshake_info: HandshakeInfo,
     /// Last SendCmpct received from the peer.
@@ -90,9 +94,21 @@ pub(crate) async fn run_session(
         .await;
     tracing::trace!(target: TARGET, "connection established");
     transport.send(NetworkMessage::GetAddr).await?;
+
+    // Kick off header sync from our current tip.
+    let locator = cfg.headers.read().unwrap().locator();
+    transport
+        .send(NetworkMessage::GetHeaders(GetHeadersMessage {
+            version: ProtocolVersion::WTXID_RELAY_VERSION,
+            locator_hashes: locator,
+            stop_hash: common::bitcoin::BlockHash::from_byte_array([0u8; 32]),
+        }))
+        .await?;
+
     let mut conn = Connection {
         transport,
         new_addr_tx: new_addr_tx.clone(),
+        headers: Arc::clone(&cfg.headers),
         handshake_info: info,
         send_cmpct: None,
         fee_filter: None,
@@ -199,7 +215,7 @@ impl<T: Transport> Connection<T> {
             NetworkMessage::Ping(nonce) => self.handle_ping(nonce).await?,
             NetworkMessage::Pong(nonce) => self.handle_pong(nonce),
             NetworkMessage::Inv(inv) => self.handle_inv(inv.0).await?,
-            NetworkMessage::Headers(headers) => self.handle_headers(headers.0),
+            NetworkMessage::Headers(headers) => self.handle_headers(headers.0).await?,
             NetworkMessage::CmpctBlock(cmpct) => self.handle_cmpct_block(cmpct),
             NetworkMessage::Addr(payload) => self.handle_addr(&payload.0),
             NetworkMessage::AddrV2(payload) => self.handle_addrv2(&payload.0),
@@ -240,11 +256,57 @@ impl<T: Transport> Connection<T> {
         Ok(())
     }
 
-    fn handle_headers(&self, headers: Vec<common::bitcoin::block::Header>) {
-        for header in headers {
-            let hash = header.block_hash();
-            tracing::info!(target: TARGET, %hash, "header announcement");
+    async fn handle_headers(&mut self, headers: Vec<common::bitcoin::block::Header>) -> Result<()> {
+        use crate::TARGET_HEADERS;
+        let count = headers.len();
+        let locator = {
+            let mut tree = self.headers.write().unwrap();
+            let mut inserted = 0usize;
+            for header in headers {
+                match tree.insert(header) {
+                    Ok(Some(reorg)) => {
+                        inserted += 1;
+                        let hash: String = header.block_hash().to_string();
+                        tracing::warn!(target: TARGET_HEADERS,
+                            hash,
+                            disconnected = reorg.disconnected.len(),
+                            connected = reorg.connected.len(),
+                            "reorg"
+                        );
+                    }
+                    Ok(None) => inserted += 1,
+                    Err(e) => tracing::debug!(target: TARGET_HEADERS, "invalid header: {e}"),
+                }
+            }
+            let tip_hash = tree.tip_hash();
+            tracing::debug!(target: TARGET_HEADERS,
+                count,
+                inserted,
+                tip_height = tree.tip().height,
+                tip_hash = %tip_hash,
+                "headers batch"
+            );
+            // If we received a full batch (2000), request the next batch.
+            if count == 2000 {
+                Some(tree.locator())
+            } else {
+                None
+            }
+        };
+        if let Some(locator) = locator {
+            self.send_get_headers(locator).await?;
         }
+        Ok(())
+    }
+
+    async fn send_get_headers(&mut self, locator: Vec<common::bitcoin::BlockHash>) -> Result<()> {
+        self.transport
+            .send(NetworkMessage::GetHeaders(GetHeadersMessage {
+                version: ProtocolVersion::WTXID_RELAY_VERSION,
+                locator_hashes: locator,
+                stop_hash: common::bitcoin::BlockHash::from_byte_array([0u8; 32]),
+            }))
+            .await
     }
 
     fn handle_cmpct_block(&self, cmpct: common::p2p::message_compact_blocks::CmpctBlock) {

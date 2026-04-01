@@ -1,5 +1,6 @@
 use common::{
     anyhow::{Context, Result},
+    bitcoin::{Network, TestnetVersion},
     config::{Config as CfgBuilder, File, FileFormat},
     p2p::Magic,
     serde::Deserialize,
@@ -23,6 +24,10 @@ pub struct Config {
     /// Initial addresses to connect to before peer discovery takes over.
     #[serde(default)]
     pub bootstrap_addrs: Vec<String>,
+
+    /// Path to the flat binary file used to persist block headers across restarts.
+    #[serde(default = "default_headers_file")]
+    pub headers_file: String,
 }
 
 #[derive(Deserialize)]
@@ -36,6 +41,8 @@ pub struct LogLevels {
     pub protocol: String,
     #[serde(default = "default_addresses_level")]
     pub addresses: String,
+    #[serde(default = "default_headers_level")]
+    pub headers: String,
 }
 
 impl Default for LogLevels {
@@ -45,6 +52,7 @@ impl Default for LogLevels {
             connection: default_connection_level(),
             protocol: default_protocol_level(),
             addresses: default_addresses_level(),
+            headers: default_headers_level(),
         }
     }
 }
@@ -52,7 +60,7 @@ impl Default for LogLevels {
 impl LogLevels {
     pub fn to_filter_string(&self) -> String {
         format!(
-            "{}={},{}={},{}={},{}={}",
+            "{}={},{}={},{}={},{}={},{}={}",
             crate::TARGET_MAIN,
             self.main,
             crate::TARGET_CONNECTION,
@@ -61,6 +69,8 @@ impl LogLevels {
             self.protocol,
             crate::TARGET_ADDRESSES,
             self.addresses,
+            crate::TARGET_HEADERS,
+            self.headers,
         )
     }
 }
@@ -86,6 +96,12 @@ fn default_protocol_level() -> String {
 fn default_addresses_level() -> String {
     "debug".to_owned()
 }
+fn default_headers_level() -> String {
+    "info".to_owned()
+}
+fn default_headers_file() -> String {
+    "headers.bin".to_owned()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -95,6 +111,7 @@ impl Default for Config {
             ping_interval_secs: default_ping_interval_secs(),
             user_agent: default_user_agent(),
             bootstrap_addrs: Vec::new(),
+            headers_file: default_headers_file(),
         }
     }
 }
@@ -120,6 +137,17 @@ impl Config {
             "testnet3" => Ok(Magic::TESTNET3),
             "testnet" | "testnet4" => Ok(Magic::TESTNET4),
             "regtest" => Ok(Magic::REGTEST),
+            other => common::anyhow::bail!("unknown network: {other}"),
+        }
+    }
+
+    pub fn to_network(&self) -> Result<Network> {
+        match self.network.as_str() {
+            "mainnet" | "bitcoin" => Ok(Network::Bitcoin),
+            "signet" => Ok(Network::Signet),
+            "testnet3" => Ok(Network::Testnet(TestnetVersion::V3)),
+            "testnet" | "testnet4" => Ok(Network::Testnet(TestnetVersion::V4)),
+            "regtest" => Ok(Network::Regtest),
             other => common::anyhow::bail!("unknown network: {other}"),
         }
     }

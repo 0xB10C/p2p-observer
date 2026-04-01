@@ -358,6 +358,18 @@ mod tests {
             .try_init();
     }
 
+    fn test_session_cfg() -> SessionConfig {
+        use crate::headertree::HeaderTree;
+        use common::bitcoin::Network;
+        use std::sync::{Arc, RwLock};
+        let tree = HeaderTree::load(std::path::Path::new("/dev/null"), Network::Regtest).unwrap();
+        SessionConfig {
+            ping_interval: Duration::from_secs(120),
+            user_agent: crate::protocol::USER_AGENT.to_owned(),
+            headers: Arc::new(RwLock::new(tree)),
+        }
+    }
+
     #[tokio::test]
     async fn test_v1_handshake_mock() {
         setup();
@@ -379,10 +391,7 @@ mod tests {
         let net_addr = NetAddr::Ipv4("127.0.0.1".parse().unwrap(), addr.port());
         let (status_tx, _status_rx) = mpsc::channel(1);
         let (tx, _rx) = mpsc::channel(1);
-        let cfg = SessionConfig {
-            ping_interval: Duration::from_secs(120),
-            user_agent: crate::protocol::USER_AGENT.to_owned(),
-        };
+        let cfg = test_session_cfg();
         let result = connect_v1(&net_addr, addr, MAGIC, &cfg, &status_tx, &tx).await;
         server.await.unwrap();
         assert!(result.is_ok(), "connect_v1 failed: {result:?}");
@@ -414,10 +423,7 @@ mod tests {
         let net_addr = NetAddr::Ipv4("127.0.0.1".parse().unwrap(), addr.port());
         let (status_tx, _status_rx) = mpsc::channel(1);
         let (tx, _rx) = mpsc::channel(1);
-        let cfg = SessionConfig {
-            ping_interval: Duration::from_secs(120),
-            user_agent: crate::protocol::USER_AGENT.to_owned(),
-        };
+        let cfg = test_session_cfg();
         let result = connect_v2(&net_addr, addr, MAGIC, &cfg, &status_tx, &tx).await;
         server.await.unwrap();
         assert!(result.is_ok(), "connect_v2 failed: {result:?}");

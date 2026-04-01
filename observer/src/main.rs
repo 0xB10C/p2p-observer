@@ -5,10 +5,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) const TARGET_CONNECTION: &str = "connection";
 pub(crate) const TARGET_PROTOCOL: &str = "protocol";
 pub(crate) const TARGET_ADDRESSES: &str = "addresses";
+pub(crate) const TARGET_HEADERS: &str = "headers";
 pub(crate) const TARGET_MAIN: &str = "main";
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Number of connection tasks currently running (connecting, retrying, or in message loop).
 pub(crate) static ACTIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
@@ -17,6 +18,7 @@ pub(crate) static IN_MESSAGE_LOOP: AtomicUsize = AtomicUsize::new(0);
 
 mod addresses;
 mod connection;
+mod headertree;
 mod logging;
 mod protocol;
 mod settings;
@@ -26,9 +28,17 @@ mod transport;
 async fn main() {
     let cfg = settings::Config::load().expect("failed to load config");
     let magic = cfg.magic().expect("invalid network in config");
+    let network = cfg.to_network().expect("invalid network in config");
+
+    let header_tree =
+        headertree::HeaderTree::load(std::path::Path::new(&cfg.headers_file), network)
+            .expect("failed to load header tree");
+    let headers = Arc::new(RwLock::new(header_tree));
+
     let session_cfg = protocol::SessionConfig {
         ping_interval: common::tokio::time::Duration::from_secs(cfg.ping_interval_secs),
         user_agent: cfg.user_agent.clone(),
+        headers: Arc::clone(&headers),
     };
 
     let filter = tracing_subscriber::EnvFilter::new(cfg.log_levels.to_filter_string());
@@ -76,6 +86,9 @@ async fn main() {
 
                 let active = ACTIVE_TASKS.load(Ordering::Relaxed);
                 let connected = IN_MESSAGE_LOOP.load(Ordering::Relaxed);
+                let headers2 = headers.read().unwrap();
+                let tip = headers2.tip();
+                let hash: String = tip.header.block_hash().to_string();
                 let s = store.lock().unwrap();
                 tracing::info!(target: TARGET_MAIN,
                     unknown = s.unknown_len(),
@@ -83,6 +96,8 @@ async fn main() {
                     bad = s.bad_len(),
                     active,
                     connected,
+                    height=tip.height,
+                    tip=hash,
                     "stats"
                 );
                 let opening = active.saturating_sub(connected);
