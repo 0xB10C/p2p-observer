@@ -83,7 +83,7 @@ async fn main() {
                     connected,
                     "stats"
                 );
-                let opening = active - connected;
+                let opening = active.saturating_sub(connected);
                 let max_new = 100usize.saturating_sub(opening);
                 let batch = s.get_batch(max_new, &active_addrs);
                 drop(s);
