@@ -104,6 +104,7 @@ impl Config {
         let path = std::env::args()
             .nth(1)
             .unwrap_or_else(|| "config.yaml".to_owned());
+        println!("loading config file: {}", path);
         Self::load_from(&path)
     }
 
@@ -112,7 +113,7 @@ impl Config {
             .add_source(
                 File::with_name(path)
                     .format(FileFormat::Yaml)
-                    .required(false),
+                    .required(true),
             )
             .build()
             .context("build config")?
@@ -122,7 +123,7 @@ impl Config {
 
     pub fn log_settings(&self) {
         use common::tracing::info;
-        info!(target: crate::TARGET_MAIN, "config: {:#?}", self);
+        info!(target: crate::TARGET_MAIN, "config: {:?}", self);
     }
 
     pub fn magic(&self) -> Result<Magic> {
