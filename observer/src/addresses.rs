@@ -236,10 +236,10 @@ impl AddrStore {
     }
 
     /// Insert new addresses as Unknown. Returns the number of addresses inserted.
-    pub fn insert_batch(&mut self, addrs: Vec<NetAddr>) -> usize {
+    pub fn insert_batch(&mut self, addrs: Vec<NetAddr>, allow_local: bool) -> usize {
         let mut inserted = 0;
         for addr in addrs {
-            if !addr.is_routable() {
+            if !allow_local && !addr.is_routable() {
                 continue;
             }
             if self.unknown.contains(&addr)
@@ -354,7 +354,7 @@ pub async fn run(
                 store.lock().unwrap().apply_update(update);
             }
             Some(addrs) = new_addr_rx.recv() => {
-                store.lock().unwrap().insert_batch(addrs);
+                store.lock().unwrap().insert_batch(addrs, false);
             }
         }
     }

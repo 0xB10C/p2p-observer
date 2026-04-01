@@ -65,7 +65,8 @@ fn init_store(cfg: &settings::Config) -> Arc<Mutex<addresses::AddrStore>> {
         .iter()
         .filter_map(|s| addresses::parse_addr(s))
         .collect();
-    store.lock().unwrap().insert_batch(addrs);
+    // allow bootstrapping via local addresses
+    store.lock().unwrap().insert_batch(addrs, true);
     store
 }
 
