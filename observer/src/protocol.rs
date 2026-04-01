@@ -41,6 +41,9 @@ pub(crate) struct HandshakeInfo {
     pub(crate) version: message_network::VersionMessage,
     #[allow(dead_code)]
     pub(crate) send_addr_v2: bool,
+    /// Peer announced BIP339 wtxid-based transaction relay support.
+    #[allow(dead_code)]
+    pub(crate) wtxid_relay: bool,
 }
 
 /// A live connection to a peer, created after a successful version handshake.
@@ -103,6 +106,7 @@ pub(crate) async fn version_handshake(transport: &mut impl Transport) -> Result<
     let mut peer_version: Option<message_network::VersionMessage> = None;
     let mut got_verack = false;
     let mut send_addr_v2 = false;
+    let mut wtxid_relay = false;
 
     while !(peer_version.is_some() && got_verack) {
         match transport.recv().await? {
@@ -120,6 +124,9 @@ pub(crate) async fn version_handshake(transport: &mut impl Transport) -> Result<
                 if !skip_sendaddrv2 {
                     transport.send(NetworkMessage::SendAddrV2).await?;
                 }
+                if v.version >= ProtocolVersion::WTXID_RELAY_VERSION {
+                    transport.send(NetworkMessage::WtxidRelay).await?;
+                }
                 transport.send(NetworkMessage::Verack).await?;
 
                 peer_version = Some(v);
@@ -131,6 +138,10 @@ pub(crate) async fn version_handshake(transport: &mut impl Transport) -> Result<
             NetworkMessage::SendAddrV2 => {
                 tracing::trace!(target: TARGET, "received sendaddrv2 (during version handshake)");
                 send_addr_v2 = true;
+            }
+            NetworkMessage::WtxidRelay => {
+                tracing::trace!(target: TARGET, "received wtxidrelay (during version handshake)");
+                wtxid_relay = true;
             }
             other => tracing::warn!(target: TARGET, "ignored during handshake: {:?}", other),
         }
@@ -147,6 +158,7 @@ pub(crate) async fn version_handshake(transport: &mut impl Transport) -> Result<
     Ok(HandshakeInfo {
         version: peer_version.expect("loop invariant: version is Some when loop exits"),
         send_addr_v2,
+        wtxid_relay,
     })
 }
 
