@@ -33,11 +33,11 @@ pub(crate) struct SessionConfig {
     pub(crate) user_agent: String,
 }
 
-/// Whether to request high-bandwidth compact block relay (BIP152).
-/// In high-bandwidth mode the peer sends compact blocks directly without an INV first,
-/// at the cost of higher bandwidth. In low-bandwidth mode (false) the peer sends an INV
-/// and we request the compact block via GETDATA. Low-bandwidth is sufficient for observation.
-const HIGH_BANDWIDTH_COMPACT_BLOCKS: bool = false;
+/// We want get high-bandwidth compact block relay (BIP152).
+/// In high-bandwidth mode the peer sends compact blocks directly without an INV first.
+/// We can then ask for a transaction via getblocktxn to learn how long it took the peer
+/// to validate the block.
+const HIGH_BANDWIDTH_COMPACT_BLOCKS: bool = true;
 
 /// Information collected from the peer during the version handshake.
 pub(crate) struct HandshakeInfo {
