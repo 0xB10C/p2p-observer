@@ -47,7 +47,7 @@ where
                 tracing::warn!(target: TARGET,
                     len = contents.len(),
                     hex = contents[..contents.len().min(64)].iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                    "v2 deserialize failed: {e}"
+                    "v2 deserialize failed: {e:#}"
                 );
                 return Err(e).context("v2 deserialize");
             }

@@ -110,9 +110,10 @@ async fn retry_loop(
                     backoff = BACKOFF_BASE;
                     attempts = 0;
                 }
+                let uptime_str = format!("{:?}", uptime);
+                let backoff_secs = backoff.as_secs();
                 tracing::warn!(target: TARGET,
-                    uptime = format!("{:?}", uptime),
-                    "connection lost. reconnecting in {backoff:.1?}"
+                    "connection lost after {uptime_str}. reconnecting in {backoff_secs}s"
                 );
             }
             Err(e) => {
@@ -151,11 +152,10 @@ async fn retry_loop(
                     }
                 }
 
+                let backoff_secs = backoff.as_secs();
                 tracing::trace!(target: TARGET,
-                    attempts,
-                    backoff_ms = backoff.as_millis(),
-                    error = format!("{:?}", e),
-                    "failed to connect, retrying.."
+                    error = format!("{:#}", e),
+                    "failed to connect; retrying in {backoff_secs}s (attempt={attempts})"
                 );
             }
         }
@@ -196,7 +196,7 @@ async fn try_connect(
             if is_tcp_connect_error(&e) {
                 return Err(e);
             }
-            tracing::trace!(target: TARGET, "v2 failed ({e}), trying v1");
+            tracing::trace!(target: TARGET, "trying transport v1 as v2 failed: {e}");
             connect_v1(net_addr, socket_addr, magic, cfg, status_tx, new_addr_tx).await
         }
     }
