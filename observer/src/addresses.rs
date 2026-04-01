@@ -244,7 +244,7 @@ pub enum StatusUpdate {
     },
 }
 
-const MAX_UNKNOWN: usize = 10_000;
+const MAX_UNKNOWN: usize = 100_000;
 const MAX_GOOD: usize = 500_000;
 const MAX_BAD: usize = 100_000;
 
