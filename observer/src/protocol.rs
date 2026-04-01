@@ -156,14 +156,6 @@ pub(crate) async fn version_handshake(
         }
     }
 
-    // Request compact block announcements (version 2 = segwit).
-    transport
-        .send(NetworkMessage::SendCmpct(SendCmpct {
-            send_compact: HIGH_BANDWIDTH_COMPACT_BLOCKS,
-            version: 2,
-        }))
-        .await?;
-
     Ok(HandshakeInfo {
         version: peer_version.expect("loop invariant: version is Some when loop exits"),
         send_addr_v2,
@@ -176,6 +168,14 @@ impl<T: Transport> Connection<T> {
     async fn run(&mut self) -> Result<()> {
         let mut ping_timer = interval(self.ping_interval);
         ping_timer.tick().await; // skip the immediate first tick
+
+        // Request compact block announcements (version 2 = segwit).
+        self.transport
+            .send(NetworkMessage::SendCmpct(SendCmpct {
+                send_compact: HIGH_BANDWIDTH_COMPACT_BLOCKS,
+                version: 2,
+            }))
+            .await?;
 
         // Note: transport.recv() is not cancel-safe — if the ping timer fires while a
         // read_exact is mid-header, the partial bytes are lost. In practice this is rare
