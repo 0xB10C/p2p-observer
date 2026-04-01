@@ -29,6 +29,7 @@ async fn main() {
     ));
     tracing_subscriber::fmt()
         .with_target(true)
+        .with_ansi(false)
         .with_env_filter(filter)
         .init();
 
