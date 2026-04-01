@@ -19,6 +19,7 @@ pub(crate) static IN_MESSAGE_LOOP: AtomicUsize = AtomicUsize::new(0);
 
 mod addresses;
 mod connection;
+mod logging;
 mod protocol;
 mod transport;
 
@@ -29,7 +30,7 @@ async fn main() {
     ));
     tracing_subscriber::fmt()
         .with_target(true)
-        .with_ansi(false)
+        .fmt_fields(logging::PlainFields)
         .with_env_filter(filter)
         .init();
 
