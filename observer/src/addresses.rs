@@ -339,6 +339,9 @@ impl AddrStore {
             if !allow_local && !peer.addr.is_routable() {
                 continue;
             }
+            if self.good.contains_key(&peer) || self.bad.contains_key(&peer) {
+                continue;
+            }
             if self.unknown.len() >= MAX_UNKNOWN {
                 break;
             }
