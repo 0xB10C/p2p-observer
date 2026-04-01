@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex};
 use crate::TARGET_ADDRESSES as TARGET;
 use common::{
     anyhow::{Context, Result},
-    p2p::address::{AddrV2, AddrV2Message, Address},
+    p2p::{
+        ServiceFlags,
+        address::{AddrV2, AddrV2Message, Address},
+    },
     serde::{Deserialize, Serialize},
     serde_json,
     tokio::{
@@ -90,6 +93,78 @@ impl std::fmt::Display for NetAddr {
     }
 }
 
+/// A network address bundled with the service flags advertised by the peer.
+///
+/// `Hash` and `Eq` are based on the `addr` field only — the same IP:port with
+/// different services is still the same peer.
+pub struct PeerAddr {
+    pub addr: NetAddr,
+    services: ServiceFlags,
+}
+
+impl PeerAddr {
+    pub fn new(addr: NetAddr, services: ServiceFlags) -> Self {
+        Self { addr, services }
+    }
+
+    pub fn services(&self) -> ServiceFlags {
+        self.services
+    }
+}
+
+impl std::fmt::Debug for PeerAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerAddr")
+            .field("addr", &self.addr)
+            .field("services", &self.services)
+            .finish()
+    }
+}
+
+impl Clone for PeerAddr {
+    fn clone(&self) -> Self {
+        Self::new(self.addr.clone(), self.services)
+    }
+}
+
+impl std::hash::Hash for PeerAddr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.addr.hash(state);
+    }
+}
+
+impl PartialEq for PeerAddr {
+    fn eq(&self, other: &Self) -> bool {
+        self.addr == other.addr
+    }
+}
+
+impl Eq for PeerAddr {}
+
+impl std::fmt::Display for PeerAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.addr.fmt(f)
+    }
+}
+
+impl TryFrom<&AddrV2Message> for PeerAddr {
+    type Error = ();
+
+    fn try_from(msg: &AddrV2Message) -> std::result::Result<Self, ()> {
+        let addr = NetAddr::try_from(msg)?;
+        Ok(PeerAddr::new(addr, msg.services))
+    }
+}
+
+impl TryFrom<&Address> for PeerAddr {
+    type Error = ();
+
+    fn try_from(a: &Address) -> std::result::Result<Self, ()> {
+        let addr = NetAddr::try_from(a)?;
+        Ok(PeerAddr::new(addr, a.services))
+    }
+}
+
 impl TryFrom<&AddrV2Message> for NetAddr {
     type Error = ();
 
@@ -125,21 +200,22 @@ impl TryFrom<&Address> for NetAddr {
     }
 }
 
-/// Parse an "ip:port" or "[ipv6]:port" string into a `NetAddr`.
-pub fn parse_addr(s: &str) -> Option<NetAddr> {
+/// Parse an "ip:port" or "[ipv6]:port" string into a `PeerAddr` with no known services.
+pub fn parse_addr(s: &str) -> Option<PeerAddr> {
     let sa: SocketAddr = s.parse().ok()?;
-    match sa.ip() {
-        IpAddr::V4(ip) => Some(NetAddr::Ipv4(ip, sa.port())),
+    let addr = match sa.ip() {
+        IpAddr::V4(ip) => NetAddr::Ipv4(ip, sa.port()),
         IpAddr::V6(ip) => {
             if let Some(ipv4) = ip.to_ipv4_mapped() {
-                Some(NetAddr::Ipv4(ipv4, sa.port()))
+                NetAddr::Ipv4(ipv4, sa.port())
             } else if ip.octets()[0] == 0xfc {
-                Some(NetAddr::Cjdns(ip, sa.port()))
+                NetAddr::Cjdns(ip, sa.port())
             } else {
-                Some(NetAddr::Ipv6(ip, sa.port()))
+                NetAddr::Ipv6(ip, sa.port())
             }
         }
-    }
+    };
+    Some(PeerAddr::new(addr, ServiceFlags::NONE))
 }
 
 // ── Store types ──────────────────────────────────────────────────────────────
@@ -173,19 +249,20 @@ const MAX_GOOD: usize = 500_000;
 const MAX_BAD: usize = 100_000;
 
 pub struct AddrStore {
-    unknown: HashSet<NetAddr>,
-    good: HashMap<NetAddr, u64>,
-    bad: HashMap<NetAddr, (u64, BadReason)>,
+    unknown: HashSet<PeerAddr>,
+    good: HashMap<PeerAddr, u64>,
+    bad: HashMap<PeerAddr, (u64, BadReason)>,
     persist_path: PathBuf,
 }
 
 /// On-disk representation — uses Vecs since NetAddr can't be a JSON object key.
+/// Services are stored as u64 since ServiceFlags doesn't impl Serialize.
 #[derive(Serialize, Deserialize)]
 #[serde(crate = "common::serde")]
 struct StoreDisk {
-    unknown: Vec<NetAddr>,
-    good: Vec<(NetAddr, u64)>,
-    bad: Vec<(NetAddr, u64, BadReason)>,
+    unknown: Vec<(NetAddr, u64)>,
+    good: Vec<(NetAddr, u64, u64)>,
+    bad: Vec<(NetAddr, u64, BadReason, u64)>,
 }
 
 impl AddrStore {
@@ -194,9 +271,21 @@ impl AddrStore {
             Ok(s) => {
                 let disk: StoreDisk = serde_json::from_str(&s).context("parse address store")?;
                 Ok(Self {
-                    unknown: disk.unknown.into_iter().collect(),
-                    good: disk.good.into_iter().collect(),
-                    bad: disk.bad.into_iter().map(|(a, t, r)| (a, (t, r))).collect(),
+                    unknown: disk
+                        .unknown
+                        .into_iter()
+                        .map(|(a, svc)| PeerAddr::new(a, ServiceFlags::from(svc)))
+                        .collect(),
+                    good: disk
+                        .good
+                        .into_iter()
+                        .map(|(a, ts, svc)| (PeerAddr::new(a, ServiceFlags::from(svc)), ts))
+                        .collect(),
+                    bad: disk
+                        .bad
+                        .into_iter()
+                        .map(|(a, ts, r, svc)| (PeerAddr::new(a, ServiceFlags::from(svc)), (ts, r)))
+                        .collect(),
                     persist_path: path.to_owned(),
                 })
             }
@@ -216,12 +305,20 @@ impl AddrStore {
 
     pub fn save(&self) -> Result<()> {
         let disk = StoreDisk {
-            unknown: self.unknown.iter().cloned().collect(),
-            good: self.good.iter().map(|(a, &t)| (a.clone(), t)).collect(),
+            unknown: self
+                .unknown
+                .iter()
+                .map(|p| (p.addr.clone(), p.services().to_u64()))
+                .collect(),
+            good: self
+                .good
+                .iter()
+                .map(|(p, &ts)| (p.addr.clone(), ts, p.services().to_u64()))
+                .collect(),
             bad: self
                 .bad
                 .iter()
-                .map(|(a, (t, r))| (a.clone(), *t, *r))
+                .map(|(p, (ts, r))| (p.addr.clone(), *ts, *r, p.services().to_u64()))
                 .collect(),
         };
         let json = serde_json::to_string(&disk).context("serialize address store")?;
@@ -236,22 +333,16 @@ impl AddrStore {
     }
 
     /// Insert new addresses as Unknown. Returns the number of addresses inserted.
-    pub fn insert_batch(&mut self, addrs: Vec<NetAddr>, allow_local: bool) -> usize {
+    pub fn insert_batch(&mut self, addrs: Vec<PeerAddr>, allow_local: bool) -> usize {
         let mut inserted = 0;
-        for addr in addrs {
-            if !allow_local && !addr.is_routable() {
-                continue;
-            }
-            if self.unknown.contains(&addr)
-                || self.good.contains_key(&addr)
-                || self.bad.contains_key(&addr)
-            {
+        for peer in addrs {
+            if !allow_local && !peer.addr.is_routable() {
                 continue;
             }
             if self.unknown.len() >= MAX_UNKNOWN {
                 break;
             }
-            self.unknown.insert(addr);
+            self.unknown.insert(peer);
             inserted += 1;
         }
         inserted
@@ -265,14 +356,15 @@ impl AddrStore {
     ///   3. Bad — fills remaining slots
     ///
     /// Only addresses with a TCP socket address are returned.
-    pub fn get_batch(&self, n: usize, active: &HashSet<NetAddr>) -> Vec<NetAddr> {
+    pub fn get_batch(&self, n: usize, active: &HashSet<PeerAddr>) -> Vec<PeerAddr> {
         let half = n / 2;
 
-        let base = |addr: &NetAddr| !active.contains(addr) && addr.to_socket_addr().is_some();
+        let base =
+            |peer: &PeerAddr| !active.contains(&peer) && peer.addr.to_socket_addr().is_some();
 
-        let fresh: Vec<&NetAddr> = self.unknown.iter().filter(|a| base(a)).collect();
+        let fresh: Vec<&PeerAddr> = self.unknown.iter().filter(|a| base(a)).collect();
 
-        let mut seen: Vec<(&NetAddr, u64)> = self
+        let mut seen: Vec<(&PeerAddr, u64)> = self
             .good
             .iter()
             .filter(|(a, _)| base(a))
@@ -280,7 +372,7 @@ impl AddrStore {
             .collect();
         seen.sort_by_key(|(_, ts)| *ts);
 
-        let stale: Vec<&NetAddr> = self.bad.keys().filter(|a| base(a)).collect();
+        let stale: Vec<&PeerAddr> = self.bad.keys().filter(|a| base(a)).collect();
 
         let from_seen_initial = seen.len().min(half);
         let from_fresh = fresh.len().min(n - from_seen_initial);
@@ -288,9 +380,9 @@ impl AddrStore {
         let from_stale = stale.len().min(n - from_fresh - from_seen);
 
         let mut result = Vec::with_capacity(from_fresh + from_seen + from_stale);
-        result.extend(fresh[..from_fresh].iter().cloned().cloned());
+        result.extend(fresh[..from_fresh].iter().map(|a| (*a).clone()));
         result.extend(seen[..from_seen].iter().map(|(a, _)| (*a).clone()));
-        result.extend(stale[..from_stale].iter().cloned().cloned());
+        result.extend(stale[..from_stale].iter().map(|a| (*a).clone()));
         result
     }
 
@@ -306,25 +398,37 @@ impl AddrStore {
         self.bad.len()
     }
 
-    /// Remove the address from whichever table it's in.
-    fn remove(&mut self, addr: &NetAddr) {
-        self.unknown.remove(addr);
-        self.good.remove(addr);
-        self.bad.remove(addr);
+    /// Look up the `PeerAddr` for a `NetAddr` in any table, preserving its services.
+    fn take(&mut self, addr: &NetAddr) -> Option<PeerAddr> {
+        let key = PeerAddr::new(addr.clone(), ServiceFlags::NONE);
+        if let Some(peer) = self.unknown.take(&key) {
+            return Some(peer);
+        }
+        if let Some((peer, _)) = self.good.remove_entry(&key) {
+            return Some(peer);
+        }
+        if let Some((peer, _)) = self.bad.remove_entry(&key) {
+            return Some(peer);
+        }
+        None
     }
 
     pub fn apply_update(&mut self, update: StatusUpdate) {
         match update {
             StatusUpdate::Good { addr, at } => {
-                self.remove(&addr);
+                let peer = self
+                    .take(&addr)
+                    .unwrap_or_else(|| PeerAddr::new(addr, ServiceFlags::NONE));
                 if self.good.len() < MAX_GOOD {
-                    self.good.insert(addr, at);
+                    self.good.insert(peer, at);
                 }
             }
             StatusUpdate::Bad { addr, at, reason } => {
-                self.remove(&addr);
+                let peer = self
+                    .take(&addr)
+                    .unwrap_or_else(|| PeerAddr::new(addr, ServiceFlags::NONE));
                 if self.bad.len() < MAX_BAD {
-                    self.bad.insert(addr, (at, reason));
+                    self.bad.insert(peer, (at, reason));
                 }
             }
         }
@@ -338,7 +442,7 @@ impl AddrStore {
 pub async fn run(
     store: Arc<Mutex<AddrStore>>,
     mut status_rx: mpsc::Receiver<StatusUpdate>,
-    mut new_addr_rx: mpsc::Receiver<Vec<NetAddr>>,
+    mut new_addr_rx: mpsc::Receiver<Vec<PeerAddr>>,
 ) {
     let mut persist_timer = interval(Duration::from_secs(60));
     persist_timer.tick().await; // skip the immediate first tick

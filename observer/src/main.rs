@@ -75,11 +75,11 @@ async fn run_loop(
     magic: common::p2p::Magic,
     session_cfg: protocol::SessionConfig,
     status_tx: tokio::sync::mpsc::Sender<addresses::StatusUpdate>,
-    new_addr_tx: tokio::sync::mpsc::Sender<Vec<addresses::NetAddr>>,
+    new_addr_tx: tokio::sync::mpsc::Sender<Vec<addresses::PeerAddr>>,
 ) {
     let mut connect_timer = tokio::time::interval(tokio::time::Duration::from_secs(10));
-    let mut active_addrs: HashSet<addresses::NetAddr> = HashSet::new();
-    let mut task_handles: Vec<(addresses::NetAddr, tokio::task::JoinHandle<()>)> = Vec::new();
+    let mut active_addrs: HashSet<addresses::PeerAddr> = HashSet::new();
+    let mut task_handles: Vec<(addresses::PeerAddr, tokio::task::JoinHandle<()>)> = Vec::new();
 
     loop {
         tokio::select! {

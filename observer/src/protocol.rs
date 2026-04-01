@@ -20,7 +20,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::addresses::{NetAddr, StatusUpdate};
+use crate::addresses::{NetAddr, PeerAddr, StatusUpdate};
 use crate::transport::Transport;
 
 use crate::TARGET_PROTOCOL as TARGET;
@@ -52,7 +52,7 @@ pub(crate) struct HandshakeInfo {
 /// A live connection to a peer, created after a successful version handshake.
 struct Connection<T: Transport> {
     transport: T,
-    new_addr_tx: mpsc::Sender<Vec<NetAddr>>,
+    new_addr_tx: mpsc::Sender<Vec<PeerAddr>>,
     #[allow(dead_code)]
     handshake_info: HandshakeInfo,
     /// Last SendCmpct received from the peer.
@@ -76,7 +76,7 @@ pub(crate) async fn run_session(
     addr: &NetAddr,
     cfg: &SessionConfig,
     status_tx: &mpsc::Sender<StatusUpdate>,
-    new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
+    new_addr_tx: &mpsc::Sender<Vec<PeerAddr>>,
 ) -> Result<Instant> {
     let info = version_handshake(&mut transport, &cfg.user_agent).await?;
     let connected_at = Instant::now();
@@ -263,9 +263,9 @@ impl<T: Transport> Connection<T> {
     }
 
     fn handle_addr(&self, addrs: &[(u32, Address)]) {
-        let converted: Vec<NetAddr> = addrs
+        let converted: Vec<PeerAddr> = addrs
             .iter()
-            .filter_map(|(_, a)| NetAddr::try_from(a).ok())
+            .filter_map(|(_, a)| PeerAddr::try_from(a).ok())
             .collect();
         tracing::debug!(target: TARGET, received = addrs.len(), parsed = converted.len(), "addr");
         if !converted.is_empty() {
@@ -274,9 +274,9 @@ impl<T: Transport> Connection<T> {
     }
 
     fn handle_addrv2(&self, addrs: &[AddrV2Message]) {
-        let converted: Vec<NetAddr> = addrs
+        let converted: Vec<PeerAddr> = addrs
             .iter()
-            .filter_map(|m| NetAddr::try_from(m).ok())
+            .filter_map(|m| PeerAddr::try_from(m).ok())
             .collect();
         tracing::debug!(target: TARGET, received = addrs.len(), parsed = converted.len(), "addrv2");
         if !converted.is_empty() {

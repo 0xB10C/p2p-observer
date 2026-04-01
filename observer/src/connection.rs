@@ -16,9 +16,10 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::addresses::{BadReason, NetAddr, StatusUpdate};
+use crate::addresses::{BadReason, NetAddr, PeerAddr, StatusUpdate};
 use crate::protocol::{SessionConfig, run_session};
 use crate::transport::{TransportV1, TransportV2};
+use common::p2p::ServiceFlags;
 
 use crate::TARGET_CONNECTION as TARGET;
 
@@ -41,23 +42,33 @@ const MAX_TIMEOUT_ATTEMPTS_UNSEEN: u32 = 2;
 static PEER_ID: AtomicU64 = AtomicU64::new(0);
 
 pub async fn connect_with_retry(
-    addr: NetAddr,
+    peer: PeerAddr,
     magic: Magic,
     cfg: SessionConfig,
     status_tx: mpsc::Sender<StatusUpdate>,
-    new_addr_tx: mpsc::Sender<Vec<NetAddr>>,
+    new_addr_tx: mpsc::Sender<Vec<PeerAddr>>,
 ) {
     let id = PEER_ID.fetch_add(1, Ordering::Relaxed);
-    let span = tracing::debug_span!(target: TARGET, "c", id, addr = %addr);
+    let span = tracing::debug_span!(target: TARGET, "c", id, addr = %peer.addr);
 
     async move {
         crate::ACTIVE_TASKS.fetch_add(1, Ordering::Relaxed);
-        let Some(socket_addr) = addr.to_socket_addr() else {
+        let Some(socket_addr) = peer.addr.to_socket_addr() else {
             tracing::debug!(target: TARGET, "no TCP address, skipping");
             crate::ACTIVE_TASKS.fetch_sub(1, Ordering::Relaxed);
             return;
         };
-        retry_loop(&addr, socket_addr, magic, &cfg, status_tx, new_addr_tx).await;
+        let skip_v2 = !peer.services().has(ServiceFlags::P2P_V2);
+        retry_loop(
+            &peer.addr,
+            socket_addr,
+            magic,
+            &cfg,
+            skip_v2,
+            status_tx,
+            new_addr_tx,
+        )
+        .await;
         crate::ACTIVE_TASKS.fetch_sub(1, Ordering::Relaxed);
     }
     .instrument(span)
@@ -69,8 +80,9 @@ async fn retry_loop(
     socket_addr: SocketAddr,
     magic: Magic,
     cfg: &SessionConfig,
+    skip_v2: bool,
     status_tx: mpsc::Sender<StatusUpdate>,
-    new_addr_tx: mpsc::Sender<Vec<NetAddr>>,
+    new_addr_tx: mpsc::Sender<Vec<PeerAddr>>,
 ) {
     let mut backoff = BACKOFF_BASE;
     let mut attempts = 0u32;
@@ -84,6 +96,7 @@ async fn retry_loop(
             socket_addr,
             magic,
             cfg,
+            skip_v2,
             &mut skip_v1_fallback,
             &status_tx,
             &new_addr_tx,
@@ -178,11 +191,17 @@ async fn try_connect(
     socket_addr: SocketAddr,
     magic: Magic,
     cfg: &SessionConfig,
+    skip_v2: bool,
     skip_v1_fallback: &mut bool,
     status_tx: &mpsc::Sender<StatusUpdate>,
-    new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
+    new_addr_tx: &mpsc::Sender<Vec<PeerAddr>>,
 ) -> Result<Instant> {
+    if skip_v2 {
+        tracing::trace!(target: TARGET, "not attemping a v2 connection, as ServiceFlags indicate this node does not support P2Pv2");
+        return connect_v1(net_addr, socket_addr, magic, cfg, status_tx, new_addr_tx).await;
+    }
     if *skip_v1_fallback {
+        tracing::trace!(target: TARGET, "not attemping a v1 connection, as we were previously connected as v2 to this node");
         return connect_v2(net_addr, socket_addr, magic, cfg, status_tx, new_addr_tx).await;
     }
     match connect_v2(net_addr, socket_addr, magic, cfg, status_tx, new_addr_tx).await {
@@ -196,7 +215,7 @@ async fn try_connect(
             if is_tcp_connect_error(&e) {
                 return Err(e);
             }
-            tracing::trace!(target: TARGET, "trying transport v1 as v2 failed: {e}");
+            tracing::trace!(target: TARGET, "trying transport v1 as v2 failed: {e:#}");
             connect_v1(net_addr, socket_addr, magic, cfg, status_tx, new_addr_tx).await
         }
     }
@@ -208,7 +227,7 @@ async fn connect_v2(
     magic: Magic,
     cfg: &SessionConfig,
     status_tx: &mpsc::Sender<StatusUpdate>,
-    new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
+    new_addr_tx: &mpsc::Sender<Vec<PeerAddr>>,
 ) -> Result<Instant> {
     tracing::trace!(target: TARGET, "connecting (v2) ...");
     let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
@@ -242,7 +261,7 @@ async fn connect_v1(
     magic: Magic,
     cfg: &SessionConfig,
     status_tx: &mpsc::Sender<StatusUpdate>,
-    new_addr_tx: &mpsc::Sender<Vec<NetAddr>>,
+    new_addr_tx: &mpsc::Sender<Vec<PeerAddr>>,
 ) -> Result<Instant> {
     tracing::trace!(target: TARGET, "connecting (v1) ...");
     let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
@@ -378,7 +397,7 @@ mod tests {
 
         let net_addr = NetAddr::Ipv4("127.0.0.1".parse().unwrap(), addr.port());
         let (status_tx, _status_rx) = mpsc::channel(1);
-        let (tx, _rx) = mpsc::channel(1);
+        let (tx, _rx) = mpsc::channel::<Vec<PeerAddr>>(1);
         let cfg = SessionConfig {
             ping_interval: Duration::from_secs(120),
             user_agent: crate::protocol::USER_AGENT.to_owned(),
@@ -413,7 +432,7 @@ mod tests {
 
         let net_addr = NetAddr::Ipv4("127.0.0.1".parse().unwrap(), addr.port());
         let (status_tx, _status_rx) = mpsc::channel(1);
-        let (tx, _rx) = mpsc::channel(1);
+        let (tx, _rx) = mpsc::channel::<Vec<PeerAddr>>(1);
         let cfg = SessionConfig {
             ping_interval: Duration::from_secs(120),
             user_agent: crate::protocol::USER_AGENT.to_owned(),
