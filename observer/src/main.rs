@@ -38,6 +38,8 @@ async fn main() {
         .with_env_filter(filter)
         .init();
 
+    cfg.log_settings();
+
     let store = init_store(&cfg);
 
     let (status_tx, status_rx) = tokio::sync::mpsc::channel(256);
@@ -74,7 +76,7 @@ async fn run_loop(
     status_tx: tokio::sync::mpsc::Sender<addresses::StatusUpdate>,
     new_addr_tx: tokio::sync::mpsc::Sender<Vec<addresses::NetAddr>>,
 ) {
-    let mut connect_timer = tokio::time::interval(tokio::time::Duration::from_secs(1));
+    let mut connect_timer = tokio::time::interval(tokio::time::Duration::from_secs(10));
     let mut active_addrs: HashSet<addresses::NetAddr> = HashSet::new();
     let mut task_handles: Vec<(addresses::NetAddr, tokio::task::JoinHandle<()>)> = Vec::new();
 

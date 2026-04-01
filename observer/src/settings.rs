@@ -5,7 +5,7 @@ use common::{
     serde::Deserialize,
 };
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(crate = "common::serde")]
 pub struct Config {
     #[serde(default = "default_network")]
@@ -25,7 +25,7 @@ pub struct Config {
     pub bootstrap_addrs: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(crate = "common::serde")]
 pub struct LogLevels {
     #[serde(default = "default_main_level")]
@@ -101,9 +101,16 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> Result<Self> {
+        let path = std::env::args()
+            .nth(1)
+            .unwrap_or_else(|| "config.yaml".to_owned());
+        Self::load_from(&path)
+    }
+
+    pub fn load_from(path: &str) -> Result<Self> {
         CfgBuilder::builder()
             .add_source(
-                File::with_name("config")
+                File::with_name(path)
                     .format(FileFormat::Yaml)
                     .required(false),
             )
@@ -111,6 +118,11 @@ impl Config {
             .context("build config")?
             .try_deserialize()
             .context("parse config")
+    }
+
+    pub fn log_settings(&self) {
+        use common::tracing::info;
+        info!(target: crate::TARGET_MAIN, "config: {:#?}", self);
     }
 
     pub fn magic(&self) -> Result<Magic> {
