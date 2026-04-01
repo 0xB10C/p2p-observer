@@ -184,6 +184,9 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         // request addresses from this peer
         self.writer.send(NetworkMessage::GetAddr).await?;
 
+        // request headers (BIP130) from this peer
+        self.writer.send(NetworkMessage::SendHeaders).await?;
+
         // recv() is cancel-safe: both v1 and v2 readers preserve partial read
         // state across cancellations, so the ping timer can fire without losing bytes.
         loop {
