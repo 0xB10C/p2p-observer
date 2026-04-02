@@ -254,6 +254,7 @@ pub struct AddrStore {
     unknown: HashSet<PeerAddr>,
     good: HashMap<PeerAddr, u64>,
     bad: HashMap<PeerAddr, (u64, BadReason)>,
+    manual: HashSet<PeerAddr>,
     persist_path: PathBuf,
 }
 
@@ -265,6 +266,8 @@ struct StoreDisk {
     unknown: Vec<(NetAddr, u64)>,
     good: Vec<(NetAddr, u64, u64)>,
     bad: Vec<(NetAddr, u64, BadReason, u64)>,
+    #[serde(default)]
+    manual: Vec<NetAddr>,
 }
 
 impl AddrStore {
@@ -288,6 +291,11 @@ impl AddrStore {
                         .into_iter()
                         .map(|(a, ts, r, svc)| (PeerAddr::new(a, ServiceFlags::from(svc)), (ts, r)))
                         .collect(),
+                    manual: disk
+                        .manual
+                        .into_iter()
+                        .map(|a| PeerAddr::new(a, ServiceFlags::NONE))
+                        .collect(),
                     persist_path: path.to_owned(),
                 })
             }
@@ -301,6 +309,7 @@ impl AddrStore {
             unknown: HashSet::new(),
             good: HashMap::new(),
             bad: HashMap::new(),
+            manual: HashSet::new(),
             persist_path: path.to_owned(),
         }
     }
@@ -322,6 +331,7 @@ impl AddrStore {
                 .iter()
                 .map(|(p, (ts, r))| (p.addr.clone(), *ts, *r, p.services().to_u64()))
                 .collect(),
+            manual: self.manual.iter().map(|p| p.addr.clone()).collect(),
         };
         let json = serde_json::to_string(&disk).context("serialize address store")?;
         std::fs::write(&self.persist_path, json).context("write address store")?;
@@ -329,6 +339,7 @@ impl AddrStore {
             unknown = self.unknown.len(),
             good = self.good.len(),
             bad = self.bad.len(),
+            manual = self.manual.len(),
             "address store saved"
         );
         Ok(())
@@ -341,7 +352,10 @@ impl AddrStore {
             if !allow_local && !peer.addr.is_routable() {
                 continue;
             }
-            if self.good.contains_key(&peer) || self.bad.contains_key(&peer) {
+            if self.good.contains_key(&peer)
+                || self.bad.contains_key(&peer)
+                || self.manual.contains(&peer)
+            {
                 continue;
             }
             if self.unknown.len() >= MAX_UNKNOWN {
@@ -353,12 +367,24 @@ impl AddrStore {
         inserted
     }
 
+    /// Insert addresses into the manual table. Returns the number of new addresses added.
+    pub fn insert_manual(&mut self, addrs: Vec<PeerAddr>) -> usize {
+        let mut inserted = 0;
+        for peer in addrs {
+            if self.manual.insert(peer) {
+                inserted += 1;
+            }
+        }
+        inserted
+    }
+
     /// Returns up to `n` addresses to connect to, excluding those in `active`.
     ///
     /// Priority order:
-    ///   1. Good — oldest-seen first. Then:
-    ///   2. Unknown. Then:
-    ///   3. Bad — fill remaining slots.
+    ///   1. Manual — user-provided addresses. Then:
+    ///   2. Good — oldest-seen first. Then:
+    ///   3. Unknown. Then:
+    ///   4. Bad — fill remaining slots.
     ///
     /// Only addresses with a TCP socket address are returned.
     pub fn get_batch(&self, n: usize, active: &HashSet<PeerAddr>) -> Vec<PeerAddr> {
@@ -366,6 +392,14 @@ impl AddrStore {
 
         let base =
             |peer: &PeerAddr| !active.contains(&peer) && peer.addr.to_socket_addr().is_some();
+
+        // first, fill up with manual
+        let manual: Vec<&PeerAddr> = self.manual.iter().filter(|a| base(a)).collect();
+        let manual_fill = std::cmp::min(n, manual.len());
+        batch.extend(manual[..manual_fill].iter().map(|a| (*a).clone()));
+        if batch.len() == n {
+            return batch;
+        }
 
         let mut good: Vec<(&PeerAddr, u64)> = self
             .good
@@ -375,36 +409,20 @@ impl AddrStore {
             .collect();
         good.sort_by_key(|(_, ts)| *ts);
 
-        // first, fill up with good ones
-        let good_fill = std::cmp::min(n, good.len());
+        // then, fill up with good ones
+        let good_fill = std::cmp::min(n - batch.len(), good.len());
         batch.extend(good[..good_fill].iter().map(|(peer, _)| (*peer).clone()));
         if batch.len() == n {
-            tracing::debug!(target: TARGET,
-                good=good_fill,
-                "returned batch with only good addresses:"
-            );
             return batch;
         }
-        assert!(
-            batch.len() <= n,
-            "batch has {} entries while {} are allowed",
-            batch.len(),
-            n
-        );
 
         // then, fill up with unknown
         let unknown: Vec<&PeerAddr> = self.unknown.iter().filter(|a| base(a)).collect();
         let unknown_fill = std::cmp::min(n - batch.len(), unknown.len());
         batch.extend(unknown[..unknown_fill].iter().map(|a| (*a).clone()));
         if batch.len() == n {
-            tracing::debug!(target: TARGET,
-                good=good_fill,
-                unknown=unknown_fill,
-                "returned batch with good and unknown addresses:"
-            );
             return batch;
         }
-        assert!(batch.len() <= n);
 
         // then, fill up with bad ones — skip addresses tried less than BAD_RETRY_INTERVAL_SECS ago
         let now = std::time::SystemTime::now()
@@ -420,12 +438,12 @@ impl AddrStore {
         let bad_fill = std::cmp::min(n - batch.len(), bad.len());
         batch.extend(bad[..bad_fill].iter().map(|a| (*a).clone()));
         tracing::debug!(target: TARGET,
+            manual=manual_fill,
             good=good_fill,
             unknown=unknown_fill,
             bad=bad_fill,
-            "returned batch with good, unknown, and bad addresses:"
+            "returned batch"
         );
-        assert!(batch.len() <= n);
 
         batch
     }
@@ -442,9 +460,16 @@ impl AddrStore {
         self.bad.len()
     }
 
+    pub fn manual_len(&self) -> usize {
+        self.manual.len()
+    }
+
     /// Look up the `PeerAddr` for a `NetAddr` in any table, preserving its services.
     fn take(&mut self, addr: &NetAddr) -> Option<PeerAddr> {
         let key = PeerAddr::new(addr.clone(), ServiceFlags::NONE);
+        if let Some(peer) = self.manual.take(&key) {
+            return Some(peer);
+        }
         if let Some(peer) = self.unknown.take(&key) {
             return Some(peer);
         }

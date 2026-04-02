@@ -44,6 +44,8 @@ pub struct LogLevels {
     pub addresses: String,
     #[serde(default = "default_publisher_level")]
     pub publisher: String,
+    #[serde(default = "default_rpc_level")]
+    pub rpc: String,
 }
 
 impl Default for LogLevels {
@@ -54,6 +56,7 @@ impl Default for LogLevels {
             protocol: default_protocol_level(),
             addresses: default_addresses_level(),
             publisher: default_publisher_level(),
+            rpc: default_rpc_level(),
         }
     }
 }
@@ -61,7 +64,7 @@ impl Default for LogLevels {
 impl LogLevels {
     pub fn to_filter_string(&self) -> String {
         format!(
-            "{}={},{}={},{}={},{}={},{}={}",
+            "{}={},{}={},{}={},{}={},{}={},{}={}",
             crate::TARGET_MAIN,
             self.main,
             crate::TARGET_CONNECTION,
@@ -72,6 +75,8 @@ impl LogLevels {
             self.addresses,
             crate::TARGET_PUBLISHER,
             self.publisher,
+            crate::TARGET_RPC,
+            self.rpc,
         )
     }
 }
@@ -102,6 +107,9 @@ fn default_addresses_level() -> String {
 }
 fn default_publisher_level() -> String {
     "warn".to_owned()
+}
+fn default_rpc_level() -> String {
+    "info".to_owned()
 }
 
 impl Default for Config {

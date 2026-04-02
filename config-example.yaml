@@ -26,3 +26,4 @@ log_levels:
   protocol: debug
   addresses: debug
   publisher: info
+  rpc: info

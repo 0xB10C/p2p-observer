@@ -7,6 +7,7 @@ pub(crate) const TARGET_PROTOCOL: &str = "protocol";
 pub(crate) const TARGET_ADDRESSES: &str = "addresses";
 pub(crate) const TARGET_MAIN: &str = "main";
 pub(crate) const TARGET_PUBLISHER: &str = "publisher";
+pub(crate) const TARGET_RPC: &str = "rpc";
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -21,6 +22,7 @@ mod connection;
 mod logging;
 mod protocol;
 mod publisher;
+mod rpc;
 mod settings;
 mod transport;
 
@@ -49,7 +51,8 @@ async fn main() {
         .await
         .expect("failed to connect to NATS");
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<common::events::PeerEvent>(1024);
-    tokio::spawn(publisher::run(nats, cfg.network.clone(), event_rx));
+    tokio::spawn(publisher::run(nats.clone(), cfg.network.clone(), event_rx));
+    tokio::spawn(rpc::Rpc::new(nats, &cfg.network, store.clone()).run());
 
     let proto_cfg = protocol::Config {
         magic,
@@ -112,6 +115,7 @@ async fn run_loop(
                     unknown = s.unknown_len(),
                     good = s.good_len(),
                     bad = s.bad_len(),
+                    manual = s.manual_len(),
                     active,
                     connected,
                     "stats"

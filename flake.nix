@@ -25,11 +25,12 @@
               pkgs.rust-analyzer
               pkgs.cargo-tarpaulin
 
-	      pkgs.protobuf
+              pkgs.protobuf
 
               # for integration tests
               pkgs.bitcoind
               pkgs.nats-server
+              pkgs.natscli
             ];
 
             shellHook = ''
