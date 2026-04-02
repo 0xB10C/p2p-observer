@@ -28,18 +28,16 @@ use crate::TARGET_CONNECTION as TARGET;
 /// Initial wait before the first reconnect attempt after a failure.
 /// Doubles on each consecutive failure, reset to this value after a successful connection.
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
-/// How many consecutive failed connection attempts to make before giving up.
-/// With BACKOFF_BASE doubling each attempt: 1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s.
+
+/// Maximum number of attempts when connecting to a peer for the first time.
+const MAX_INITIAL_ATTEMPTS: u32 = 2;
+/// Maximum number of reconnect attempts after a peer we once successfully connected to drops us.
+/// With BACKOFF_BASE doubling each attempt: 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s.
 const MAX_RECONNECT_ATTEMPTS: u32 = 8;
 
 /// Timeout for TCP connection attempts. The OS default (several minutes with SYN retransmits)
 /// is far too long when managing many connections.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How many consecutive TCP timeouts to tolerate before giving up on a peer we have
-/// never successfully connected to. Timeouts are a softer signal than ConnectionRefused
-/// (the node might be firewalled), so we allow a small number of retries before giving up.
-const MAX_TIMEOUT_ATTEMPTS_UNSEEN: u32 = 2;
 
 /// A connection shorter than this is considered a likely eviction (peer is full).
 const EVICTION_THRESHOLD: Duration = Duration::from_secs(31);
@@ -67,36 +65,119 @@ pub async fn connect_with_retry(
             return;
         };
         let skip_v2 = !peer.services().has(ServiceFlags::P2P_V2);
-        retry_loop(
+        let mut skip_v1_fallback = false;
+
+        if initial_connect(
             &peer.addr,
             socket_addr,
             magic,
             &cfg,
             skip_v2,
-            status_tx,
-            new_addr_tx,
+            &mut skip_v1_fallback,
+            &status_tx,
+            &new_addr_tx,
         )
-        .await;
+        .await
+        {
+            reconnect_loop(
+                &peer.addr,
+                socket_addr,
+                magic,
+                &cfg,
+                skip_v2,
+                &mut skip_v1_fallback,
+                &status_tx,
+                &new_addr_tx,
+            )
+            .await;
+        }
         crate::ACTIVE_TASKS.fetch_sub(1, Ordering::Relaxed);
     }
     .instrument(span)
     .await
 }
 
-async fn retry_loop(
+/// Tries to connect for the first time, up to `MAX_INITIAL_ATTEMPTS` attempts.
+/// Hard errors (refused, unreachable) give up immediately.
+/// Returns true if we connected at least once (triggering the reconnect loop).
+async fn initial_connect(
     addr: &NetAddr,
     socket_addr: SocketAddr,
     magic: Magic,
     cfg: &SessionConfig,
     skip_v2: bool,
-    status_tx: mpsc::Sender<StatusUpdate>,
-    new_addr_tx: mpsc::Sender<Vec<PeerAddr>>,
+    skip_v1_fallback: &mut bool,
+    status_tx: &mpsc::Sender<StatusUpdate>,
+    new_addr_tx: &mpsc::Sender<Vec<PeerAddr>>,
+) -> bool {
+    let mut backoff = BACKOFF_BASE;
+    for attempt in 1..=MAX_INITIAL_ATTEMPTS {
+        match try_connect(
+            addr,
+            socket_addr,
+            magic,
+            cfg,
+            skip_v2,
+            skip_v1_fallback,
+            status_tx,
+            new_addr_tx,
+        )
+        .await
+        {
+            Ok(_) => return true,
+            Err(e) => {
+                let bad = |reason| StatusUpdate::Bad {
+                    addr: addr.clone(),
+                    at: unix_secs(),
+                    reason,
+                };
+                if is_network_unreachable(&e) {
+                    tracing::debug!(target: TARGET, "network unreachable");
+                    let _ = status_tx.send(bad(BadReason::NetworkUnreachable)).await;
+                    return false;
+                }
+                if is_connection_refused(&e) {
+                    tracing::debug!(target: TARGET, "connection refused");
+                    let _ = status_tx.send(bad(BadReason::ConnectionRefused)).await;
+                    return false;
+                }
+                if is_host_unreachable(&e) {
+                    tracing::debug!(target: TARGET, "host unreachable");
+                    let _ = status_tx.send(bad(BadReason::HostUnreachable)).await;
+                    return false;
+                }
+                if attempt >= MAX_INITIAL_ATTEMPTS {
+                    if is_timed_out(&e) {
+                        let _ = status_tx.send(bad(BadReason::TimedOut)).await;
+                    }
+                    tracing::debug!(target: TARGET, attempt, "initial connect failed, giving up");
+                    return false;
+                }
+                backoff *= 2;
+                tracing::trace!(target: TARGET,
+                    error = format!("{:#}", e),
+                    "initial connect failed, retrying in {}s", backoff.as_secs()
+                );
+                sleep(backoff).await;
+            }
+        }
+    }
+    false
+}
+
+/// Reconnects to a peer we've previously connected to, up to `MAX_RECONNECT_ATTEMPTS` per connection drop.
+async fn reconnect_loop(
+    addr: &NetAddr,
+    socket_addr: SocketAddr,
+    magic: Magic,
+    cfg: &SessionConfig,
+    skip_v2: bool,
+    skip_v1_fallback: &mut bool,
+    status_tx: &mpsc::Sender<StatusUpdate>,
+    new_addr_tx: &mpsc::Sender<Vec<PeerAddr>>,
 ) {
     let mut backoff = BACKOFF_BASE;
     let mut attempts = 0u32;
-    let mut timeout_attempts = 0u32;
-    let mut skip_v1_fallback = false;
-    let mut ever_connected = false;
 
     loop {
         let result = try_connect(
@@ -105,18 +186,16 @@ async fn retry_loop(
             magic,
             cfg,
             skip_v2,
-            &mut skip_v1_fallback,
-            &status_tx,
-            &new_addr_tx,
+            skip_v1_fallback,
+            status_tx,
+            new_addr_tx,
         )
         .await;
-
         attempts += 1;
         backoff *= 2;
 
         match result {
             Ok(connected_at) => {
-                ever_connected = true;
                 let _ = status_tx
                     .send(StatusUpdate::Good {
                         addr: addr.clone(),
@@ -124,18 +203,14 @@ async fn retry_loop(
                     })
                     .await;
                 let uptime = connected_at.elapsed();
-                // Only reset backoff if the connection was stable long enough — otherwise
-                // a peer that immediately evicts us after the handshake would reset the
-                // backoff on every attempt, causing a reconnect flood.
+
+                // Reset backoff if the connection was stable long enough.
                 if uptime > backoff {
                     backoff = BACKOFF_BASE;
                     attempts = 0;
                 }
-                let uptime_str = format!("{:?}", uptime);
 
-                // If the connection was short, the peer is likely evicting us
-                // (connection slot full, etc). Force a short cooldown so we
-                // don't hammer it.
+                let uptime_str = format!("{:?}", uptime);
                 if uptime < EVICTION_THRESHOLD {
                     tracing::debug!(target: TARGET,
                         "connection lost after only {uptime_str}. Cooling down for {}s",
@@ -150,51 +225,20 @@ async fn retry_loop(
                 );
             }
             Err(e) => {
-                let bad = |reason| StatusUpdate::Bad {
-                    addr: addr.clone(),
-                    at: unix_secs(),
-                    reason,
-                };
-
                 if is_network_unreachable(&e) {
-                    tracing::debug!(target: TARGET, "network unreachable, not retrying");
-                    let _ = status_tx.send(bad(BadReason::NetworkUnreachable)).await;
+                    tracing::debug!(target: TARGET, "network unreachable, stopping reconnect");
                     break;
                 }
-
-                if is_timed_out(&e) {
-                    timeout_attempts += 1;
-                    if !ever_connected && timeout_attempts >= MAX_TIMEOUT_ATTEMPTS_UNSEEN {
-                        tracing::debug!(target: TARGET, timeout_attempts, "timed out repeatedly, not retrying");
-                        let _ = status_tx.send(bad(BadReason::TimedOut)).await;
-                        break;
-                    }
-                } else {
-                    timeout_attempts = 0;
-                }
-
-                if !ever_connected {
-                    if is_connection_refused(&e) {
-                        tracing::debug!(target: TARGET, "connection refused on first attempt, not retrying");
-                        let _ = status_tx.send(bad(BadReason::ConnectionRefused)).await;
-                        break;
-                    } else if is_host_unreachable(&e) {
-                        tracing::debug!(target: TARGET, "host unreachable on first attempt, not retrying");
-                        let _ = status_tx.send(bad(BadReason::HostUnreachable)).await;
-                        break;
-                    }
-                }
-
                 let backoff_secs = backoff.as_secs();
                 tracing::trace!(target: TARGET,
                     error = format!("{:#}", e),
-                    "failed to connect; retrying in {backoff_secs}s (attempt={attempts})"
+                    "re-connect failed; retrying in {backoff_secs}s (attempt={attempts})"
                 );
             }
         }
 
         if attempts >= MAX_RECONNECT_ATTEMPTS {
-            tracing::debug!(target: TARGET, attempts, "giving up");
+            tracing::debug!(target: TARGET, attempts, "giving up re-connect");
             break;
         }
 
