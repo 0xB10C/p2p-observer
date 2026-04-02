@@ -26,6 +26,9 @@ pub struct Config {
     /// Initial addresses to connect to before peer discovery takes over.
     #[serde(default)]
     pub bootstrap_addrs: Vec<String>,
+
+    #[serde(default = "default_nats_url")]
+    pub nats_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +42,8 @@ pub struct LogLevels {
     pub protocol: String,
     #[serde(default = "default_addresses_level")]
     pub addresses: String,
+    #[serde(default = "default_publisher_level")]
+    pub publisher: String,
 }
 
 impl Default for LogLevels {
@@ -48,6 +53,7 @@ impl Default for LogLevels {
             connection: default_connection_level(),
             protocol: default_protocol_level(),
             addresses: default_addresses_level(),
+            publisher: default_publisher_level(),
         }
     }
 }
@@ -55,7 +61,7 @@ impl Default for LogLevels {
 impl LogLevels {
     pub fn to_filter_string(&self) -> String {
         format!(
-            "{}={},{}={},{}={},{}={}",
+            "{}={},{}={},{}={},{}={},{}={}",
             crate::TARGET_MAIN,
             self.main,
             crate::TARGET_CONNECTION,
@@ -64,6 +70,8 @@ impl LogLevels {
             self.protocol,
             crate::TARGET_ADDRESSES,
             self.addresses,
+            crate::TARGET_PUBLISHER,
+            self.publisher,
         )
     }
 }
@@ -92,6 +100,9 @@ fn default_protocol_level() -> String {
 fn default_addresses_level() -> String {
     "debug".to_owned()
 }
+fn default_publisher_level() -> String {
+    "warn".to_owned()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -102,8 +113,13 @@ impl Default for Config {
             ping_interval_secs: default_ping_interval_secs(),
             user_agent: default_user_agent(),
             bootstrap_addrs: Vec::new(),
+            nats_url: default_nats_url(),
         }
     }
+}
+
+fn default_nats_url() -> String {
+    "nats://localhost:4222".to_owned()
 }
 
 impl Config {

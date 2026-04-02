@@ -48,6 +48,7 @@ static PEER_ID: AtomicU64 = AtomicU64::new(0);
 /// Per-peer connection state. Drives the full lifecycle for a single peer:
 /// initial connect, message loop, and reconnect loop.
 pub struct Connection {
+    id: u64,
     cfg: Config,
     status_tx: mpsc::Sender<StatusUpdate>,
     new_addr_tx: mpsc::Sender<Vec<PeerAddr>>,
@@ -64,6 +65,7 @@ impl Connection {
         peer: PeerAddr,
     ) -> Self {
         Self {
+            id: PEER_ID.fetch_add(1, Ordering::Relaxed),
             cfg,
             status_tx,
             new_addr_tx,
@@ -73,8 +75,7 @@ impl Connection {
     }
 
     pub async fn run(mut self) {
-        let id = PEER_ID.fetch_add(1, Ordering::Relaxed);
-        let span = tracing::debug_span!(target: TARGET, "c", id, addr = %self.peer.addr);
+        let span = tracing::debug_span!(target: TARGET, "c", id = self.id, addr = %self.peer.addr);
         async move {
             crate::ACTIVE_TASKS.fetch_add(1, Ordering::Relaxed);
             if self.initial_connect().await {
@@ -248,6 +249,7 @@ impl Connection {
             TransportV2Reader { reader: pr },
             TransportV2Writer { writer: pw },
             2,
+            self.id,
             &self.peer.addr,
             &self.cfg,
             &self.status_tx,
@@ -271,6 +273,7 @@ impl Connection {
                 writer,
             },
             1,
+            self.id,
             &self.peer.addr,
             &self.cfg,
             &self.status_tx,
@@ -402,10 +405,12 @@ mod tests {
         let net_addr = NetAddr::Ipv4("127.0.0.1".parse().unwrap(), addr.port());
         let (status_tx, _status_rx) = mpsc::channel(1);
         let (tx, _rx) = mpsc::channel::<Vec<PeerAddr>>(1);
+        let (event_tx, _event_rx) = mpsc::channel(1);
         let cfg = Config {
             magic: MAGIC,
             ping_interval: Duration::from_secs(120),
             user_agent: crate::protocol::USER_AGENT.to_owned(),
+            event_tx,
         };
         let conn = Connection::new(
             cfg,
@@ -446,10 +451,12 @@ mod tests {
         let net_addr = NetAddr::Ipv4("127.0.0.1".parse().unwrap(), addr.port());
         let (status_tx, _status_rx) = mpsc::channel(1);
         let (tx, _rx) = mpsc::channel::<Vec<PeerAddr>>(1);
+        let (event_tx, _event_rx) = mpsc::channel(1);
         let cfg = Config {
             magic: MAGIC,
             ping_interval: Duration::from_secs(120),
             user_agent: crate::protocol::USER_AGENT.to_owned(),
+            event_tx,
         };
         let conn = Connection::new(
             cfg,
@@ -460,5 +467,68 @@ mod tests {
         let result = conn.connect_v2().await;
         server.await.unwrap();
         assert!(result.is_ok(), "connect_v2 failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_ping_rtt_event() {
+        setup();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, writer) = stream.into_split();
+            let mut r = TransportV1Reader::new(BufReader::new(reader));
+            let mut w = TransportV1Writer {
+                magic: MAGIC,
+                writer,
+            };
+            server_handshake(&mut r, &mut w).await;
+            // Respond to the first ping; ignore everything else (GetAddr, SendHeaders, ...)
+            loop {
+                match r.recv().await.unwrap() {
+                    NetworkMessage::Ping(nonce) => {
+                        w.send(NetworkMessage::Pong(nonce)).await.unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let net_addr = NetAddr::Ipv4("127.0.0.1".parse().unwrap(), addr.port());
+        let (status_tx, _status_rx) = mpsc::channel(1);
+        let (addr_tx, _addr_rx) = mpsc::channel::<Vec<PeerAddr>>(1);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let cfg = Config {
+            magic: MAGIC,
+            ping_interval: Duration::from_millis(50),
+            user_agent: crate::protocol::USER_AGENT.to_owned(),
+            event_tx,
+        };
+        tokio::spawn(
+            Connection::new(
+                cfg,
+                status_tx,
+                addr_tx,
+                PeerAddr::new(net_addr, ServiceFlags::NONE),
+            )
+            .run(),
+        );
+
+        let event = common::tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timed out waiting for ping_rtt event")
+            .expect("event channel closed");
+
+        assert!(
+            matches!(
+                event.event,
+                Some(common::events::peer_event::Event::PingRtt(_))
+            ),
+            "expected PingRtt, got: {:?}",
+            event.event,
+        );
+        server.await.unwrap();
     }
 }

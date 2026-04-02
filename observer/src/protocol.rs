@@ -32,6 +32,7 @@ pub(crate) struct Config {
     pub(crate) magic: common::p2p::Magic,
     pub(crate) ping_interval: Duration,
     pub(crate) user_agent: String,
+    pub(crate) event_tx: mpsc::Sender<common::events::PeerEvent>,
 }
 
 /// We want get high-bandwidth compact block relay (BIP152).
@@ -55,7 +56,6 @@ struct Connection<R: TransportReader, W: TransportWriter> {
     reader: R,
     writer: W,
     new_addr_tx: mpsc::Sender<Vec<PeerAddr>>,
-    #[allow(dead_code)]
     handshake_info: HandshakeInfo,
     /// Last SendCmpct received from the peer.
     #[allow(dead_code)]
@@ -64,6 +64,10 @@ struct Connection<R: TransportReader, W: TransportWriter> {
     #[allow(dead_code)]
     fee_filter: Option<common::bitcoin::FeeRate>,
     ping_interval: Duration,
+    addr: NetAddr,
+    transport_version: u8,
+    connection_id: u64,
+    event_tx: mpsc::Sender<common::events::PeerEvent>,
 }
 
 /// Run the Bitcoin P2P session on an already-established transport.
@@ -76,6 +80,7 @@ pub(crate) async fn run_session(
     mut reader: impl TransportReader,
     mut writer: impl TransportWriter,
     v: u8,
+    connection_id: u64,
     addr: &NetAddr,
     cfg: &Config,
     status_tx: &mpsc::Sender<StatusUpdate>,
@@ -101,6 +106,10 @@ pub(crate) async fn run_session(
         send_cmpct: None,
         fee_filter: None,
         ping_interval: cfg.ping_interval,
+        addr: addr.clone(),
+        transport_version: v,
+        connection_id,
+        event_tx: cfg.event_tx.clone(),
     };
     crate::IN_MESSAGE_LOOP.fetch_add(1, Ordering::Relaxed);
     if let Err(e) = conn.run().instrument(conn_span).await {
@@ -270,6 +279,16 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     fn handle_pong(&self, nonce: u64) {
         let rtt_ms = unix_ms().saturating_sub(nonce);
         tracing::debug!(target: TARGET, rtt_ms, "pong");
+        let _ = self.event_tx.try_send(common::events::PeerEvent {
+            timestamp_ms: unix_ms(),
+            peer_addr: self.addr.to_string(),
+            user_agent: self.handshake_info.version.user_agent.to_string(),
+            transport_version: self.transport_version as u32,
+            connection_id: self.connection_id,
+            event: Some(common::events::peer_event::Event::PingRtt(
+                common::events::PingRtt { rtt_ms },
+            )),
+        });
     }
 
     fn handle_addr(&self, addrs: &[(u32, Address)]) {
