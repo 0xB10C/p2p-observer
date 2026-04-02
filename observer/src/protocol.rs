@@ -239,9 +239,11 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             match item {
                 Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
                     tracing::info!(target: TARGET, %hash, "inv: block");
+                    self.emit_block_announcement(hash, common::events::AnnouncementType::Inv);
                 }
                 Inventory::CompactBlock(hash) => {
                     tracing::info!(target: TARGET, %hash, "inv: compact block");
+                    self.emit_block_announcement(hash, common::events::AnnouncementType::Inv);
                     getdata.push(Inventory::CompactBlock(hash));
                 }
                 _ => {}
@@ -263,12 +265,27 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         for header in headers {
             let hash = header.block_hash();
             tracing::info!(target: TARGET, %hash, "header announcement");
+            self.emit_block_announcement(hash, common::events::AnnouncementType::Headers);
         }
     }
 
     fn handle_cmpct_block(&self, cmpct: common::p2p::message_compact_blocks::CmpctBlock) {
         let hash = cmpct.compact_block.header.block_hash();
         tracing::info!(target: TARGET, %hash, "compact block");
+        self.emit_block_announcement(hash, common::events::AnnouncementType::CompactBlock);
+    }
+
+    fn emit_block_announcement(
+        &self,
+        hash: common::bitcoin::BlockHash,
+        announcement_type: common::events::AnnouncementType,
+    ) {
+        self.emit_event(common::events::peer_event::Event::BlockAnnouncement(
+            common::events::BlockAnnouncement {
+                block_hash: hash.to_string(),
+                announcement_type: announcement_type.into(),
+            },
+        ));
     }
 
     async fn handle_ping(&mut self, nonce: u64) -> Result<()> {
@@ -276,19 +293,23 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         self.writer.send(NetworkMessage::Pong(nonce)).await
     }
 
-    fn handle_pong(&self, nonce: u64) {
-        let rtt_ms = unix_ms().saturating_sub(nonce);
-        tracing::debug!(target: TARGET, rtt_ms, "pong");
+    fn emit_event(&self, event: common::events::peer_event::Event) {
         let _ = self.event_tx.try_send(common::events::PeerEvent {
             timestamp_ms: unix_ms(),
             peer_addr: self.addr.to_string(),
             user_agent: self.handshake_info.version.user_agent.to_string(),
             transport_version: self.transport_version as u32,
             connection_id: self.connection_id,
-            event: Some(common::events::peer_event::Event::PingRtt(
-                common::events::PingRtt { rtt_ms },
-            )),
+            event: Some(event),
         });
+    }
+
+    fn handle_pong(&self, nonce: u64) {
+        let rtt_ms = unix_ms().saturating_sub(nonce);
+        tracing::debug!(target: TARGET, rtt_ms, "pong");
+        self.emit_event(common::events::peer_event::Event::PingRtt(
+            common::events::PingRtt { rtt_ms },
+        ));
     }
 
     fn handle_addr(&self, addrs: &[(u32, Address)]) {

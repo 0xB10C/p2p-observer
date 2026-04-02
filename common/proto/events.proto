@@ -10,10 +10,22 @@ message PeerEvent {
 
   oneof event {
     PingRtt ping_rtt = 6;
-    // future variants: BlockInv, HeaderAnnouncement, etc.
+    BlockAnnouncement block_announcement = 7;
   }
 }
 
 message PingRtt {
   uint64 rtt_ms = 1;
+}
+
+message BlockAnnouncement {
+  string block_hash = 1;
+  AnnouncementType announcement_type = 2;
+}
+
+enum AnnouncementType {
+  UNKNOWN = 0;
+  INV = 1;
+  HEADERS = 2;
+  COMPACT_BLOCK = 3;
 }

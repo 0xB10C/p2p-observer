@@ -25,6 +25,7 @@ pub(crate) async fn run(
 fn subject_for(event: &PeerEvent) -> &'static str {
     match &event.event {
         Some(peer_event::Event::PingRtt(_)) => "ping_rtt",
+        Some(peer_event::Event::BlockAnnouncement(_)) => "block_announcement",
         None => "unknown",
     }
 }
