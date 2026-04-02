@@ -28,7 +28,8 @@ use crate::TARGET_PROTOCOL as TARGET;
 pub(crate) const USER_AGENT: &str = "/p2p-observer:0.1.0/";
 
 #[derive(Clone)]
-pub(crate) struct SessionConfig {
+pub(crate) struct Config {
+    pub(crate) magic: common::p2p::Magic,
     pub(crate) ping_interval: Duration,
     pub(crate) user_agent: String,
 }
@@ -76,7 +77,7 @@ pub(crate) async fn run_session(
     mut writer: impl TransportWriter,
     v: u8,
     addr: &NetAddr,
-    cfg: &SessionConfig,
+    cfg: &Config,
     status_tx: &mpsc::Sender<StatusUpdate>,
     new_addr_tx: &mpsc::Sender<Vec<PeerAddr>>,
 ) -> Result<Instant> {

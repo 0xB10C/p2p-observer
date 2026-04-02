@@ -43,7 +43,13 @@ async fn main() {
 
     tokio::spawn(addresses::run(store.clone(), status_rx, new_addr_rx));
 
-    run_loop(&store, magic, cfg, status_tx, new_addr_tx).await;
+    let proto_cfg = protocol::Config {
+        magic,
+        ping_interval: common::tokio::time::Duration::from_secs(cfg.ping_interval_secs),
+        user_agent: cfg.user_agent.clone(),
+    };
+
+    run_loop(&store, cfg, proto_cfg, status_tx, new_addr_tx).await;
 
     if let Err(e) = store.lock().unwrap().save() {
         tracing::warn!(target: TARGET_MAIN, "failed to persist address store on shutdown: {e}");
@@ -68,19 +74,14 @@ fn init_store(cfg: &settings::Config) -> Arc<Mutex<addresses::AddrStore>> {
 
 async fn run_loop(
     store: &Arc<Mutex<addresses::AddrStore>>,
-    magic: common::p2p::Magic,
     cfg: settings::Config,
+    proto_cfg: protocol::Config,
     status_tx: tokio::sync::mpsc::Sender<addresses::StatusUpdate>,
     new_addr_tx: tokio::sync::mpsc::Sender<Vec<addresses::PeerAddr>>,
 ) {
     let mut connect_timer = tokio::time::interval(tokio::time::Duration::from_secs(1));
     let mut active_addrs: HashSet<addresses::PeerAddr> = HashSet::new();
     let mut task_handles: Vec<(addresses::PeerAddr, tokio::task::JoinHandle<()>)> = Vec::new();
-
-    let session_cfg = protocol::SessionConfig {
-        ping_interval: common::tokio::time::Duration::from_secs(cfg.ping_interval_secs),
-        user_agent: cfg.user_agent.clone(),
-    };
 
     loop {
         tokio::select! {
@@ -112,13 +113,13 @@ async fn run_loop(
 
                 for addr in batch {
                     active_addrs.insert(addr.clone());
-                    let status_tx = status_tx.clone();
-                    let new_addr_tx = new_addr_tx.clone();
-                    let a = addr.clone();
-                    let cfg = session_cfg.clone();
-                    task_handles.push((addr, tokio::spawn(async move {
-                        connection::connect_with_retry(a, magic, cfg, status_tx, new_addr_tx).await;
-                    })));
+                    let conn = connection::Connection::new(
+                        proto_cfg.clone(),
+                        status_tx.clone(),
+                        new_addr_tx.clone(),
+                        addr.clone(),
+                    );
+                    task_handles.push((addr, tokio::spawn(conn.run())));
                 }
             }
             _ = tokio::signal::ctrl_c() => {
