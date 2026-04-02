@@ -3,5 +3,6 @@
 resolver = "2"
 members = [
   "common",
-  "observer"
+  "observer",
+  "tools/logger",
 ]
