@@ -41,6 +41,12 @@ const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (the node might be firewalled), so we allow a small number of retries before giving up.
 const MAX_TIMEOUT_ATTEMPTS_UNSEEN: u32 = 2;
 
+/// A connection shorter than this is considered a likely eviction (peer is full).
+const EVICTION_THRESHOLD: Duration = Duration::from_secs(31);
+/// Minimum wait before retrying after a short-lived successful connection, to avoid
+/// hammering a peer that is repeatedly evicting us.
+const EVICTION_COOLDOWN: Duration = Duration::from_secs(60);
+
 static PEER_ID: AtomicU64 = AtomicU64::new(0);
 
 pub async fn connect_with_retry(
@@ -126,6 +132,18 @@ async fn retry_loop(
                     attempts = 0;
                 }
                 let uptime_str = format!("{:?}", uptime);
+
+                // If the connection was short, the peer is likely evicting us
+                // (connection slot full, etc). Force a short cooldown so we
+                // don't hammer it.
+                if uptime < EVICTION_THRESHOLD {
+                    tracing::debug!(target: TARGET,
+                        "connection lost after only {uptime_str}. Cooling down for {}s",
+                        EVICTION_COOLDOWN.as_secs(),
+                    );
+                    sleep(EVICTION_COOLDOWN).await;
+                }
+
                 let backoff_secs = backoff.as_secs();
                 tracing::warn!(target: TARGET,
                     "connection lost after {uptime_str}. reconnecting in {backoff_secs}s"
