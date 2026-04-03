@@ -8,9 +8,10 @@ pub(crate) const TARGET_ADDRESSES: &str = "addresses";
 pub(crate) const TARGET_MAIN: &str = "main";
 pub(crate) const TARGET_PUBLISHER: &str = "publisher";
 pub(crate) const TARGET_RPC: &str = "rpc";
+pub(crate) const TARGET_HEADERTREE: &str = "headertree";
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Number of connection tasks currently running (connecting, retrying, or in message loop).
 pub(crate) static ACTIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
@@ -19,6 +20,7 @@ pub(crate) static IN_MESSAGE_LOOP: AtomicUsize = AtomicUsize::new(0);
 
 mod addresses;
 mod connection;
+mod headertree;
 mod logging;
 mod protocol;
 mod publisher;
@@ -30,6 +32,9 @@ mod transport;
 async fn main() {
     let cfg = settings::Config::load().expect("failed to load config");
     let magic = cfg.magic().expect("invalid network in config");
+    let params = common::bitcoin::network::Params::new(
+        common::bitcoin::Network::try_from(magic).expect("invalid magic for network params"),
+    );
 
     let filter = tracing_subscriber::EnvFilter::new(cfg.log_levels.to_filter_string());
     tracing_subscriber::fmt()
@@ -42,6 +47,12 @@ async fn main() {
 
     let store = init_store(&cfg);
 
+    let header_path = format!("headers-{}.bin", cfg.network);
+    let header_tree = Arc::new(RwLock::new(
+        headertree::HeaderTree::load(Path::new(&header_path), params)
+            .expect("failed to load header tree"),
+    ));
+
     let (status_tx, status_rx) = tokio::sync::mpsc::channel(256);
     let (new_addr_tx, new_addr_rx) = tokio::sync::mpsc::channel(256);
 
@@ -53,18 +64,96 @@ async fn main() {
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<common::events::PeerEvent>(1024);
     tokio::spawn(publisher::run(nats.clone(), cfg.network.clone(), event_rx));
     tokio::spawn(rpc::Rpc::new(nats, &cfg.network, store.clone()).run());
+    tokio::spawn(headertree::persist_task(
+        header_tree.clone(),
+        header_path.clone().into(),
+    ));
+
+    // Bootstrap sync: connect to bootstrap peers sequentially to sync headers first.
+    let bootstrap_addrs: Vec<_> = cfg
+        .bootstrap_addrs
+        .iter()
+        .filter_map(|s| addresses::parse_addr(s))
+        .collect();
+
+    bootstrap_sync(
+        &bootstrap_addrs,
+        magic,
+        &cfg,
+        &header_tree,
+        &event_tx,
+        &status_tx,
+        &new_addr_tx,
+    )
+    .await;
 
     let proto_cfg = protocol::Config {
         magic,
         ping_interval: common::tokio::time::Duration::from_secs(cfg.ping_interval_secs),
         user_agent: cfg.user_agent.clone(),
         event_tx,
+        header_tree: header_tree.clone(),
+        sync_headers: false,
     };
 
     run_loop(&store, cfg, proto_cfg, status_tx, new_addr_tx).await;
 
+    if let Err(e) = header_tree.write().unwrap().save(Path::new(&header_path)) {
+        tracing::warn!(target: TARGET_MAIN, "failed to persist header tree on shutdown: {e}");
+    }
     if let Err(e) = store.lock().unwrap().save() {
         tracing::warn!(target: TARGET_MAIN, "failed to persist address store on shutdown: {e}");
+    }
+}
+
+async fn bootstrap_sync(
+    bootstrap_addrs: &[addresses::PeerAddr],
+    magic: common::p2p::Magic,
+    cfg: &settings::Config,
+    header_tree: &Arc<RwLock<headertree::HeaderTree>>,
+    event_tx: &tokio::sync::mpsc::Sender<common::events::PeerEvent>,
+    status_tx: &tokio::sync::mpsc::Sender<addresses::StatusUpdate>,
+    new_addr_tx: &tokio::sync::mpsc::Sender<Vec<addresses::PeerAddr>>,
+) {
+    if bootstrap_addrs.is_empty() {
+        tracing::warn!(target: TARGET_MAIN, "no bootstrap peers configured, skipping header sync");
+        return;
+    }
+
+    let sync_cfg = protocol::Config {
+        magic,
+        ping_interval: common::tokio::time::Duration::from_secs(cfg.ping_interval_secs),
+        user_agent: cfg.user_agent.clone(),
+        event_tx: event_tx.clone(),
+        header_tree: header_tree.clone(),
+        sync_headers: true,
+    };
+
+    loop {
+        for peer in bootstrap_addrs {
+            tracing::info!(target: TARGET_MAIN, addr = %peer.addr, "bootstrap sync: trying peer");
+            let mut conn = connection::Connection::new(
+                sync_cfg.clone(),
+                status_tx.clone(),
+                new_addr_tx.clone(),
+                peer.clone(),
+            );
+            match conn.try_connect().await {
+                Ok(_) => {
+                    tracing::info!(target: TARGET_MAIN, "bootstrap header sync complete");
+                    return;
+                }
+                Err(e) => {
+                    if e.is::<protocol::SyncComplete>() {
+                        tracing::info!(target: TARGET_MAIN, "bootstrap header sync complete");
+                        return;
+                    }
+                    tracing::warn!(target: TARGET_MAIN, addr = %peer.addr, "bootstrap sync failed: {e:#}");
+                }
+            }
+        }
+        tracing::warn!(target: TARGET_MAIN, "all bootstrap peers failed, retrying in 10s");
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
     }
 }
 

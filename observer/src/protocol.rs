@@ -1,10 +1,11 @@
 use common::{
     anyhow::Result,
+    bitcoin::BlockHash,
     p2p::{
         ProtocolVersion, ServiceFlags, address,
         address::{AddrV2Message, Address},
         message::NetworkMessage,
-        message_blockdata::Inventory,
+        message_blockdata::{GetHeadersMessage, Inventory},
         message_compact_blocks::SendCmpct,
         message_network::{self, UserAgent},
     },
@@ -18,12 +19,27 @@ use common::{
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::addresses::{NetAddr, PeerAddr, StatusUpdate};
+use crate::headertree::HeaderTree;
 use crate::transport::{TransportReader, TransportWriter};
 
 use crate::TARGET_PROTOCOL as TARGET;
+
+/// Sentinel value indicating header sync is complete. Used to signal that
+/// a connection should close after the initial header sync phase.
+#[derive(Debug, Clone)]
+pub(crate) struct SyncComplete;
+
+impl std::fmt::Display for SyncComplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "header sync complete")
+    }
+}
+
+impl std::error::Error for SyncComplete {}
 
 pub(crate) const USER_AGENT: &str = "/p2p-observer:0.1.0/";
 
@@ -33,6 +49,8 @@ pub(crate) struct Config {
     pub(crate) ping_interval: Duration,
     pub(crate) user_agent: String,
     pub(crate) event_tx: mpsc::Sender<common::events::PeerEvent>,
+    pub(crate) header_tree: Arc<RwLock<HeaderTree>>,
+    pub(crate) sync_headers: bool,
 }
 
 /// We want get high-bandwidth compact block relay (BIP152).
@@ -68,6 +86,8 @@ struct Connection<R: TransportReader, W: TransportWriter> {
     transport_version: u8,
     connection_id: u64,
     event_tx: mpsc::Sender<common::events::PeerEvent>,
+    header_tree: Arc<RwLock<HeaderTree>>,
+    sync_headers: bool,
 }
 
 /// Run the Bitcoin P2P session on an already-established transport.
@@ -110,6 +130,8 @@ pub(crate) async fn run_session(
         transport_version: v,
         connection_id,
         event_tx: cfg.event_tx.clone(),
+        header_tree: cfg.header_tree.clone(),
+        sync_headers: cfg.sync_headers,
     };
     crate::IN_MESSAGE_LOOP.fetch_add(1, Ordering::Relaxed);
     if let Err(e) = conn.run().instrument(conn_span).await {
@@ -197,6 +219,11 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         // request headers (BIP130) from this peer
         self.writer.send(NetworkMessage::SendHeaders).await?;
 
+        // Ask the peer about headers we don't yet have. During bootstrap sync
+        // (sync_headers=true), this is the primary sync mechanism. During normal
+        // operation, this ensures new connections contribute any headers they know about.
+        self.send_getheaders().await?;
+
         // recv() is cancel-safe: both v1 and v2 readers preserve partial read
         // state across cancellations, so the ping timer can fire without losing bytes.
         loop {
@@ -218,13 +245,13 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             NetworkMessage::Ping(nonce) => self.handle_ping(nonce).await?,
             NetworkMessage::Pong(nonce) => self.handle_pong(nonce),
             NetworkMessage::Inv(inv) => self.handle_inv(inv.0).await?,
-            NetworkMessage::Headers(headers) => self.handle_headers(headers.0),
+            NetworkMessage::Headers(headers) => self.handle_headers(headers.0).await?,
             NetworkMessage::CmpctBlock(cmpct) => self.handle_cmpct_block(cmpct),
             NetworkMessage::Addr(payload) => self.handle_addr(&payload.0),
             NetworkMessage::AddrV2(payload) => self.handle_addrv2(&payload.0),
             NetworkMessage::SendCmpct(sc) => self.handle_send_cmpct(sc),
             NetworkMessage::FeeFilter(rate) => self.handle_fee_filter(rate),
-            NetworkMessage::GetHeaders(_) => self.handle_get_headers().await?,
+            NetworkMessage::GetHeaders(msg) => self.handle_get_headers(msg).await?,
             NetworkMessage::SendHeaders => self.handle_send_headers(),
             NetworkMessage::SendAddrV2 => self.handle_send_addr_v2(),
             other => tracing::trace!(target: TARGET, "received: {:?}", other),
@@ -261,12 +288,38 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         Ok(())
     }
 
-    fn handle_headers(&self, headers: Vec<common::bitcoin::block::Header>) {
-        for header in headers {
-            let hash = header.block_hash();
-            tracing::info!(target: TARGET, %hash, "header announcement");
-            self.emit_block_announcement(hash, common::events::AnnouncementType::Headers);
+    async fn handle_headers(&mut self, headers: Vec<common::bitcoin::block::Header>) -> Result<()> {
+        if headers.is_empty() {
+            if self.sync_headers {
+                let (tip, height) = self.header_tree.read().unwrap().tip();
+                tracing::info!(target: TARGET, %tip, height, "header sync complete");
+                return Err(SyncComplete.into());
+            }
+            return Ok(());
         }
+
+        let (accepted, err) = self.header_tree.write().unwrap().insert_batch(&headers);
+        let (tip, height) = self.header_tree.read().unwrap().tip();
+
+        if accepted > 0 {
+            tracing::info!(target: TARGET, accepted, height, %tip, "headers inserted");
+        }
+        if let Some(e) = &err {
+            tracing::warn!(target: TARGET, "header insert error: {e}");
+        }
+
+        if !self.sync_headers {
+            for header in &headers {
+                let hash = header.block_hash();
+                self.emit_block_announcement(hash, common::events::AnnouncementType::Headers);
+            }
+        }
+
+        if self.sync_headers && accepted > 0 {
+            self.send_getheaders().await?;
+        }
+
+        Ok(())
     }
 
     fn handle_cmpct_block(&self, cmpct: common::p2p::message_compact_blocks::CmpctBlock) {
@@ -348,12 +401,30 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         self.fee_filter = Some(rate);
     }
 
-    async fn handle_get_headers(&mut self) -> Result<()> {
-        tracing::debug!(target: TARGET, "received getheaders, responding with empty headers");
+    async fn handle_get_headers(&mut self, msg: GetHeadersMessage) -> Result<()> {
+        let headers = self
+            .header_tree
+            .read()
+            .unwrap()
+            .get_headers_from_locator(&msg.locator_hashes, msg.stop_hash);
+        tracing::debug!(target: TARGET, count = headers.len(), "responding to getheaders");
         self.writer
             .send(NetworkMessage::Headers(
-                common::p2p::message::HeadersMessage(vec![]),
+                common::p2p::message::HeadersMessage(headers),
             ))
+            .await
+    }
+
+    async fn send_getheaders(&mut self) -> Result<()> {
+        let locator = self.header_tree.read().unwrap().build_locator();
+        let (_, height) = self.header_tree.read().unwrap().tip();
+        tracing::debug!(target: TARGET, height, locator_len = locator.len(), "sending getheaders");
+        self.writer
+            .send(NetworkMessage::GetHeaders(GetHeadersMessage {
+                version: ProtocolVersion::WTXID_RELAY_VERSION,
+                locator_hashes: locator,
+                stop_hash: BlockHash::from_byte_array([0; 32]),
+            }))
             .await
     }
 
