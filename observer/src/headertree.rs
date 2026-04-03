@@ -643,4 +643,88 @@ mod tests {
         assert_eq!(accepted, 0);
         assert!(err.is_none());
     }
+
+    /// Mine a valid regtest header. Regtest uses bits=0x207fffff which gives a
+    /// target so easy that nonce=0 always satisfies PoW. A unique `seed` byte in
+    /// the merkle root lets callers produce different blocks at the same height.
+    fn mine_header(prev_hash: BlockHash, time: u32, seed: u8) -> Header {
+        use common::bitcoin::{
+            CompactTarget, TxMerkleNode, blockdata::block::Version, time::BlockTime,
+        };
+        let bits = CompactTarget::from_consensus(0x207fffff);
+        let merkle_root = TxMerkleNode::from_byte_array([seed; 32]);
+        for nonce in 0..=u32::MAX {
+            let h = Header {
+                version: Version::ONE,
+                prev_blockhash: prev_hash,
+                merkle_root,
+                time: BlockTime::from(time),
+                bits,
+                nonce,
+            };
+            if h.validate_pow(h.bits.into()).is_ok() {
+                return h;
+            }
+        }
+        panic!("failed to mine regtest header — this should never happen");
+    }
+
+    /// Simulate a reorg by self-mining two diverging chains without bitcoind.
+    /// Chain A has 10 blocks; chain B diverges at height 1 and has 12 blocks.
+    /// The tree should follow chain B after both are inserted.
+    #[test]
+    fn test_reorg() {
+        let mut tree = regtest_tree();
+        let genesis_hash = tree.tip().0;
+
+        // Chain A: 10 headers, seed=0
+        let mut chain_a = Vec::new();
+        let mut prev = genesis_hash;
+        for i in 0..10u32 {
+            let h = mine_header(prev, 1296688602 + i, 0);
+            chain_a.push(h);
+            prev = h.block_hash();
+        }
+
+        // Chain B: 12 headers from same genesis, seed=1 so height-1 block differs
+        let mut chain_b = Vec::new();
+        prev = genesis_hash;
+        for i in 0..12u32 {
+            let h = mine_header(prev, 1296688602 + i, 1);
+            chain_b.push(h);
+            prev = h.block_hash();
+        }
+
+        // Sanity: chains diverge immediately at height 1
+        assert_ne!(chain_a[0].block_hash(), chain_b[0].block_hash());
+
+        // Insert chain A — tip at height 10
+        let (accepted, err) = tree.insert_batch(&chain_a);
+        assert_eq!(accepted, 10);
+        assert!(err.is_none());
+        assert_eq!(tree.tip().1, 10);
+        let tip_a = tree.tip().0;
+
+        // Insert chain B — all 12 are new (different chain), tip should switch to height 12
+        let (accepted, err) = tree.insert_batch(&chain_b);
+        assert_eq!(accepted, 12);
+        assert!(err.is_none());
+        assert_eq!(tree.tip().1, 12);
+
+        // Tip changed to chain B
+        let tip_b = tree.tip().0;
+        assert_ne!(tip_a, tip_b);
+
+        // best_chain should follow chain B (13 entries: genesis + 12)
+        assert_eq!(tree.best_chain.len(), 13);
+        assert_eq!(tree.best_chain[12], tip_b);
+
+        // Chain A headers are still in the tree
+        for header in &chain_a {
+            assert!(tree.contains(&header.block_hash()));
+        }
+
+        // Total headers: genesis + 10 (chain A) + 12 (chain B) = 23
+        assert_eq!(tree.len(), 23);
+    }
 }
