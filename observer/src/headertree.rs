@@ -189,7 +189,14 @@ impl HeaderTree {
         }
 
         let expected_bits = if height % 2016 == 0 && height > 0 {
-            // Retarget: walk back 2016 blocks from the parent to find epoch start
+            // Retarget: we need the first block of the epoch (height - 2016) to
+            // compute the new difficulty. We can't use best_chain[height - 2016]
+            // because on test networks deep reorgs spanning a retarget boundary
+            // are realistic, meaning the fork's epoch-start block may differ from
+            // the one on our best chain. Walking back via prev_blockhash always
+            // gives the correct epoch-start for whichever chain this header is on.
+            // We start at the parent (the last block of the epoch) and walk back
+            // 2015 more steps to land on the epoch-start block (2016 behind us).
             let epoch_start = self
                 .walk_back(header.prev_blockhash, 2015)
                 .ok_or(HeaderError::OrphanHeader)?;
@@ -792,6 +799,82 @@ mod tests {
 
         // Total headers: genesis + 10 (chain A) + 12 (chain B) = 23
         assert_eq!(tree.len(), 23);
+    }
+
+    /// A reorg that crosses a retarget boundary (height 2016). Both chains share
+    /// 2010 blocks, then diverge. Both cross the retarget, exercising the
+    /// walk_back path in validate_header. Chain B (15 blocks) beats chain A (10).
+    #[test]
+    fn test_reorg_across_retarget() {
+        const SHARED: u32 = 2010;
+        const CHAIN_A_LEN: u32 = 10; // tip at 2020
+        const CHAIN_B_LEN: u32 = 15; // tip at 2025
+
+        let mut tree = regtest_tree();
+
+        // Build shared base
+        let mut shared = Vec::new();
+        let mut prev = tree.tip().0;
+        for i in 0..SHARED {
+            let h = mine_header(prev, 1296688602 + i, 0);
+            shared.push(h);
+            prev = h.block_hash();
+        }
+        let (accepted, err) = tree.insert_batch(&shared);
+        assert_eq!(accepted, SHARED as usize);
+        assert!(err.is_none());
+
+        let fork_point = prev;
+
+        // Chain A: 10 blocks crossing retarget at 2016, seed=0
+        let mut chain_a = Vec::new();
+        prev = fork_point;
+        for i in 0..CHAIN_A_LEN {
+            let h = mine_header(prev, 1296688602 + SHARED + i, 0);
+            chain_a.push(h);
+            prev = h.block_hash();
+        }
+        let (accepted, err) = tree.insert_batch(&chain_a);
+        assert_eq!(accepted, CHAIN_A_LEN as usize);
+        assert!(err.is_none());
+        assert_eq!(tree.tip().1, SHARED + CHAIN_A_LEN);
+
+        // Chain B: 15 blocks crossing retarget at 2016, seed=1
+        let mut chain_b = Vec::new();
+        prev = fork_point;
+        for i in 0..CHAIN_B_LEN {
+            let h = mine_header(prev, 1296688602 + SHARED + i, 1);
+            chain_b.push(h);
+            prev = h.block_hash();
+        }
+        let (accepted, err) = tree.insert_batch(&chain_b);
+        assert_eq!(accepted, CHAIN_B_LEN as usize);
+        assert!(err.is_none());
+
+        // Chain B wins
+        assert_eq!(tree.tip().1, SHARED + CHAIN_B_LEN);
+        assert_eq!(tree.tip().0, chain_b.last().unwrap().block_hash());
+
+        // Both fork branches are in the tree
+        assert_eq!(
+            tree.len(),
+            1 + SHARED as usize + CHAIN_A_LEN as usize + CHAIN_B_LEN as usize
+        );
+
+        // Two tips: chain A (stale) and chain B (active)
+        let mut tips = tree.chain_tips();
+        tips.sort_by_key(|t| t.height);
+        assert_eq!(tips.len(), 2);
+
+        let stale = &tips[0];
+        assert_eq!(stale.height, SHARED + CHAIN_A_LEN);
+        assert_eq!(stale.branch_len, CHAIN_A_LEN);
+        assert_eq!(stale.status, ChainTipStatus::HeadersOnly);
+
+        let active = &tips[1];
+        assert_eq!(active.height, SHARED + CHAIN_B_LEN);
+        assert_eq!(active.branch_len, 0);
+        assert_eq!(active.status, ChainTipStatus::Active);
     }
 
     #[test]
