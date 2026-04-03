@@ -560,11 +560,13 @@ mod tests {
         let path = dir.join("headers.bin");
         let _ = std::fs::create_dir_all(&dir);
 
-        let tips_before = tree.chain_tips();
+        let mut tips_before = tree.chain_tips();
+        tips_before.sort_by_key(|t| t.hash);
         tree.save(&path).unwrap();
 
         let loaded = HeaderTree::load(&path, regtest_params()).unwrap();
-        let tips_after = loaded.chain_tips();
+        let mut tips_after = loaded.chain_tips();
+        tips_after.sort_by_key(|t| t.hash);
 
         assert_eq!(loaded.tip(), tree.tip());
         assert_eq!(loaded.tip().0, tip_before);
