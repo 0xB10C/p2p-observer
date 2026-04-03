@@ -10,6 +10,7 @@ use common::{
     tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     tracing,
 };
+use std::io::{Error, ErrorKind};
 
 pub trait TransportReader {
     async fn recv(&mut self) -> Result<NetworkMessage>;
@@ -111,7 +112,11 @@ where
                             .await
                             .context("v1 header read")?;
                         if n == 0 {
-                            return Err(common::anyhow::anyhow!("v1 header: unexpected EOF"));
+                            return Err(Error::new(
+                                ErrorKind::UnexpectedEof,
+                                "EOF while trying to read v1 transport header",
+                            )
+                            .into());
                         }
                         *pos += n;
                     }
@@ -139,7 +144,11 @@ where
                     .await
                     .context("v1 payload read")?;
                 if n == 0 {
-                    return Err(common::anyhow::anyhow!("v1 payload: unexpected EOF"));
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "EOF while trying to read v1 transport payload",
+                    )
+                    .into());
                 }
                 *pos += n;
             }

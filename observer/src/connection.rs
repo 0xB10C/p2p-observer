@@ -75,10 +75,12 @@ impl Connection {
     }
 
     pub async fn run(mut self) {
-        let span = tracing::debug_span!(target: TARGET, "c", id = self.id, addr = %self.peer.addr);
+        let span = tracing::info_span!(target: TARGET, "c", id = self.id, addr = %self.peer.addr);
         async move {
+            tracing::debug!(target: TARGET, "opening new connection");
             crate::ACTIVE_TASKS.fetch_add(1, Ordering::Relaxed);
             if self.initial_connect().await {
+                // initial connection succeeded. Retry for a bit on the next connection drop.
                 self.reconnect_loop().await;
             }
             crate::ACTIVE_TASKS.fetch_sub(1, Ordering::Relaxed);
@@ -101,6 +103,7 @@ impl Connection {
                         at: unix_secs(),
                         reason,
                     };
+
                     if is_network_unreachable(&e) {
                         tracing::debug!(target: TARGET, "network unreachable");
                         let _ = self
@@ -109,21 +112,32 @@ impl Connection {
                             .await;
                         return false;
                     }
+
                     if is_connection_refused(&e) {
                         tracing::debug!(target: TARGET, "connection refused");
                         let _ = self.status_tx.send(bad(BadReason::ConnectionRefused)).await;
                         return false;
                     }
+
                     if is_host_unreachable(&e) {
                         tracing::debug!(target: TARGET, "host unreachable");
                         let _ = self.status_tx.send(bad(BadReason::HostUnreachable)).await;
                         return false;
                     }
+
+                    // Don't early exit for these:
+                    if is_timed_out(&e) {
+                        tracing::debug!(target: TARGET, "connection timed out");
+                        let _ = self.status_tx.send(bad(BadReason::TimedOut)).await;
+                    }
+
+                    if is_unexpected_eof(&e) {
+                        tracing::debug!(target: TARGET, "unexpected EOF");
+                        let _ = self.status_tx.send(bad(BadReason::UnexpectedEOF)).await;
+                    }
+
                     if attempt >= MAX_INITIAL_ATTEMPTS {
-                        if is_timed_out(&e) {
-                            let _ = self.status_tx.send(bad(BadReason::TimedOut)).await;
-                        }
-                        tracing::debug!(target: TARGET, attempt, "initial connect failed, giving up");
+                        tracing::debug!(target: TARGET, attempt, error=%e, "initial connect failed, giving up");
                         return false;
                     }
                     backoff *= 2;
@@ -204,8 +218,11 @@ impl Connection {
     /// Attempts a v2 connection, falling back to v1 on failure.
     /// Once v2 has succeeded once, `skip_v1_fallback` is set and v1 is never tried again.
     async fn try_connect(&mut self) -> Result<Instant> {
-        if !self.peer.services().has(ServiceFlags::P2P_V2) {
-            tracing::trace!(target: TARGET, "not attemping a v2 connection, as ServiceFlags indicate this node does not support P2Pv2");
+        // We set ServiceFlags::NONE on addresses we don't know, so also try a V2 connection there.
+        if !self.peer.services().has(ServiceFlags::P2P_V2)
+            && self.peer.services().has(ServiceFlags::NONE)
+        {
+            tracing::trace!(target: TARGET, services=%self.peer.services(), "not attemping a v2 connection, as ServiceFlags indicate this node does not support P2Pv2");
             return self.connect_v1().await;
         }
         if self.skip_v1_fallback {
@@ -291,6 +308,10 @@ fn is_network_unreachable(err: &common::anyhow::Error) -> bool {
 
 fn is_host_unreachable(err: &common::anyhow::Error) -> bool {
     has_io_error_kind(err, std::io::ErrorKind::HostUnreachable)
+}
+
+fn is_unexpected_eof(err: &common::anyhow::Error) -> bool {
+    has_io_error_kind(err, std::io::ErrorKind::UnexpectedEof)
 }
 
 /// Returns true for TCP-level errors where retrying with a different transport

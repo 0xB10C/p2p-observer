@@ -230,6 +230,8 @@ pub enum BadReason {
     NetworkUnreachable,
     /// TCP connection timed out — the node may be firewalled or the IP unoccupied.
     TimedOut,
+    /// We were able to open a TCP connection, but received an unexpected EOF before we could do the version handshake.
+    UnexpectedEOF,
 }
 
 pub enum StatusUpdate {
@@ -485,18 +487,34 @@ impl AddrStore {
     pub fn apply_update(&mut self, update: StatusUpdate) {
         match update {
             StatusUpdate::Good { addr, at } => {
+                let addr_str = format!("{:#}", addr);
+
                 let peer = self
                     .take(&addr)
                     .unwrap_or_else(|| PeerAddr::new(addr, ServiceFlags::NONE));
+
                 if self.good.len() < MAX_GOOD {
+                    tracing::debug!(target: TARGET,
+                        addr=addr_str,
+                        at,
+                        "marked address as good"
+                    );
                     self.good.insert(peer, at);
                 }
             }
             StatusUpdate::Bad { addr, at, reason } => {
+                let addr_str = format!("{:#}", addr);
                 let peer = self
                     .take(&addr)
                     .unwrap_or_else(|| PeerAddr::new(addr, ServiceFlags::NONE));
+
                 if self.bad.len() < MAX_BAD {
+                    tracing::debug!(target: TARGET,
+                        addr=addr_str,
+                        at,
+                        reason=format!("{:?}", reason),
+                        "marked address as bad"
+                    );
                     self.bad.insert(peer, (at, reason));
                 }
             }
