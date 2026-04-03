@@ -78,11 +78,6 @@ impl HeaderTree {
         }
     }
 
-    /// Insert a single header. Returns `Ok(true)` if new, `Ok(false)` if already known.
-    pub(crate) fn insert(&mut self, header: Header) -> std::result::Result<bool, HeaderError> {
-        self.insert_inner(header, false)
-    }
-
     // Insert a single header. Returns `Ok(true)` if new, `Ok(false)` if already known.
     // In batch mode, the caller has to take care of calling rebuild_best_chain().
     fn insert_inner(
@@ -351,13 +346,14 @@ impl HeaderTree {
                     let offset = i * HEADER_SIZE;
                     let header: Header = deserialize(&data[offset..offset + HEADER_SIZE])
                         .context("deserialize header")?;
-                    match tree.insert(header) {
+                    match tree.insert_inner(header, true) {
                         Ok(_) => {}
                         Err(e) => {
                             tracing::warn!(target: TARGET, "skipping header during load: {e}");
                         }
                     }
                 }
+                tree.rebuild_best_chain();
                 tracing::info!(target: TARGET,
                     headers = tree.headers.len(),
                     tip_height = tree.tip_height,
@@ -726,5 +722,108 @@ mod tests {
 
         // Total headers: genesis + 10 (chain A) + 12 (chain B) = 23
         assert_eq!(tree.len(), 23);
+    }
+
+    /// Sync 4321 headers from Node A, then serve them to Node B. Both
+    /// connections use real Connection instances sharing a single HeaderTree.
+    #[tokio::test]
+    async fn test_sync_and_serve_headers() {
+        use crate::addresses::{NetAddr, PeerAddr, StatusUpdate};
+        use crate::connection;
+        use crate::protocol;
+        use common::p2p::{Magic, ServiceFlags};
+        use common::tokio::sync::mpsc;
+        use std::sync::{Arc, RwLock};
+
+        const TOTAL: usize = 4321;
+
+        let exe = bitcoind::exe_path().unwrap();
+
+        let header_tree = Arc::new(RwLock::new(regtest_tree()));
+        let (status_tx, _) = mpsc::channel::<StatusUpdate>(256);
+        let (new_addr_tx, _) = mpsc::channel::<Vec<PeerAddr>>(256);
+        let (event_tx, _) = mpsc::channel(1024);
+
+        let make_cfg = |sync_headers: bool| protocol::Config {
+            magic: Magic::REGTEST,
+            ping_interval: common::tokio::time::Duration::from_secs(120),
+            user_agent: protocol::USER_AGENT.to_owned(),
+            event_tx: event_tx.clone(),
+            header_tree: header_tree.clone(),
+            sync_headers,
+        };
+
+        let make_peer = |port: u16| {
+            PeerAddr::new(
+                NetAddr::Ipv4("127.0.0.1".parse().unwrap(), port),
+                ServiceFlags::NONE,
+            )
+        };
+
+        let node_conf = |p2p| {
+            let mut conf = bitcoind::Conf::default();
+            conf.p2p = p2p;
+            conf.args.push("-nowallet");
+            conf
+        };
+
+        // Node A: generate blocks
+        let node_a = bitcoind::Node::with_conf(&exe, &node_conf(bitcoind::P2P::Yes)).unwrap();
+
+        println!("generating {TOTAL} blocks on node A...");
+        node_a
+            .client
+            .generate_to_address(TOTAL, &regtest_address())
+            .unwrap();
+        println!(
+            "node A at height {}",
+            node_a.client.get_blockchain_info().unwrap().headers
+        );
+
+        // Sync from Node A
+        println!("syncing headers from node A...");
+        let port_a = node_a.params.p2p_socket.unwrap().port();
+        let mut conn = connection::Connection::new(
+            make_cfg(true),
+            status_tx.clone(),
+            new_addr_tx.clone(),
+            make_peer(port_a),
+        );
+        conn.try_connect().await.unwrap();
+        println!("tree at height {}", header_tree.read().unwrap().tip().1);
+        assert_eq!(header_tree.read().unwrap().tip().1, TOTAL as u32);
+
+        // Node B: serve headers to it
+        let node_b = bitcoind::Node::with_conf(&exe, &node_conf(bitcoind::P2P::Yes)).unwrap();
+        let port_b = node_b.params.p2p_socket.unwrap().port();
+        println!("serving headers to node B...");
+        let mut conn =
+            connection::Connection::new(make_cfg(false), status_tx, new_addr_tx, make_peer(port_b));
+        let handle = common::tokio::spawn(async move {
+            let _ = conn.try_connect().await;
+        });
+
+        // Wait for Node B to sync
+        loop {
+            common::tokio::time::sleep(common::tokio::time::Duration::from_millis(200)).await;
+            let headers = node_b.client.get_blockchain_info().unwrap().headers;
+            println!("node B headers: {headers}");
+            if headers >= TOTAL as i64 {
+                break;
+            }
+        }
+        handle.abort();
+
+        let tips_a = node_a.client.get_chain_tips().unwrap().0;
+        let tips_b = node_b.client.get_chain_tips().unwrap().0;
+        let tip_a = tips_a.iter().max_by_key(|t| t.height).unwrap();
+        let tip_b = tips_b.iter().max_by_key(|t| t.height).unwrap();
+        assert_eq!(tip_a.height, TOTAL as i64);
+        assert_eq!(tip_b.height, TOTAL as i64);
+        assert_eq!(
+            tip_a.hash, tip_b.hash,
+            "both nodes should have the same tip hash"
+        );
+        println!("both nodes at height {} tip {}", tip_b.height, tip_b.hash);
     }
 }
