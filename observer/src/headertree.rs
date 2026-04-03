@@ -41,6 +41,24 @@ pub(crate) enum HeaderError {
     TargetTooEasy,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChainTipStatus {
+    /// The current best chain.
+    Active,
+    /// Headers are valid but we have not validated block bodies (SPV node).
+    HeadersOnly,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ChainTip {
+    pub hash: BlockHash,
+    pub height: u32,
+    /// Number of headers on this branch since it forked from the active chain
+    /// (0 for the active tip itself).
+    pub branch_len: u32,
+    pub status: ChainTipStatus,
+}
+
 impl std::fmt::Display for HeaderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -297,6 +315,58 @@ impl HeaderTree {
         }
 
         headers
+    }
+
+    /// Return all chain tips (analogous to Bitcoin Core's `getchaintips`).
+    ///
+    /// A tip is any header that is not referenced as the parent of another
+    /// known header. The active tip has `branch_len = 0`; all others report
+    /// how many headers since they last shared a block with the active chain.
+    pub(crate) fn chain_tips(&self) -> Vec<ChainTip> {
+        // Set of all hashes that are someone's parent.
+        let parents: std::collections::HashSet<BlockHash> = self
+            .headers
+            .values()
+            .filter(|e| e.height > 0)
+            .map(|e| e.header.prev_blockhash)
+            .collect();
+
+        // Tips = headers whose own hash does not appear in `parents`.
+        self.headers
+            .iter()
+            .filter(|(hash, _)| !parents.contains(*hash))
+            .map(|(hash, entry)| {
+                let status = if *hash == self.tip {
+                    ChainTipStatus::Active
+                } else {
+                    ChainTipStatus::HeadersOnly
+                };
+
+                // Walk back from this tip until we hit a block on best_chain.
+                let branch_len = {
+                    let mut len = 0u32;
+                    let mut h = entry.height as usize;
+                    let mut cur = *hash;
+                    loop {
+                        if h < self.best_chain.len() && self.best_chain[h] == cur {
+                            break;
+                        }
+                        let e = &self.headers[&cur];
+                        cur = e.header.prev_blockhash;
+                        h = h.saturating_sub(1);
+                        len += 1;
+                    }
+                    len
+                };
+
+                ChainTip {
+                    hash: *hash,
+                    height: entry.height,
+                    branch_len,
+                    status,
+                }
+            })
+            .collect()
     }
 
     // ── Persistence ──────────────────────────────────────────────────────────
@@ -722,6 +792,56 @@ mod tests {
 
         // Total headers: genesis + 10 (chain A) + 12 (chain B) = 23
         assert_eq!(tree.len(), 23);
+    }
+
+    #[test]
+    fn test_chain_tips() {
+        let mut tree = regtest_tree();
+        let genesis_hash = tree.tip().0;
+
+        // Only genesis: one tip, active, branch_len=0
+        let tips = tree.chain_tips();
+        assert_eq!(tips.len(), 1);
+        assert_eq!(tips[0].hash, genesis_hash);
+        assert_eq!(tips[0].branch_len, 0);
+        assert_eq!(tips[0].status, ChainTipStatus::Active);
+
+        // Mine chain A (10 blocks) and chain B (12 blocks) from genesis
+        let mut chain_a = Vec::new();
+        let mut prev = genesis_hash;
+        for i in 0..10u32 {
+            let h = mine_header(prev, 1296688602 + i, 0);
+            chain_a.push(h);
+            prev = h.block_hash();
+        }
+        let mut chain_b = Vec::new();
+        prev = genesis_hash;
+        for i in 0..12u32 {
+            let h = mine_header(prev, 1296688602 + i, 1);
+            chain_b.push(h);
+            prev = h.block_hash();
+        }
+
+        tree.insert_batch(&chain_a);
+        tree.insert_batch(&chain_b);
+
+        // Two tips: chain A (stale) and chain B (active)
+        let mut tips = tree.chain_tips();
+        tips.sort_by_key(|t| t.height);
+
+        assert_eq!(tips.len(), 2);
+
+        let stale = &tips[0];
+        assert_eq!(stale.hash, chain_a.last().unwrap().block_hash());
+        assert_eq!(stale.height, 10);
+        assert_eq!(stale.branch_len, 10); // all 10 blocks are off the active chain
+        assert_eq!(stale.status, ChainTipStatus::HeadersOnly);
+
+        let active = &tips[1];
+        assert_eq!(active.hash, chain_b.last().unwrap().block_hash());
+        assert_eq!(active.height, 12);
+        assert_eq!(active.branch_len, 0);
+        assert_eq!(active.status, ChainTipStatus::Active);
     }
 
     /// Sync 4321 headers from Node A, then serve them to Node B. Both
