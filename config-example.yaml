@@ -10,8 +10,12 @@ ping_interval_secs: 120
 # How many new connection tasks should be spawned per second.
 connections_per_second: 1
 
-# Initial peers to connect to. The observer will discover more via ADDR/ADDRV2
-# messages and does not need many bootstrap addresses to get started.
+# Initial bootstrap peers to connect to.
+# These are used to:
+# - Sync headers from in an initial boostrap phase. If you can't connect to
+#   them, you can't sync the headers.
+# - Learn about new peer addresses via GETADDR.
+# One or two semi-trusted boostrap nodes should be enough.
 bootstrap_addrs:
   - "1.2.3.4:38333"
   - "5.6.7.8:38333"
@@ -27,3 +31,4 @@ log_levels:
   addresses: debug
   publisher: info
   rpc: info
+  headertree: info

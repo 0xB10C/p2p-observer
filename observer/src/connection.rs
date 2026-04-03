@@ -217,7 +217,7 @@ impl Connection {
 
     /// Attempts a v2 connection, falling back to v1 on failure.
     /// Once v2 has succeeded once, `skip_v1_fallback` is set and v1 is never tried again.
-    async fn try_connect(&mut self) -> Result<Instant> {
+    pub async fn try_connect(&mut self) -> Result<Instant> {
         // We set ServiceFlags::NONE on addresses we don't know, so also try a V2 connection there.
         if !self.peer.services().has(ServiceFlags::P2P_V2)
             && self.peer.services().has(ServiceFlags::NONE)
@@ -357,6 +357,7 @@ fn unix_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::addresses::{NetAddr, PeerAddr};
+    use crate::headertree::HeaderTree;
     use crate::protocol::build_version;
     use crate::transport::{
         TransportReader, TransportV1Reader, TransportV1Writer, TransportV2Reader,
@@ -365,10 +366,12 @@ mod tests {
     use bip324::{Role, futures::Protocol};
     use common::p2p::{Magic, ServiceFlags};
     use common::{
+        bitcoin::network::Params,
         p2p::message::NetworkMessage,
         tokio::{io::BufReader, net::TcpListener, sync::mpsc},
         tracing_subscriber,
     };
+    use std::sync::{Arc, RwLock};
 
     /// Complete the server side of the version handshake.
     async fn server_handshake(
@@ -432,6 +435,10 @@ mod tests {
             ping_interval: Duration::from_secs(120),
             user_agent: crate::protocol::USER_AGENT.to_owned(),
             event_tx,
+            header_tree: Arc::new(RwLock::new(HeaderTree::new(Params::new(
+                common::bitcoin::Network::Regtest,
+            )))),
+            sync_headers: false,
         };
         let conn = Connection::new(
             cfg,
@@ -478,6 +485,10 @@ mod tests {
             ping_interval: Duration::from_secs(120),
             user_agent: crate::protocol::USER_AGENT.to_owned(),
             event_tx,
+            header_tree: Arc::new(RwLock::new(HeaderTree::new(Params::new(
+                common::bitcoin::Network::Regtest,
+            )))),
+            sync_headers: false,
         };
         let conn = Connection::new(
             cfg,
@@ -526,6 +537,10 @@ mod tests {
             ping_interval: Duration::from_millis(50),
             user_agent: crate::protocol::USER_AGENT.to_owned(),
             event_tx,
+            header_tree: Arc::new(RwLock::new(HeaderTree::new(Params::new(
+                common::bitcoin::Network::Regtest,
+            )))),
+            sync_headers: false,
         };
         tokio::spawn(
             Connection::new(
