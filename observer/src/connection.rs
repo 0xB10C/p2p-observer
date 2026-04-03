@@ -169,6 +169,7 @@ impl Connection {
                         .send(StatusUpdate::Good {
                             addr: self.peer.addr.clone(),
                             at: unix_secs(),
+                            services: None,
                         })
                         .await;
                     let uptime = connected_at.elapsed();

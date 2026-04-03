@@ -114,6 +114,7 @@ pub(crate) async fn run_session(
         .send(StatusUpdate::Good {
             addr: addr.clone(),
             at: unix_secs(),
+            services: Some(info.version.services),
         })
         .await;
     tracing::trace!(target: TARGET, "connection established");

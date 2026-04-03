@@ -238,6 +238,7 @@ pub enum StatusUpdate {
     Good {
         addr: NetAddr,
         at: u64,
+        services: Option<ServiceFlags>,
     },
     Bad {
         addr: NetAddr,
@@ -486,20 +487,47 @@ impl AddrStore {
 
     pub fn apply_update(&mut self, update: StatusUpdate) {
         match update {
-            StatusUpdate::Good { addr, at } => {
+            StatusUpdate::Good { addr, at, services } => {
                 let addr_str = format!("{:#}", addr);
 
                 let peer = self
                     .take(&addr)
                     .unwrap_or_else(|| PeerAddr::new(addr, ServiceFlags::NONE));
 
-                if self.good.len() < MAX_GOOD {
-                    tracing::debug!(target: TARGET,
-                        addr=addr_str,
-                        at,
-                        "marked address as good"
-                    );
-                    self.good.insert(peer, at);
+                // If we have reported services (from version message), compare and update
+                if let Some(new_services) = services {
+                    let old_services = peer.services();
+                    let peer_with_services = PeerAddr::new(peer.addr.clone(), new_services);
+
+                    // Log if services differ
+                    if old_services != new_services {
+                        tracing::debug!(target: TARGET,
+                            addr=addr_str,
+                            old_services=%old_services,
+                            new_services=%new_services,
+                            "peer-reported service flags differ from stored ones"
+                        );
+                    }
+
+                    if self.good.len() < MAX_GOOD {
+                        tracing::debug!(target: TARGET,
+                            addr=addr_str,
+                            at,
+                            services=%new_services,
+                            "marked address as good"
+                        );
+                        self.good.insert(peer_with_services, at);
+                    }
+                } else {
+                    // No services reported, just insert with existing services
+                    if self.good.len() < MAX_GOOD {
+                        tracing::debug!(target: TARGET,
+                            addr=addr_str,
+                            at,
+                            "marked address as good"
+                        );
+                        self.good.insert(peer, at);
+                    }
                 }
             }
             StatusUpdate::Bad { addr, at, reason } => {
@@ -548,5 +576,43 @@ pub async fn run(
                 store.lock().unwrap().insert_batch(addrs, false);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn test_service_flags_update_on_good_address() {
+        let mut store = AddrStore::empty(Path::new("/dev/null"));
+        let addr = NetAddr::Ipv4(Ipv4Addr::new(127, 0, 0, 1), 8333);
+
+        // Mark address as good with services A
+        let services_a = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let peer_a = PeerAddr::new(addr.clone(), services_a);
+        store.apply_update(StatusUpdate::Good {
+            addr: addr.clone(),
+            at: 1000,
+            services: Some(services_a),
+        });
+
+        // Should be in good
+        assert!(store.good.contains_key(&peer_a));
+        let (stored_peer, _) = store.good.get_key_value(&peer_a).unwrap();
+        assert_eq!(stored_peer.services(), services_a);
+
+        // Update with different services B
+        let services_b = ServiceFlags::NETWORK; // No WITNESS
+        store.apply_update(StatusUpdate::Good {
+            addr: addr.clone(),
+            at: 2000,
+            services: Some(services_b),
+        });
+
+        // Services should be updated
+        let (updated_peer, _) = store.good.get_key_value(&peer_a).unwrap();
+        assert_eq!(updated_peer.services(), services_b);
     }
 }
