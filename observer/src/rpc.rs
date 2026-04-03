@@ -1,9 +1,10 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::TARGET_RPC as TARGET;
 use common::{async_nats, futures_util::StreamExt, serde_json, tracing};
 
 use crate::addresses::{AddrStore, parse_addr};
+use crate::headertree::{ChainTipStatus, HeaderTree};
 
 pub(crate) struct Rpc {
     nats: async_nats::Client,
@@ -13,6 +14,7 @@ pub(crate) struct Rpc {
 
 struct Handler {
     store: Arc<Mutex<AddrStore>>,
+    header_tree: Arc<RwLock<HeaderTree>>,
 }
 
 impl Rpc {
@@ -20,11 +22,12 @@ impl Rpc {
         nats: async_nats::Client,
         network: &str,
         store: Arc<Mutex<AddrStore>>,
+        header_tree: Arc<RwLock<HeaderTree>>,
     ) -> Self {
         Self {
             nats,
             network: network.to_owned(),
-            handler: Handler { store },
+            handler: Handler { store, header_tree },
         }
     }
 
@@ -64,6 +67,7 @@ impl Handler {
         let result = match method {
             Some("addresses.add") => self.handle_add_addresses(payload),
             Some("addresses.info") => self.handle_addresses_info(),
+            Some("headertree.tips") => self.handle_chain_tips(),
             Some(other) => Err(format!("unknown method: {other}")),
             None => Err("malformed subject".to_owned()),
         };
@@ -84,6 +88,32 @@ impl Handler {
         .to_string())
     }
 
+    fn handle_chain_tips(&self) -> Result<String, String> {
+        let tree = self.header_tree.read().unwrap();
+        let mut tips = tree.chain_tips();
+        // Deterministic order: active tip first, then descending by height.
+        tips.sort_by(|a, b| {
+            b.branch_len
+                .cmp(&a.branch_len)
+                .then(b.height.cmp(&a.height))
+        });
+        let json: Vec<_> = tips
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "height": t.height,
+                    "hash": t.hash.to_string(),
+                    "branch_len": t.branch_len,
+                    "status": match t.status {
+                        ChainTipStatus::Active => "active",
+                        ChainTipStatus::HeadersOnly => "headers-only",
+                    },
+                })
+            })
+            .collect();
+        Ok(serde_json::to_string(&json).unwrap())
+    }
+
     fn handle_add_addresses(&self, payload: &[u8]) -> Result<String, String> {
         let addrs: Vec<String> =
             serde_json::from_slice(payload).map_err(|e| format!("invalid JSON: {e}"))?;
@@ -101,8 +131,12 @@ mod tests {
     use std::path::Path;
 
     fn test_handler() -> Handler {
+        use common::bitcoin::{Network, network::Params};
         let store = Arc::new(Mutex::new(AddrStore::empty(Path::new("/dev/null"))));
-        Handler { store }
+        let header_tree = Arc::new(RwLock::new(crate::headertree::HeaderTree::new(
+            Params::new(Network::Regtest),
+        )));
+        Handler { store, header_tree }
     }
 
     #[test]
@@ -147,6 +181,18 @@ mod tests {
         assert_eq!(v["unknown"], 0);
         assert_eq!(v["good"], 0);
         assert_eq!(v["bad"], 0);
+    }
+
+    #[test]
+    fn test_chain_tips_genesis_only() {
+        let h = test_handler();
+        let response = h.dispatch(Some("headertree.tips"), b"");
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let tips = v.as_array().unwrap();
+        assert_eq!(tips.len(), 1);
+        assert_eq!(tips[0]["height"], 0);
+        assert_eq!(tips[0]["branch_len"], 0);
+        assert_eq!(tips[0]["status"], "active");
     }
 
     #[test]

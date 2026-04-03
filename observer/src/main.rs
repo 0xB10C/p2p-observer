@@ -63,7 +63,7 @@ async fn main() {
         .expect("failed to connect to NATS");
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<common::events::PeerEvent>(1024);
     tokio::spawn(publisher::run(nats.clone(), cfg.network.clone(), event_rx));
-    tokio::spawn(rpc::Rpc::new(nats, &cfg.network, store.clone()).run());
+    tokio::spawn(rpc::Rpc::new(nats, &cfg.network, store.clone(), header_tree.clone()).run());
     tokio::spawn(headertree::persist_task(
         header_tree.clone(),
         header_path.clone().into(),
