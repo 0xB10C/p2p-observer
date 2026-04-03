@@ -225,10 +225,12 @@ impl HeaderTree {
         (self.tip, self.tip_height)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn contains(&self, hash: &BlockHash) -> bool {
         self.headers.contains_key(hash)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.headers.len()
     }
@@ -387,5 +389,258 @@ pub(crate) async fn persist_task(
         if let Err(e) = tree.save(&path) {
             tracing::warn!(target: TARGET, "failed to persist header tree: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoind::client::bitcoin::Address;
+    use common::bitcoin::{Network, network::Params};
+
+    // A random regtest address we can mine to.
+    fn regtest_address() -> Address {
+        const REGTEST_ADDR: &str = "bcrt1qs758ursh4q9z627kt3pp5yysm78ddny6txaqgw";
+        REGTEST_ADDR
+            .parse::<bitcoind::client::bitcoin::Address<_>>()
+            .unwrap()
+            .assume_checked()
+    }
+
+    fn regtest_params() -> Params {
+        Params::new(Network::Regtest)
+    }
+
+    fn regtest_tree() -> HeaderTree {
+        HeaderTree::new(regtest_params())
+    }
+
+    #[test]
+    fn test_new_starts_at_genesis() {
+        let tree = regtest_tree();
+        let (_, height) = tree.tip();
+        assert_eq!(height, 0);
+        assert_eq!(tree.len(), 1);
+    }
+
+    #[test]
+    fn test_locator_genesis_only() {
+        let tree = regtest_tree();
+        let locator = tree.build_locator();
+        assert_eq!(locator.len(), 1);
+        let (tip, _) = tree.tip();
+        assert_eq!(locator[0], tip);
+    }
+
+    #[test]
+    fn test_duplicate_insert_returns_false() {
+        let mut tree = regtest_tree();
+        let genesis =
+            *common::bitcoin::blockdata::constants::genesis_block(&regtest_params()).header();
+        let (accepted, err) = tree.insert_batch(&[genesis]);
+        assert_eq!(accepted, 0);
+        assert!(err.is_none());
+        assert_eq!(tree.len(), 1);
+    }
+
+    #[test]
+    fn test_orphan_rejected() {
+        let mut tree = regtest_tree();
+        let mut header =
+            *common::bitcoin::blockdata::constants::genesis_block(&regtest_params()).header();
+        header.prev_blockhash = BlockHash::from_byte_array([0xab; 32]);
+        let (_, err) = tree.insert_batch(&[header]);
+        assert!(matches!(err, Some(HeaderError::OrphanHeader)));
+    }
+
+    #[test]
+    fn test_save_load_roundtrip() {
+        let mut tree = regtest_tree();
+        let genesis_hash = tree.tip().0;
+
+        // Mine chain A: 5 headers
+        let mut chain_a = Vec::new();
+        let mut prev = genesis_hash;
+        for i in 0..5u32 {
+            let h = mine_header(prev, 1296688602 + i, 0);
+            chain_a.push(h);
+            prev = h.block_hash();
+        }
+        tree.insert_batch(&chain_a);
+
+        // Mine chain B: 7 headers (longer, causes reorg)
+        let mut chain_b = Vec::new();
+        prev = genesis_hash;
+        for i in 0..7u32 {
+            let h = mine_header(prev, 1296688602 + i, 1);
+            chain_b.push(h);
+            prev = h.block_hash();
+        }
+        tree.insert_batch(&chain_b);
+
+        // Tree should have: genesis + 5 (chain A) + 7 (chain B) = 13 headers, tip at 7
+        assert_eq!(tree.len(), 13);
+        assert_eq!(tree.tip().1, 7);
+        let tip_before = tree.tip().0;
+
+        let dir = std::env::temp_dir().join("headertree-test-roundtrip");
+        let path = dir.join("headers.bin");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let tips_before = tree.chain_tips();
+        tree.save(&path).unwrap();
+
+        let loaded = HeaderTree::load(&path, regtest_params()).unwrap();
+        let tips_after = loaded.chain_tips();
+
+        assert_eq!(loaded.tip(), tree.tip());
+        assert_eq!(loaded.tip().0, tip_before);
+        assert_eq!(loaded.len(), tree.len());
+        assert_eq!(loaded.len(), 13);
+
+        // Chain tips should be preserved across save/load
+        assert_eq!(tips_before.len(), tips_after.len());
+        for (before, after) in tips_before.iter().zip(tips_after.iter()) {
+            assert_eq!(before.hash, after.hash);
+            assert_eq!(before.height, after.height);
+            assert_eq!(before.branch_len, after.branch_len);
+            assert_eq!(before.status, after.status);
+        }
+
+        // Both forks should be preserved
+        for header in &chain_a {
+            assert!(loaded.contains(&header.block_hash()));
+        }
+        for header in &chain_b {
+            assert!(loaded.contains(&header.block_hash()));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_missing_file_starts_fresh() {
+        let tree = HeaderTree::load(
+            Path::new("/tmp/nonexistent-headertree-test-6336395673c0dceda7e525edb3ffbb6607e4.bin"),
+            regtest_params(),
+        )
+        .unwrap();
+
+        let (hash, height) = tree.tip();
+        assert_eq!(height, 0);
+        assert_eq!(
+            hash.to_string(),
+            "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+        );
+        assert_eq!(tree.len(), 1);
+    }
+
+    #[test]
+    fn test_get_headers_from_locator_empty_tree() {
+        let tree = regtest_tree();
+        let (genesis_hash, _) = tree.tip();
+        let headers =
+            tree.get_headers_from_locator(&[genesis_hash], BlockHash::from_byte_array([0; 32]));
+        // No headers after genesis
+        assert!(headers.is_empty());
+    }
+
+    /// Decode a hex-encoded header string from the bitcoind RPC.
+    fn header_from_hex(hex: &str) -> Header {
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        deserialize(&bytes).unwrap()
+    }
+
+    /// Fetch headers at heights 1..=count from a bitcoind node.
+    fn fetch_headers(node: &bitcoind::Node, count: u64) -> Vec<Header> {
+        use bitcoind::client::bitcoin::BlockHash as RpcBlockHash;
+
+        let mut headers = Vec::new();
+        for h in 1..=count {
+            let hash_hex = &node.client.get_block_hash(h).unwrap().0;
+            let block_hash: RpcBlockHash = hash_hex.parse().unwrap();
+            let header_hex = &node.client.get_block_header(&block_hash).unwrap().0;
+            headers.push(header_from_hex(header_hex));
+        }
+        headers
+    }
+
+    /// Generate blocks with a real bitcoind, fetch headers via RPC, insert into
+    /// the tree, and verify tip height, locator, save/load, and getheaders response.
+    #[test]
+    fn test_insert_regtest_headers() {
+        let exe = bitcoind::exe_path().unwrap();
+        let conf = bitcoind::Conf::default();
+        let node = bitcoind::Node::with_conf(exe, &conf).unwrap();
+
+        node.client
+            .generate_to_address(10, &regtest_address())
+            .unwrap();
+
+        let headers = fetch_headers(&node, 10);
+        let mut tree = regtest_tree();
+        let (accepted, err) = tree.insert_batch(&headers);
+        assert_eq!(accepted, 10);
+        assert!(err.is_none());
+
+        assert_eq!(tree.tip().1, 10);
+        assert_eq!(tree.len(), 11);
+
+        // Locator starts at tip, ends at genesis
+        let locator = tree.build_locator();
+        assert_eq!(locator[0], tree.tip().0);
+        assert_eq!(*locator.last().unwrap(), tree.best_chain[0]);
+
+        // get_headers_from_locator: asking from genesis should return all 10
+        let genesis_hash = tree.best_chain[0];
+        let resp =
+            tree.get_headers_from_locator(&[genesis_hash], BlockHash::from_byte_array([0; 32]));
+        assert_eq!(resp.len(), 10);
+
+        // get_headers_from_locator: asking from tip should return empty
+        let resp =
+            tree.get_headers_from_locator(&[tree.tip().0], BlockHash::from_byte_array([0; 32]));
+        assert!(resp.is_empty());
+
+        // Save and reload
+        let dir = std::env::temp_dir().join("headertree-test-regtest");
+        let path = dir.join("headers.bin");
+        let _ = std::fs::create_dir_all(&dir);
+
+        tree.dirty = true;
+        tree.save(&path).unwrap();
+
+        let loaded = HeaderTree::load(&path, regtest_params()).unwrap();
+        assert_eq!(loaded.tip(), tree.tip());
+        assert_eq!(loaded.len(), tree.len());
+        assert_eq!(loaded.build_locator(), tree.build_locator());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Insert the same batch twice — second time should accept 0 new headers.
+    #[test]
+    fn test_insert_batch_dedup() {
+        let exe = bitcoind::exe_path().unwrap();
+        let conf = bitcoind::Conf::default();
+        let node = bitcoind::Node::with_conf(exe, &conf).unwrap();
+
+        node.client
+            .generate_to_address(5, &regtest_address())
+            .unwrap();
+
+        let headers = fetch_headers(&node, 5);
+
+        let mut tree = regtest_tree();
+        let (accepted, err) = tree.insert_batch(&headers);
+        assert_eq!(accepted, 5);
+        assert!(err.is_none());
+
+        let (accepted, err) = tree.insert_batch(&headers);
+        assert_eq!(accepted, 0);
+        assert!(err.is_none());
     }
 }
