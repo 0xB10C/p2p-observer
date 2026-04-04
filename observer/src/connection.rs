@@ -11,6 +11,8 @@ use common::{
     tracing,
     tracing::Instrument,
 };
+#[cfg(target_os = "linux")]
+use libc;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -56,6 +58,44 @@ pub struct Connection {
     peer: PeerAddr,
     /// Once we've connected via v2, never fall back to v1.
     skip_v1_fallback: bool,
+}
+
+/// Apply socket-level options that improve latency and reliability for
+/// long-lived Bitcoin P2P connections.
+fn configure_stream(stream: &TcpStream) -> Result<()> {
+    // Disable Nagle's algorithm so every write goes on the wire immediately.
+    // Without this the kernel buffers small messages until a full MSS
+    // accumulates or an ACK arrives, adding invisible latency to pings and
+    // request/response exchanges. It also avoids the Nagle+delayed-ACK
+    // deadlock where two small back-to-back writes stall because each side
+    // waits for the other.
+    stream.set_nodelay(true).context("set_nodelay")?;
+
+    // Cap how long the kernel will retransmit unacknowledged data before
+    // aborting the connection. The default is unbounded — the OS can spend
+    // many minutes retransmitting while the connection appears alive to us.
+    // A dead peer (crashed node, network partition) would go undetected for
+    // that entire window, stalling the reconnect loop. 30 seconds is long
+    // enough to ride out transient packet loss but short enough to detect
+    // real failures promptly.
+    #[cfg(target_os = "linux")]
+    {
+        let timeout_ms: u32 = 30_000;
+        let ret = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_USER_TIMEOUT,
+                &timeout_ms as *const _ as *const libc::c_void,
+                std::mem::size_of::<u32>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error()).context("TCP_USER_TIMEOUT");
+        }
+    }
+
+    Ok(())
 }
 
 impl Connection {
@@ -253,13 +293,7 @@ impl Connection {
             .await
             .context("TCP connect timeout")?
             .context("TCP connect")?;
-
-        // Disable Nagle's algorithm. Without this, the kernel may buffer small
-        // writes waiting for either a full MSS or an ACK from the peer, adding
-        // invisible latency before bytes leave the machine. For an observer that
-        // measures propagation timing this would silently inflate RTT samples.
-        stream.set_nodelay(true).context("set_nodelay")?;
-
+        configure_stream(&stream)?;
         let raw_fd = stream.as_raw_fd();
         let (reader, writer) = stream.into_split();
         let proto = Protocol::new(
@@ -294,9 +328,7 @@ impl Connection {
             .context("TCP connect timeout")?
             .context("TCP connect")?;
 
-        // See connect_v2 for why we disable Nagle's algorithm.
-        stream.set_nodelay(true).context("set_nodelay")?;
-
+        configure_stream(&stream)?;
         let raw_fd = stream.as_raw_fd();
         let (reader, writer) = stream.into_split();
         run_session(
