@@ -17,6 +17,7 @@ use common::{
     tracing,
     tracing::Instrument,
 };
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
@@ -59,6 +60,35 @@ pub(crate) struct Config {
 /// to validate the block.
 const HIGH_BANDWIDTH_COMPACT_BLOCKS: bool = true;
 
+/// Per-connection state and statistics accumulated during the session.
+struct ConnectionStats {
+    /// Last SendCmpct received from the peer.
+    #[allow(dead_code)]
+    send_cmpct: Option<SendCmpct>,
+    /// Minimum fee rate the peer will accept for relay (BIP133).
+    #[allow(dead_code)]
+    fee_filter: Option<common::bitcoin::FeeRate>,
+    /// Rolling window of last 10 RTT samples in milliseconds.
+    rtt_history: VecDeque<u32>,
+}
+
+impl ConnectionStats {
+    fn new() -> Self {
+        Self {
+            send_cmpct: None,
+            fee_filter: None,
+            rtt_history: VecDeque::new(),
+        }
+    }
+
+    fn record_rtt(&mut self, rtt_ms: u32) {
+        self.rtt_history.push_back(rtt_ms);
+        if self.rtt_history.len() > 10 {
+            self.rtt_history.pop_front();
+        }
+    }
+}
+
 /// Information collected from the peer during the version handshake.
 pub(crate) struct HandshakeInfo {
     pub(crate) version: message_network::VersionMessage,
@@ -75,12 +105,7 @@ struct Connection<R: TransportReader, W: TransportWriter> {
     writer: W,
     new_addr_tx: mpsc::Sender<Vec<PeerAddr>>,
     handshake_info: HandshakeInfo,
-    /// Last SendCmpct received from the peer.
-    #[allow(dead_code)]
-    send_cmpct: Option<SendCmpct>,
-    /// Minimum fee rate the peer will accept for relay (BIP133).
-    #[allow(dead_code)]
-    fee_filter: Option<common::bitcoin::FeeRate>,
+    stats: ConnectionStats,
     ping_interval: Duration,
     addr: NetAddr,
     transport_version: u8,
@@ -124,8 +149,7 @@ pub(crate) async fn run_session(
         writer,
         new_addr_tx: new_addr_tx.clone(),
         handshake_info: info,
-        send_cmpct: None,
-        fee_filter: None,
+        stats: ConnectionStats::new(),
         ping_interval: cfg.ping_interval,
         addr: addr.clone(),
         transport_version: v,
@@ -358,9 +382,10 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         });
     }
 
-    fn handle_pong(&self, nonce: u64) {
+    fn handle_pong(&mut self, nonce: u64) {
         let rtt_ms = unix_ms().saturating_sub(nonce);
         tracing::debug!(target: TARGET, rtt_ms, "pong");
+        self.stats.record_rtt(rtt_ms as u32);
         self.emit_event(common::events::peer_event::Event::PingRtt(
             common::events::PingRtt { rtt_ms },
         ));
@@ -394,12 +419,12 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             version = sc.version,
             "received sendcmpct"
         );
-        self.send_cmpct = Some(sc);
+        self.stats.send_cmpct = Some(sc);
     }
 
     fn handle_fee_filter(&mut self, rate: common::bitcoin::FeeRate) {
         tracing::debug!(target: TARGET, rate=rate.to_sat_per_vb_ceil(), "received feefilter");
-        self.fee_filter = Some(rate);
+        self.stats.fee_filter = Some(rate);
     }
 
     async fn handle_get_headers(&mut self, msg: GetHeadersMessage) -> Result<()> {
