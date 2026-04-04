@@ -566,7 +566,7 @@ pub async fn run(
         tokio::select! {
             _ = persist_timer.tick() => {
                 if let Err(e) = store.lock().unwrap().save() {
-                    tracing::warn!(target: TARGET, "failed to persist address store: {e}");
+                    tracing::warn!(target: TARGET, "failed to persist address store: {e:#}");
                 }
             }
             Some(update) = status_rx.recv() => {

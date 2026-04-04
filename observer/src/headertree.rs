@@ -460,7 +460,7 @@ pub(crate) async fn persist_task(
         timer.tick().await;
         let mut tree = tree.write().unwrap();
         if let Err(e) = tree.save(&path) {
-            tracing::warn!(target: TARGET, "failed to persist header tree: {e}");
+            tracing::warn!(target: TARGET, "failed to persist header tree: {e:#}");
         }
     }
 }
