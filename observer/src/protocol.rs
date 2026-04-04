@@ -71,8 +71,8 @@ struct ConnectionStats {
     fee_filter: Option<common::bitcoin::FeeRate>,
     /// Rolling window of last 10 RTT samples in milliseconds.
     rtt_history: VecDeque<u32>,
-    /// Most recently sampled OS-level TCP smoothed RTT in microseconds.
-    tcp_srtt_us: Option<u32>,
+    /// Most recently sampled OS-level TCP statistics.
+    tcp: Option<crate::tcp::TcpStats>,
 }
 
 impl ConnectionStats {
@@ -81,7 +81,7 @@ impl ConnectionStats {
             send_cmpct: None,
             fee_filter: None,
             rtt_history: VecDeque::new(),
-            tcp_srtt_us: None,
+            tcp: None,
         }
     }
 
@@ -268,9 +268,12 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     }
 
     async fn send_ping(&mut self) -> Result<()> {
-        self.stats.tcp_srtt_us = crate::tcp::srtt_us(self.raw_fd);
+        self.stats.tcp = crate::tcp::tcp_info(self.raw_fd);
         let nonce = unix_ms();
-        tracing::trace!(target: TARGET, ts_ms = nonce, tcp_srtt_us = ?self.stats.tcp_srtt_us, "sending ping");
+        tracing::trace!(target: TARGET, ts_ms = nonce,
+            tcp_srtt_us = self.stats.tcp.as_ref().map(|t| t.srtt_us),
+            "sending ping"
+        );
         self.writer.send(NetworkMessage::Ping(nonce)).await
     }
 
@@ -367,12 +370,18 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         hash: common::bitcoin::BlockHash,
         announcement_type: common::events::AnnouncementType,
     ) {
+        let tcp_stats = self.stats.tcp.as_ref().map(|t| common::events::TcpStats {
+            srtt_us: u64::from(t.srtt_us),
+            rttvar_us: u64::from(t.rttvar_us),
+            total_retrans: u64::from(t.total_retrans),
+            snd_cwnd: u64::from(t.snd_cwnd),
+        });
         self.emit_event(common::events::peer_event::Event::BlockAnnouncement(
             common::events::BlockAnnouncement {
                 block_hash: hash.to_string(),
                 announcement_type: announcement_type.into(),
                 rtt_ms: self.stats.rtt_history.back().copied().map(u64::from),
-                tcp_srtt_us: self.stats.tcp_srtt_us.map(u64::from),
+                tcp_stats,
             },
         ));
     }

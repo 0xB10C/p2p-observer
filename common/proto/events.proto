@@ -18,11 +18,25 @@ message PingRtt {
   uint64 rtt_ms = 1;
 }
 
+message TcpStats {
+  // Smoothed RTT in microseconds (SRTT). Available on Linux and macOS.
+  uint64 srtt_us = 1;
+  // RTT variance in microseconds. Reflects path jitter. Available on Linux and macOS.
+  uint64 rttvar_us = 2;
+  // Total retransmitted segments over the connection lifetime.
+  // Increases indicate packet loss. Available on Linux and macOS.
+  uint64 total_retrans = 3;
+  // Congestion window size in segments. Available on Linux and macOS.
+  uint64 snd_cwnd = 4;
+}
+
 message BlockAnnouncement {
   string block_hash = 1;
   AnnouncementType announcement_type = 2;
+  // Application-level RTT from the most recent ping/pong exchange, in milliseconds.
   optional uint64 rtt_ms = 3;
-  optional uint64 tcp_srtt_us = 4;
+  // OS-level TCP statistics sampled at the last ping interval.
+  optional TcpStats tcp_stats = 4;
 }
 
 enum AnnouncementType {

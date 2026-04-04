@@ -1,7 +1,32 @@
-/// Query the OS TCP stack for the smoothed RTT of a socket in microseconds.
-/// Returns `None` if the platform is unsupported or the syscall fails.
+/// TCP statistics sampled from the OS kernel via `getsockopt`.
+///
+/// Fields are in canonical units (microseconds for time, segments for window
+/// sizes) regardless of what the kernel reports natively. Platform availability
+/// is noted per field.
+pub(crate) struct TcpStats {
+    /// Smoothed RTT in microseconds (SRTT).
+    /// Available on: Linux, macOS.
+    pub srtt_us: u32,
+
+    /// RTT variance in microseconds. Reflects jitter / stability of the path.
+    /// Available on: Linux, macOS.
+    pub rttvar_us: u32,
+
+    /// Total number of retransmitted segments over the lifetime of the connection.
+    /// Increases indicate packet loss on the path.
+    /// Available on: Linux (`tcpi_total_retrans`), macOS (`tcpi_rxretransmitpackets`).
+    pub total_retrans: u32,
+
+    /// Congestion window size in segments.
+    /// A small value means the sender is congestion-limited.
+    /// Available on: Linux, macOS.
+    pub snd_cwnd: u32,
+}
+
+/// Query the OS TCP stack for statistics on the given socket file descriptor.
+/// Returns `None` if the platform is unsupported or the `getsockopt` call fails.
 #[cfg(unix)]
-pub(crate) fn srtt_us(fd: std::os::unix::io::RawFd) -> Option<u32> {
+pub(crate) fn tcp_info(fd: std::os::unix::io::RawFd) -> Option<TcpStats> {
     #[cfg(target_os = "linux")]
     {
         let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
@@ -15,7 +40,15 @@ pub(crate) fn srtt_us(fd: std::os::unix::io::RawFd) -> Option<u32> {
                 &mut len,
             )
         };
-        if ret == 0 { Some(info.tcpi_rtt) } else { None }
+        if ret != 0 {
+            return None;
+        }
+        Some(TcpStats {
+            srtt_us: info.tcpi_rtt,
+            rttvar_us: info.tcpi_rttvar,
+            total_retrans: info.tcpi_total_retrans,
+            snd_cwnd: info.tcpi_snd_cwnd,
+        })
     }
     #[cfg(target_os = "macos")]
     {
@@ -30,12 +63,16 @@ pub(crate) fn srtt_us(fd: std::os::unix::io::RawFd) -> Option<u32> {
                 &mut len,
             )
         };
-        // tcpi_srtt is in milliseconds on macOS — convert to microseconds.
-        if ret == 0 {
-            Some(info.tcpi_srtt * 1_000)
-        } else {
-            None
+        if ret != 0 {
+            return None;
         }
+        // Time fields are in milliseconds on macOS — convert to microseconds.
+        Some(TcpStats {
+            srtt_us: info.tcpi_srtt * 1_000,
+            rttvar_us: info.tcpi_rttvar * 1_000,
+            total_retrans: info.tcpi_rxretransmitpackets as u32,
+            snd_cwnd: info.tcpi_snd_cwnd,
+        })
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -45,6 +82,6 @@ pub(crate) fn srtt_us(fd: std::os::unix::io::RawFd) -> Option<u32> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn srtt_us(_fd: i32) -> Option<u32> {
+pub(crate) fn tcp_info(_fd: i32) -> Option<TcpStats> {
     None
 }
