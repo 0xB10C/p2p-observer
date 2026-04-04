@@ -11,6 +11,7 @@ use common::{
     tracing,
     tracing::Instrument,
 };
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -252,6 +253,7 @@ impl Connection {
             .await
             .context("TCP connect timeout")?
             .context("TCP connect")?;
+        let raw_fd = stream.as_raw_fd();
         let (reader, writer) = stream.into_split();
         let proto = Protocol::new(
             self.cfg.magic,
@@ -269,6 +271,7 @@ impl Connection {
             2,
             self.id,
             &self.peer.addr,
+            raw_fd,
             &self.cfg,
             &self.status_tx,
             &self.new_addr_tx,
@@ -283,6 +286,7 @@ impl Connection {
             .await
             .context("TCP connect timeout")?
             .context("TCP connect")?;
+        let raw_fd = stream.as_raw_fd();
         let (reader, writer) = stream.into_split();
         run_session(
             TransportV1Reader::new(BufReader::new(reader)),
@@ -293,6 +297,7 @@ impl Connection {
             1,
             self.id,
             &self.peer.addr,
+            raw_fd,
             &self.cfg,
             &self.status_tx,
             &self.new_addr_tx,

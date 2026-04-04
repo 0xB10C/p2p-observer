@@ -26,6 +26,7 @@ mod protocol;
 mod publisher;
 mod rpc;
 mod settings;
+mod tcp;
 mod transport;
 
 #[tokio::main]

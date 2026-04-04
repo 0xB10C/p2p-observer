@@ -19,6 +19,7 @@ use common::{
 };
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::os::unix::io::RawFd;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -70,6 +71,8 @@ struct ConnectionStats {
     fee_filter: Option<common::bitcoin::FeeRate>,
     /// Rolling window of last 10 RTT samples in milliseconds.
     rtt_history: VecDeque<u32>,
+    /// Most recently sampled OS-level TCP smoothed RTT in microseconds.
+    tcp_srtt_us: Option<u32>,
 }
 
 impl ConnectionStats {
@@ -78,6 +81,7 @@ impl ConnectionStats {
             send_cmpct: None,
             fee_filter: None,
             rtt_history: VecDeque::new(),
+            tcp_srtt_us: None,
         }
     }
 
@@ -106,6 +110,8 @@ struct Connection<R: TransportReader, W: TransportWriter> {
     new_addr_tx: mpsc::Sender<Vec<PeerAddr>>,
     handshake_info: HandshakeInfo,
     stats: ConnectionStats,
+    /// Raw file descriptor of the TCP socket, used to query OS-level TCP stats.
+    raw_fd: RawFd,
     ping_interval: Duration,
     addr: NetAddr,
     transport_version: u8,
@@ -127,6 +133,7 @@ pub(crate) async fn run_session(
     v: u8,
     connection_id: u64,
     addr: &NetAddr,
+    raw_fd: RawFd,
     cfg: &Config,
     status_tx: &mpsc::Sender<StatusUpdate>,
     new_addr_tx: &mpsc::Sender<Vec<PeerAddr>>,
@@ -150,6 +157,7 @@ pub(crate) async fn run_session(
         new_addr_tx: new_addr_tx.clone(),
         handshake_info: info,
         stats: ConnectionStats::new(),
+        raw_fd,
         ping_interval: cfg.ping_interval,
         addr: addr.clone(),
         transport_version: v,
@@ -260,8 +268,9 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     }
 
     async fn send_ping(&mut self) -> Result<()> {
+        self.stats.tcp_srtt_us = crate::tcp::srtt_us(self.raw_fd);
         let nonce = unix_ms();
-        tracing::trace!(target: TARGET, ts_ms = nonce, "sending ping");
+        tracing::trace!(target: TARGET, ts_ms = nonce, tcp_srtt_us = ?self.stats.tcp_srtt_us, "sending ping");
         self.writer.send(NetworkMessage::Ping(nonce)).await
     }
 
@@ -363,6 +372,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                 block_hash: hash.to_string(),
                 announcement_type: announcement_type.into(),
                 rtt_ms: self.stats.rtt_history.back().copied().map(u64::from),
+                tcp_srtt_us: self.stats.tcp_srtt_us.map(u64::from),
             },
         ));
     }

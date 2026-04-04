@@ -49,8 +49,12 @@ fn print_event(subject: &str, event: &PeerEvent) {
                 .rtt_ms
                 .map(|r| format!(" rtt={r}ms"))
                 .unwrap_or_default();
+            let tcp_srtt = blk
+                .tcp_srtt_us
+                .map(|r| format!(" tcp_srtt={}µs", r))
+                .unwrap_or_default();
             println!(
-                "[{subject}] conn={} peer={} block={} type={:?}{rtt} ts={}",
+                "[{subject}] conn={} peer={} block={} type={:?}{rtt}{tcp_srtt} ts={}",
                 event.connection_id, event.peer_addr, blk.block_hash, atype, event.timestamp_ms,
             );
         }
