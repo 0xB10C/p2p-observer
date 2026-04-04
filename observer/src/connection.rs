@@ -253,6 +253,13 @@ impl Connection {
             .await
             .context("TCP connect timeout")?
             .context("TCP connect")?;
+
+        // Disable Nagle's algorithm. Without this, the kernel may buffer small
+        // writes waiting for either a full MSS or an ACK from the peer, adding
+        // invisible latency before bytes leave the machine. For an observer that
+        // measures propagation timing this would silently inflate RTT samples.
+        stream.set_nodelay(true).context("set_nodelay")?;
+
         let raw_fd = stream.as_raw_fd();
         let (reader, writer) = stream.into_split();
         let proto = Protocol::new(
@@ -286,6 +293,10 @@ impl Connection {
             .await
             .context("TCP connect timeout")?
             .context("TCP connect")?;
+
+        // See connect_v2 for why we disable Nagle's algorithm.
+        stream.set_nodelay(true).context("set_nodelay")?;
+
         let raw_fd = stream.as_raw_fd();
         let (reader, writer) = stream.into_split();
         run_session(
