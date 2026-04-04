@@ -362,6 +362,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             common::events::BlockAnnouncement {
                 block_hash: hash.to_string(),
                 announcement_type: announcement_type.into(),
+                rtt_ms: self.stats.rtt_history.back().copied().map(u64::from),
             },
         ));
     }

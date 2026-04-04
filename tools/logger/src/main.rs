@@ -45,8 +45,12 @@ fn print_event(subject: &str, event: &PeerEvent) {
         Some(peer_event::Event::BlockAnnouncement(blk)) => {
             let atype = common::events::AnnouncementType::try_from(blk.announcement_type)
                 .unwrap_or(common::events::AnnouncementType::Unknown);
+            let rtt = blk
+                .rtt_ms
+                .map(|r| format!(" rtt={r}ms"))
+                .unwrap_or_default();
             println!(
-                "[{subject}] conn={} peer={} block={} type={:?} ts={}",
+                "[{subject}] conn={} peer={} block={} type={:?}{rtt} ts={}",
                 event.connection_id, event.peer_addr, blk.block_hash, atype, event.timestamp_ms,
             );
         }
