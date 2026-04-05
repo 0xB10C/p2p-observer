@@ -68,6 +68,8 @@ impl Handler {
             Some("addresses.add") => self.handle_add_addresses(payload),
             Some("addresses.info") => self.handle_addresses_info(),
             Some("headertree.tips") => self.handle_chain_tips(),
+            Some("banlist.add") => self.handle_ban_add(payload),
+            Some("banlist.list") => self.handle_ban_list(),
             Some(other) => Err(format!("unknown method: {other}")),
             None => Err("malformed subject".to_owned()),
         };
@@ -84,6 +86,7 @@ impl Handler {
             "good": s.good_len(),
             "bad": s.bad_len(),
             "manual": s.manual_len(),
+            "banned": s.banned_len(),
         })
         .to_string())
     }
@@ -122,6 +125,28 @@ impl Handler {
         let added = self.store.lock().unwrap().insert_manual(peers);
         tracing::info!(target: TARGET, received = addrs.len(), added, "add-addresses");
         Ok(serde_json::json!({ "added": added }).to_string())
+    }
+
+    fn handle_ban_add(&self, payload: &[u8]) -> Result<String, String> {
+        let entries: Vec<crate::addresses::BanEntry> =
+            serde_json::from_slice(payload).map_err(|e| format!("invalid JSON: {e}"))?;
+
+        let mut store = self.store.lock().unwrap();
+        let mut added = 0;
+        for entry in entries {
+            let count_before = store.banned_len();
+            store.ban(entry);
+            let count_after = store.banned_len();
+            added += count_after - count_before;
+        }
+        tracing::info!(target: TARGET, added, "banlist.add");
+        Ok(serde_json::json!({ "added": added }).to_string())
+    }
+
+    fn handle_ban_list(&self) -> Result<String, String> {
+        let store = self.store.lock().unwrap();
+        let entries = store.banned_entries();
+        Ok(serde_json::to_string(entries).unwrap())
     }
 }
 

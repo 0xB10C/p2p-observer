@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use crate::TARGET_ADDRESSES as TARGET;
@@ -234,6 +235,107 @@ pub enum BadReason {
     UnexpectedEOF,
 }
 
+// ── Banlist ──────────────────────────────────────────────────────────────
+
+/// A CIDR network address (IP + prefix length). Serializes as a string like "10.0.0.0/8" or "1.2.3.4/32".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IpNet {
+    addr: IpAddr,
+    prefix_len: u8,
+}
+
+impl IpNet {
+    /// Check if an IP address falls within this network.
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let shift = 32u8.saturating_sub(self.prefix_len);
+                let mask: u32 = if shift >= 32 { 0 } else { !0u32 << shift };
+                (u32::from(net) & mask) == (u32::from(ip) & mask)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let shift = 128u8.saturating_sub(self.prefix_len);
+                let mask: u128 = if shift >= 128 { 0 } else { !0u128 << shift };
+                (u128::from(net) & mask) == (u128::from(ip) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for IpNet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.addr, self.prefix_len)
+    }
+}
+
+impl FromStr for IpNet {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let (addr_str, prefix_str) = match s.split_once('/') {
+            Some((a, p)) => (a, Some(p)),
+            None => (s, None),
+        };
+
+        let addr: IpAddr = addr_str
+            .parse()
+            .map_err(|_| format!("invalid IP address: {}", addr_str))?;
+
+        let prefix_len = match prefix_str {
+            Some(p) => p
+                .parse::<u8>()
+                .map_err(|_| format!("invalid prefix length: {}", p))?,
+            None => match addr {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            },
+        };
+
+        let max_prefix = match addr {
+            IpAddr::V4(_) => 32u8,
+            IpAddr::V6(_) => 128u8,
+        };
+
+        if prefix_len > max_prefix {
+            return Err(format!(
+                "prefix length {} exceeds maximum {} for {}",
+                prefix_len, max_prefix, addr
+            ));
+        }
+
+        Ok(IpNet { addr, prefix_len })
+    }
+}
+
+impl Serialize for IpNet {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: common::serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for IpNet {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: common::serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        IpNet::from_str(&s).map_err(common::serde::de::Error::custom)
+    }
+}
+
+/// A banlist entry with optional comment and one or more CIDR networks to ban.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(crate = "common::serde")]
+pub struct BanEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    pub nets: Vec<IpNet>,
+}
+
 pub enum StatusUpdate {
     Good {
         addr: NetAddr,
@@ -258,6 +360,7 @@ pub struct AddrStore {
     good: HashMap<PeerAddr, u64>,
     bad: HashMap<PeerAddr, (u64, BadReason)>,
     manual: HashSet<PeerAddr>,
+    banned: Vec<BanEntry>,
     persist_path: PathBuf,
 }
 
@@ -271,6 +374,8 @@ struct StoreDisk {
     bad: Vec<(NetAddr, u64, BadReason, u64)>,
     #[serde(default)]
     manual: Vec<NetAddr>,
+    #[serde(default)]
+    banned: Vec<BanEntry>,
 }
 
 impl AddrStore {
@@ -299,6 +404,7 @@ impl AddrStore {
                         .into_iter()
                         .map(|a| PeerAddr::new(a, ServiceFlags::NONE))
                         .collect(),
+                    banned: disk.banned,
                     persist_path: path.to_owned(),
                 })
             }
@@ -313,6 +419,7 @@ impl AddrStore {
             good: HashMap::new(),
             bad: HashMap::new(),
             manual: HashSet::new(),
+            banned: Vec::new(),
             persist_path: path.to_owned(),
         }
     }
@@ -335,6 +442,7 @@ impl AddrStore {
                 .map(|(p, (ts, r))| (p.addr.clone(), *ts, *r, p.services().to_u64()))
                 .collect(),
             manual: self.manual.iter().map(|p| p.addr.clone()).collect(),
+            banned: self.banned.clone(),
         };
         let json = serde_json::to_string(&disk).context("serialize address store")?;
         std::fs::write(&self.persist_path, json).context("write address store")?;
@@ -343,6 +451,7 @@ impl AddrStore {
             good = self.good.len(),
             bad = self.bad.len(),
             manual = self.manual.len(),
+            banned = self.banned_len(),
             "address store saved"
         );
         Ok(())
@@ -353,6 +462,9 @@ impl AddrStore {
         let mut inserted = 0;
         for peer in addrs {
             if !allow_local && !peer.addr.is_routable() {
+                continue;
+            }
+            if self.is_banned(&peer.addr) {
                 continue;
             }
             if self.good.contains_key(&peer)
@@ -393,8 +505,11 @@ impl AddrStore {
     pub fn get_batch(&self, n: usize, active: &HashSet<PeerAddr>) -> Vec<PeerAddr> {
         let mut batch = Vec::with_capacity(n);
 
-        let base =
-            |peer: &PeerAddr| !active.contains(&peer) && peer.addr.to_socket_addr().is_some();
+        let base = |peer: &PeerAddr| {
+            !active.contains(&peer)
+                && peer.addr.to_socket_addr().is_some()
+                && !self.is_banned(&peer.addr)
+        };
 
         // first, fill up with manual
         let manual: Vec<&PeerAddr> = self.manual.iter().filter(|a| base(a)).collect();
@@ -467,6 +582,49 @@ impl AddrStore {
         self.manual.len()
     }
 
+    pub fn banned_len(&self) -> usize {
+        self.banned.iter().map(|e| e.nets.len()).sum()
+    }
+
+    pub fn banned_entries(&self) -> &[BanEntry] {
+        &self.banned
+    }
+
+    /// Check if an IP address is banned.
+    fn is_banned(&self, addr: &NetAddr) -> bool {
+        let ip = match addr {
+            NetAddr::Ipv4(ip, _) => IpAddr::V4(*ip),
+            NetAddr::Ipv6(ip, _) => IpAddr::V6(*ip),
+            NetAddr::Cjdns(ip, _) => IpAddr::V6(*ip),
+            NetAddr::TorV3(_, _) | NetAddr::I2p(_, _) => return false,
+        };
+        self.banned
+            .iter()
+            .any(|e| e.nets.iter().any(|net| net.contains(ip)))
+    }
+
+    /// Add a ban entry, removing all matching addresses from other tables.
+    pub fn ban(&mut self, entry: BanEntry) {
+        for net in &entry.nets {
+            let should_ban = |addr: &NetAddr| {
+                let ip = match addr {
+                    NetAddr::Ipv4(ip, _) => IpAddr::V4(*ip),
+                    NetAddr::Ipv6(ip, _) => IpAddr::V6(*ip),
+                    NetAddr::Cjdns(ip, _) => IpAddr::V6(*ip),
+                    NetAddr::TorV3(_, _) | NetAddr::I2p(_, _) => return false,
+                };
+                net.contains(ip)
+            };
+
+            // Remove from all tables
+            self.unknown.retain(|p| !should_ban(&p.addr));
+            self.good.retain(|p, _| !should_ban(&p.addr));
+            self.bad.retain(|p, _| !should_ban(&p.addr));
+            self.manual.retain(|p| !should_ban(&p.addr));
+        }
+        self.banned.push(entry);
+    }
+
     /// Look up the `PeerAddr` for a `NetAddr` in any table, preserving its services.
     fn take(&mut self, addr: &NetAddr) -> Option<PeerAddr> {
         let key = PeerAddr::new(addr.clone(), ServiceFlags::NONE);
@@ -486,6 +644,14 @@ impl AddrStore {
     }
 
     pub fn apply_update(&mut self, update: StatusUpdate) {
+        // Ignore status updates for banned addresses
+        let addr = match &update {
+            StatusUpdate::Good { addr, .. } | StatusUpdate::Bad { addr, .. } => addr,
+        };
+        if self.is_banned(addr) {
+            return;
+        }
+
         match update {
             StatusUpdate::Good { addr, at, services } => {
                 let addr_str = format!("{:#}", addr);
