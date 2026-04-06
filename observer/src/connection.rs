@@ -135,6 +135,7 @@ impl Connection {
     /// Returns true if we connected at least once (triggering the reconnect loop).
     async fn initial_connect(&mut self) -> bool {
         let mut backoff = BACKOFF_BASE;
+        let mut last_reason: Option<BadReason> = None;
         for attempt in 1..=MAX_INITIAL_ATTEMPTS {
             match self.try_connect().await {
                 Ok(_) => return true,
@@ -166,19 +167,23 @@ impl Connection {
                         return false;
                     }
 
-                    // Don't early exit for these:
+                    // Don't early exit for these, but track the reason:
                     if is_timed_out(&e) {
                         tracing::debug!(target: TARGET, "connection timed out");
-                        let _ = self.status_tx.send(bad(BadReason::TimedOut)).await;
-                    }
-
-                    if is_unexpected_eof(&e) {
+                        last_reason = Some(BadReason::TimedOut);
+                    } else if is_unexpected_eof(&e) {
                         tracing::debug!(target: TARGET, "unexpected EOF");
-                        let _ = self.status_tx.send(bad(BadReason::UnexpectedEOF)).await;
+                        last_reason = Some(BadReason::UnexpectedEOF);
+                    } else {
+                        last_reason.get_or_insert(BadReason::Other);
                     }
 
                     if attempt >= MAX_INITIAL_ATTEMPTS {
                         tracing::debug!(target: TARGET, attempt, error=%e, "initial connect failed, giving up");
+                        let _ = self
+                            .status_tx
+                            .send(bad(last_reason.unwrap_or(BadReason::Other)))
+                            .await;
                         return false;
                     }
                     backoff *= 2;

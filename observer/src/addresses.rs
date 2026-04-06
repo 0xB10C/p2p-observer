@@ -282,6 +282,8 @@ pub enum BadReason {
     TimedOut,
     /// We were able to open a TCP connection, but received an unexpected EOF before we could do the version handshake.
     UnexpectedEOF,
+    /// Connection failed for an unclassified reason.
+    Other,
 }
 
 // ── Banlist ──────────────────────────────────────────────────────────────
