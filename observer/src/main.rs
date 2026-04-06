@@ -95,6 +95,7 @@ async fn main() {
         event_tx,
         header_tree: header_tree.clone(),
         sync_headers: false,
+        tor: cfg.tor.clone(),
     };
 
     run_loop(&store, cfg, proto_cfg, status_tx, new_addr_tx).await;
@@ -128,6 +129,7 @@ async fn bootstrap_sync(
         event_tx: event_tx.clone(),
         header_tree: header_tree.clone(),
         sync_headers: true,
+        tor: cfg.tor.clone(),
     };
 
     loop {
@@ -211,7 +213,7 @@ async fn run_loop(
                     "stats"
                 );
 
-                let batch = s.get_batch(cfg.connections_per_second as usize, &active_addrs);
+                let batch = s.get_batch(cfg.connections_per_second as usize, &active_addrs, cfg.tor.enabled);
                 drop(s);
 
                 for addr in batch {

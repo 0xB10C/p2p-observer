@@ -23,12 +23,65 @@ use common::{
 
 // ── Address types ────────────────────────────────────────────────────────────
 
+fn base32_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut result = String::new();
+    let mut bits = 0u64;
+    let mut bit_count = 0;
+
+    for &byte in bytes {
+        bits = (bits << 8) | (byte as u64);
+        bit_count += 8;
+
+        while bit_count >= 5 {
+            bit_count -= 5;
+            let idx = ((bits >> bit_count) & 0x1f) as usize;
+            result.push(ALPHABET[idx] as char);
+        }
+    }
+
+    if bit_count > 0 {
+        let idx = ((bits << (5 - bit_count)) & 0x1f) as usize;
+        result.push(ALPHABET[idx] as char);
+    }
+
+    result
+}
+
+/// Convert a 32-byte Tor v3 public key to a base32-encoded onion address.
+/// Tor v3 addresses are base32(pubkey || checksum || version) + ".onion" where:
+/// - pubkey is 32 bytes
+/// - checksum is 2 bytes = SHA3-256(".onion checksum" || pubkey || version)[0..2]
+/// - version is 1 byte = 0x03
+/// Result is always 56 base32 chars + ".onion".
+fn tor_v3_address(key: &[u8; 32]) -> String {
+    use sha3::Digest;
+    const VERSION: u8 = 0x03;
+
+    let checksum = {
+        let hash = sha3::Sha3_256::new()
+            .chain_update(b".onion checksum")
+            .chain_update(key)
+            .chain_update([VERSION])
+            .finalize();
+        [hash[0], hash[1]]
+    };
+
+    // Build the 35 bytes to encode: pubkey (32) || checksum (2) || version (1)
+    let mut bytes = [0u8; 35];
+    bytes[..32].copy_from_slice(key);
+    bytes[32..34].copy_from_slice(&checksum);
+    bytes[34] = VERSION;
+
+    format!("{}.onion", base32_encode(&bytes))
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(crate = "common::serde")]
 pub enum NetAddr {
     Ipv4(Ipv4Addr, u16),
     Ipv6(Ipv6Addr, u16),
-    TorV3([u8; 32], u16),
+    TorV3(String, u16),
     I2p([u8; 32], u16),
     Cjdns(Ipv6Addr, u16),
 }
@@ -56,7 +109,7 @@ impl NetAddr {
                     // fd00::/8 unique local (fc00::/8 is CJDNS and has its own variant)
                     && ip.octets()[0] != 0xfd
             }
-            NetAddr::TorV3(key, port) => *port != 0 && key != &[0u8; 32],
+            NetAddr::TorV3(addr, port) => *port != 0 && !addr.is_empty(),
             NetAddr::I2p(hash, port) => *port != 0 && hash != &[0u8; 32],
             NetAddr::Cjdns(ip, port) => *port != 0 && !ip.is_unspecified(),
         }
@@ -79,11 +132,7 @@ impl std::fmt::Display for NetAddr {
         match self {
             NetAddr::Ipv4(ip, port) => write!(f, "{}:{}", ip, port),
             NetAddr::Ipv6(ip, port) => write!(f, "[{}]:{}", ip, port),
-            NetAddr::TorV3(key, port) => write!(
-                f,
-                "torv3:{:02x}{:02x}{:02x}{:02x}:{}",
-                key[0], key[1], key[2], key[3], port
-            ),
+            NetAddr::TorV3(addr, port) => write!(f, "{}:{}", addr, port),
             NetAddr::I2p(hash, port) => write!(
                 f,
                 "i2p:{:02x}{:02x}{:02x}{:02x}:{}",
@@ -173,7 +222,7 @@ impl TryFrom<&AddrV2Message> for NetAddr {
         match &msg.addr {
             AddrV2::Ipv4(ip) => Ok(NetAddr::Ipv4(*ip, msg.port)),
             AddrV2::Ipv6(ip) => Ok(NetAddr::Ipv6(*ip, msg.port)),
-            AddrV2::TorV3(key) => Ok(NetAddr::TorV3(*key, msg.port)),
+            AddrV2::TorV3(key) => Ok(NetAddr::TorV3(tor_v3_address(key), msg.port)),
             AddrV2::I2p(hash) => Ok(NetAddr::I2p(*hash, msg.port)),
             AddrV2::Cjdns(ip) => Ok(NetAddr::Cjdns(*ip, msg.port)),
             AddrV2::Unknown(_, _) => Err(()),
@@ -501,21 +550,40 @@ impl AddrStore {
     ///   3. Unknown. Then:
     ///   4. Bad — fill remaining slots.
     ///
-    /// Only addresses with a TCP socket address are returned.
-    pub fn get_batch(&self, n: usize, active: &HashSet<PeerAddr>) -> Vec<PeerAddr> {
+    /// Only addresses that are connectable (TCP or Tor) are returned.
+    pub fn get_batch(
+        &self,
+        n: usize,
+        active: &HashSet<PeerAddr>,
+        tor_enabled: bool,
+    ) -> Vec<PeerAddr> {
         let mut batch = Vec::with_capacity(n);
 
         let base = |peer: &PeerAddr| {
             !active.contains(&peer)
-                && peer.addr.to_socket_addr().is_some()
                 && !self.is_banned(&peer.addr)
+                && match &peer.addr {
+                    NetAddr::TorV3(_, _) => tor_enabled,
+                    _ => peer.addr.to_socket_addr().is_some(),
+                }
         };
+
+        fn log_batch(batch: &[PeerAddr], manual: usize, good: usize, unknown: usize, bad: usize) {
+            let ipv4 = batch.iter().filter(|p| matches!(p.addr, NetAddr::Ipv4(_, _))).count();
+            let ipv6 = batch.iter().filter(|p| matches!(p.addr, NetAddr::Ipv6(_, _))).count();
+            let tor  = batch.iter().filter(|p| matches!(p.addr, NetAddr::TorV3(_, _))).count();
+            tracing::debug!(target: TARGET,
+                manual, good, unknown, bad, ipv4, ipv6, tor,
+                "get_batch"
+            );
+        }
 
         // first, fill up with manual
         let manual: Vec<&PeerAddr> = self.manual.iter().filter(|a| base(a)).collect();
         let manual_fill = std::cmp::min(n, manual.len());
         batch.extend(manual[..manual_fill].iter().map(|a| (*a).clone()));
         if batch.len() == n {
+            log_batch(&batch, manual_fill, 0, 0, 0);
             return batch;
         }
 
@@ -531,6 +599,7 @@ impl AddrStore {
         let good_fill = std::cmp::min(n - batch.len(), good.len());
         batch.extend(good[..good_fill].iter().map(|(peer, _)| (*peer).clone()));
         if batch.len() == n {
+            log_batch(&batch, manual_fill, good_fill, 0, 0);
             return batch;
         }
 
@@ -539,6 +608,7 @@ impl AddrStore {
         let unknown_fill = std::cmp::min(n - batch.len(), unknown.len());
         batch.extend(unknown[..unknown_fill].iter().map(|a| (*a).clone()));
         if batch.len() == n {
+            log_batch(&batch, manual_fill, good_fill, unknown_fill, 0);
             return batch;
         }
 
@@ -555,13 +625,7 @@ impl AddrStore {
             .collect();
         let bad_fill = std::cmp::min(n - batch.len(), bad.len());
         batch.extend(bad[..bad_fill].iter().map(|a| (*a).clone()));
-        tracing::debug!(target: TARGET,
-            manual=manual_fill,
-            good=good_fill,
-            unknown=unknown_fill,
-            bad=bad_fill,
-            "returned batch"
-        );
+        log_batch(&batch, manual_fill, good_fill, unknown_fill, bad_fill);
 
         batch
     }
@@ -604,8 +668,28 @@ impl AddrStore {
     }
 
     /// Add a ban entry, removing all matching addresses from other tables.
+    /// Skips networks already banned.
     pub fn ban(&mut self, entry: BanEntry) {
-        for net in &entry.nets {
+        // Filter out networks that are already banned
+        let new_nets: Vec<IpNet> = entry
+            .nets
+            .iter()
+            .copied()
+            .filter(|net| {
+                !self
+                    .banned
+                    .iter()
+                    .any(|e| e.nets.iter().any(|existing| existing == net))
+            })
+            .collect();
+
+        // If nothing left to ban, don't add an entry
+        if new_nets.is_empty() {
+            return;
+        }
+
+        // Ban the new networks: remove matching addresses from all tables
+        for net in &new_nets {
             let should_ban = |addr: &NetAddr| {
                 let ip = match addr {
                     NetAddr::Ipv4(ip, _) => IpAddr::V4(*ip),
@@ -622,7 +706,11 @@ impl AddrStore {
             self.bad.retain(|p, _| !should_ban(&p.addr));
             self.manual.retain(|p| !should_ban(&p.addr));
         }
-        self.banned.push(entry);
+
+        self.banned.push(BanEntry {
+            comment: entry.comment,
+            nets: new_nets,
+        });
     }
 
     /// Look up the `PeerAddr` for a `NetAddr` in any table, preserving its services.
@@ -780,5 +868,36 @@ mod tests {
         // Services should be updated
         let (updated_peer, _) = store.good.get_key_value(&peer_a).unwrap();
         assert_eq!(updated_peer.services(), services_b);
+    }
+
+    #[test]
+    fn test_base32_encode() {
+        // RFC 4648 test vectors (lowercase alphabet)
+        assert_eq!(base32_encode(b""), "");
+        assert_eq!(base32_encode(b"f"), "my");
+        assert_eq!(base32_encode(b"fo"), "mzxq");
+        assert_eq!(base32_encode(b"foo"), "mzxw6");
+        assert_eq!(base32_encode(b"foob"), "mzxw6yq");
+        assert_eq!(base32_encode(b"fooba"), "mzxw6ytb");
+        assert_eq!(base32_encode(b"foobar"), "mzxw6ytboi");
+    }
+
+    #[test]
+    fn test_tor_v3_address_format() {
+        // Known test vector: all-zero key
+        let key = [0u8; 32];
+        let addr = tor_v3_address(&key);
+        assert!(addr.ends_with(".onion"), "should end with .onion");
+        let host = addr.strip_suffix(".onion").unwrap();
+        assert_eq!(host.len(), 56, "host should be 56 base32 chars");
+        assert!(
+            host.chars()
+                .all(|c| c.is_ascii_lowercase() || ('2'..='7').contains(&c)),
+            "should only contain base32 alphabet chars"
+        );
+
+        // Two different keys should produce different addresses
+        let key2 = [1u8; 32];
+        assert_ne!(tor_v3_address(&key), tor_v3_address(&key2));
     }
 }
