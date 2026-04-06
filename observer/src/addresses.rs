@@ -398,9 +398,9 @@ pub enum StatusUpdate {
     },
 }
 
-const MAX_UNKNOWN: usize = 100_000;
+const MAX_UNKNOWN: usize = 500_000;
 const MAX_GOOD: usize = 500_000;
-const MAX_BAD: usize = 100_000;
+const MAX_BAD: usize = 500_000;
 /// Minimum seconds to wait before retrying a bad address.
 const BAD_RETRY_INTERVAL_SECS: u64 = 3600;
 
