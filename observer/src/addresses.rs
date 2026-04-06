@@ -550,13 +550,14 @@ impl AddrStore {
     ///   3. Unknown. Then:
     ///   4. Bad — fill remaining slots.
     ///
-    /// Only addresses with a TCP socket address are returned.
+    /// Only addresses that are connectable (TCP or Tor) are returned.
     pub fn get_batch(&self, n: usize, active: &HashSet<PeerAddr>) -> Vec<PeerAddr> {
         let mut batch = Vec::with_capacity(n);
 
         let base = |peer: &PeerAddr| {
             !active.contains(&peer)
-                && peer.addr.to_socket_addr().is_some()
+                && (peer.addr.to_socket_addr().is_some()
+                    || matches!(peer.addr, NetAddr::TorV3(_, _)))
                 && !self.is_banned(&peer.addr)
         };
 
