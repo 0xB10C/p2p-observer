@@ -481,7 +481,7 @@ mod tests {
             }
         }
         writer
-            .send(build_version(crate::protocol::USER_AGENT))
+            .send(build_version(crate::protocol::USER_AGENT, 0))
             .await
             .unwrap();
         writer.send(NetworkMessage::Verack).await.unwrap();

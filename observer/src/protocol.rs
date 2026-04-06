@@ -139,9 +139,16 @@ pub(crate) async fn run_session(
     status_tx: &mpsc::Sender<StatusUpdate>,
     new_addr_tx: &mpsc::Sender<Vec<PeerAddr>>,
 ) -> Result<Instant> {
-    let info = version_handshake(&mut reader, &mut writer, &cfg.user_agent).await?;
+    let (_, tip_height) = &cfg.header_tree.read().unwrap().tip();
+    let info = version_handshake(
+        &mut reader,
+        &mut writer,
+        &cfg.user_agent,
+        *tip_height as i32,
+    )
+    .await?;
     let connected_at = Instant::now();
-    let conn_span = tracing::info_span!(target: TARGET, "", v = v, ua = %info.version.user_agent);
+    let conn_span = tracing::info_span!(target: TARGET, "", v, ua = %info.version.user_agent);
 
     let _ = status_tx
         .send(StatusUpdate::Good {
@@ -179,8 +186,9 @@ pub(crate) async fn version_handshake(
     reader: &mut impl TransportReader,
     writer: &mut impl TransportWriter,
     user_agent: &str,
+    tip_height: i32,
 ) -> Result<HandshakeInfo> {
-    writer.send(build_version(user_agent)).await?;
+    writer.send(build_version(user_agent, tip_height)).await?;
 
     let mut peer_version: Option<message_network::VersionMessage> = None;
     let mut got_verack = false;
@@ -484,7 +492,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     }
 }
 
-pub(crate) fn build_version(user_agent: &str) -> NetworkMessage {
+pub(crate) fn build_version(user_agent: &str, start_height: i32) -> NetworkMessage {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
@@ -507,7 +515,7 @@ pub(crate) fn build_version(user_agent: &str) -> NetworkMessage {
         // at the same time, so this should be fine.
         nonce: 0,
         user_agent: UserAgent::from_nonstandard(user_agent),
-        start_height: 0,
+        start_height,
         relay: false,
     })
 }
@@ -563,7 +571,7 @@ mod tests {
             magic: Magic::REGTEST,
             writer,
         };
-        version_handshake(&mut r, &mut w, USER_AGENT)
+        version_handshake(&mut r, &mut w, USER_AGENT, 0)
             .await
             .expect("v1 handshake failed");
     }
@@ -594,7 +602,7 @@ mod tests {
         let (pr, pw) = proto.into_split();
         let mut r = TransportV2Reader { reader: pr };
         let mut w = TransportV2Writer { writer: pw };
-        version_handshake(&mut r, &mut w, USER_AGENT)
+        version_handshake(&mut r, &mut w, USER_AGENT, 0)
             .await
             .expect("v2 version handshake failed");
     }
