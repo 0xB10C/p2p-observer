@@ -259,12 +259,7 @@ impl Connection {
 
     /// Connect to a peer, using Tor SOCKS5 proxy if the peer is an onion address and Tor is enabled.
     async fn tcp_connect(&self) -> Result<TcpStream> {
-        let socket_addr = self.peer.addr.to_socket_addr().context("no TCP address")?;
-
-        // Check if this is a Tor onion address
-        let is_tor = matches!(self.peer.addr, NetAddr::TorV3(_, _));
-
-        if is_tor && self.cfg.tor.enabled {
+        if matches!(self.peer.addr, NetAddr::TorV3(_, _)) && self.cfg.tor.enabled {
             // Connect via Tor SOCKS5 proxy
             let socks_addr: std::net::SocketAddr = self
                 .cfg
@@ -289,6 +284,7 @@ impl Connection {
             Ok(stream)
         } else {
             // Direct TCP connection
+            let socket_addr = self.peer.addr.to_socket_addr().context("no TCP address")?;
             let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
                 .await
                 .context("TCP connect timeout")?
