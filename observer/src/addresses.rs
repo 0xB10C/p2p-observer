@@ -564,14 +564,24 @@ impl AddrStore {
                 && !self.is_banned(&peer.addr)
                 && match &peer.addr {
                     NetAddr::TorV3(_, _) => tor_enabled,
-                    _ => peer.addr.to_socket_addr().is_some(),
+                    NetAddr::Ipv4(_, _) | NetAddr::Ipv6(_, _) => true,
+                    _ => false,
                 }
         };
 
         fn log_batch(batch: &[PeerAddr], manual: usize, good: usize, unknown: usize, bad: usize) {
-            let ipv4 = batch.iter().filter(|p| matches!(p.addr, NetAddr::Ipv4(_, _))).count();
-            let ipv6 = batch.iter().filter(|p| matches!(p.addr, NetAddr::Ipv6(_, _))).count();
-            let tor  = batch.iter().filter(|p| matches!(p.addr, NetAddr::TorV3(_, _))).count();
+            let ipv4 = batch
+                .iter()
+                .filter(|p| matches!(p.addr, NetAddr::Ipv4(_, _)))
+                .count();
+            let ipv6 = batch
+                .iter()
+                .filter(|p| matches!(p.addr, NetAddr::Ipv6(_, _)))
+                .count();
+            let tor = batch
+                .iter()
+                .filter(|p| matches!(p.addr, NetAddr::TorV3(_, _)))
+                .count();
             tracing::debug!(target: TARGET,
                 manual, good, unknown, bad, ipv4, ipv6, tor,
                 "get_batch"

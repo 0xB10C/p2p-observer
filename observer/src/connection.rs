@@ -305,8 +305,7 @@ impl Connection {
             NetAddr::TorV3(..) => self.tor_connect().await,
             NetAddr::Ipv4(..) | NetAddr::Ipv6(..) => self.ip_connect().await,
             _ => {
-                tracing::warn!(target: TARGET, addr=%self.peer.addr, "tcp_connect not implemented for");
-                anyhow::bail!("tcp_connect not implemented for address type")
+                anyhow::bail!("unsupported address type: {}", self.peer.addr)
             }
         }
     }
