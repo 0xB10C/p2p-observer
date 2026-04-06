@@ -23,6 +23,22 @@ bootstrap_addrs:
 # NATS server URL for publishing events.
 nats_url: "nats://localhost:4222"
 
+# Which network types to connect to.
+# IPv4 is enabled by default. All others must be explicitly enabled.
+networks:
+  ipv4:
+    enabled: true
+  ipv6:
+    enabled: false
+  tor:
+    enabled: false
+    # Address of the local Tor SOCKS5 proxy.
+    proxy_addr: "127.0.0.1:9050"
+  cjdns:
+    enabled: false
+  i2p:
+    enabled: false
+
 # Log level per target. Options: error, warn, info, debug, trace
 log_levels:
   main: debug

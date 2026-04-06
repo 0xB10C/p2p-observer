@@ -53,7 +53,7 @@ pub(crate) struct Config {
     pub(crate) event_tx: mpsc::Sender<common::events::PeerEvent>,
     pub(crate) header_tree: Arc<RwLock<HeaderTree>>,
     pub(crate) sync_headers: bool,
-    pub(crate) tor: crate::settings::TorConfig,
+    pub(crate) networks: crate::settings::NetworksConfig,
 }
 
 /// We want get high-bandwidth compact block relay (BIP152).

@@ -258,12 +258,13 @@ impl Connection {
     }
 
     async fn tor_connect(&self) -> Result<TcpStream> {
-        if !self.cfg.tor.enabled {
+        if !self.cfg.networks.tor.enabled {
             anyhow::bail!("attempted to connect to TorV3 address, but Tor is disabled");
         }
         // Connect via Tor SOCKS5 proxy
         let socks_addr: std::net::SocketAddr = self
             .cfg
+            .networks
             .tor
             .proxy_addr
             .parse()
@@ -530,7 +531,7 @@ mod tests {
                 common::bitcoin::Network::Regtest,
             )))),
             sync_headers: false,
-            tor: crate::settings::TorConfig::default(),
+            networks: crate::settings::NetworksConfig::default(),
         };
         let conn = Connection::new(
             cfg,
@@ -581,7 +582,7 @@ mod tests {
                 common::bitcoin::Network::Regtest,
             )))),
             sync_headers: false,
-            tor: crate::settings::TorConfig::default(),
+            networks: crate::settings::NetworksConfig::default(),
         };
         let conn = Connection::new(
             cfg,
@@ -634,7 +635,7 @@ mod tests {
                 common::bitcoin::Network::Regtest,
             )))),
             sync_headers: false,
-            tor: crate::settings::TorConfig::default(),
+            networks: crate::settings::NetworksConfig::default(),
         };
         tokio::spawn(
             Connection::new(

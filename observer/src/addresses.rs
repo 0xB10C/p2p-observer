@@ -555,7 +555,7 @@ impl AddrStore {
         &self,
         n: usize,
         active: &HashSet<PeerAddr>,
-        tor_enabled: bool,
+        networks: &crate::settings::NetworksConfig,
     ) -> Vec<PeerAddr> {
         let mut batch = Vec::with_capacity(n);
 
@@ -563,9 +563,11 @@ impl AddrStore {
             !active.contains(&peer)
                 && !self.is_banned(&peer.addr)
                 && match &peer.addr {
-                    NetAddr::TorV3(_, _) => tor_enabled,
-                    NetAddr::Ipv4(_, _) | NetAddr::Ipv6(_, _) => true,
-                    _ => false,
+                    NetAddr::Ipv4(_, _) => networks.ipv4.enabled,
+                    NetAddr::Ipv6(_, _) => networks.ipv6.enabled,
+                    NetAddr::TorV3(_, _) => networks.tor.enabled,
+                    NetAddr::Cjdns(_, _) => networks.cjdns.enabled,
+                    NetAddr::I2p(_, _) => networks.i2p.enabled,
                 }
         };
 

@@ -31,7 +31,55 @@ pub struct Config {
     pub nats_url: String,
 
     #[serde(default)]
+    pub networks: NetworksConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(crate = "common::serde")]
+pub struct NetworksConfig {
+    #[serde(default = "default_enabled")]
+    pub ipv4: NetworkConfig,
+
+    #[serde(default)]
+    pub ipv6: NetworkConfig,
+
+    #[serde(default)]
     pub tor: TorConfig,
+
+    #[serde(default)]
+    pub cjdns: NetworkConfig,
+
+    #[serde(default)]
+    pub i2p: NetworkConfig,
+}
+
+impl Default for NetworksConfig {
+    fn default() -> Self {
+        Self {
+            ipv4: default_enabled(),
+            ipv6: NetworkConfig::default(),
+            tor: TorConfig::default(),
+            cjdns: NetworkConfig::default(),
+            i2p: NetworkConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(crate = "common::serde")]
+pub struct NetworkConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
+fn default_enabled() -> NetworkConfig {
+    NetworkConfig { enabled: true }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -152,7 +200,7 @@ impl Default for Config {
             user_agent: default_user_agent(),
             bootstrap_addrs: Vec::new(),
             nats_url: default_nats_url(),
-            tor: TorConfig::default(),
+            networks: NetworksConfig::default(),
         }
     }
 }
@@ -297,5 +345,27 @@ mod tests {
     fn test_invalid_network() {
         let cfg = parse_str("network: invalidnet");
         assert!(cfg.magic().is_err());
+    }
+
+    #[test]
+    fn test_networks_config() {
+        // defaults: ipv4 on, everything else off
+        let cfg = parse_str("");
+        assert!(cfg.networks.ipv4.enabled);
+        assert!(!cfg.networks.ipv6.enabled);
+        assert!(!cfg.networks.tor.enabled);
+        assert!(!cfg.networks.cjdns.enabled);
+        assert!(!cfg.networks.i2p.enabled);
+        assert_eq!(cfg.networks.tor.proxy_addr, "127.0.0.1:9050");
+
+        // enable tor
+        let cfg = parse_str("networks:\n  tor:\n    enabled: true");
+        assert!(cfg.networks.tor.enabled);
+        assert!(cfg.networks.ipv4.enabled); // default still applies
+
+        // enable ipv6
+        let cfg = parse_str("networks:\n  ipv6:\n    enabled: true");
+        assert!(cfg.networks.ipv6.enabled);
+        assert!(cfg.networks.ipv4.enabled); // default still applies
     }
 }

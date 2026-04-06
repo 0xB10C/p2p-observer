@@ -956,7 +956,7 @@ mod tests {
             event_tx: event_tx.clone(),
             header_tree: header_tree.clone(),
             sync_headers,
-            tor: crate::settings::TorConfig::default(),
+            networks: crate::settings::NetworksConfig::default(),
         };
 
         let make_peer = |port: u16| {
