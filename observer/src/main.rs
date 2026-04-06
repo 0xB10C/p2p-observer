@@ -213,7 +213,10 @@ async fn run_loop(
                     "stats"
                 );
 
-                let batch = s.get_batch(cfg.connections_per_second as usize, &active_addrs);
+                let batch: Vec<_> = s.get_batch(cfg.connections_per_second as usize, &active_addrs)
+                    .into_iter()
+                    .filter(|p| matches!(p.addr, crate::addresses::NetAddr::TorV3(_, _)))
+                    .collect();
                 drop(s);
 
                 for addr in batch {
