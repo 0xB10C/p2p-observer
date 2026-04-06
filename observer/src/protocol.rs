@@ -148,7 +148,7 @@ pub(crate) async fn run_session(
     )
     .await?;
     let connected_at = Instant::now();
-    let conn_span = tracing::info_span!(target: TARGET, "", v, ua = %info.version.user_agent);
+    let conn_span = tracing::info_span!(target: TARGET, "", v, sh=info.version.start_height, ua = %info.version.user_agent);
 
     let _ = status_tx
         .send(StatusUpdate::Good {
