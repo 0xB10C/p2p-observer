@@ -1,6 +1,6 @@
 use bip324::{Role, futures::Protocol};
 use common::{
-    anyhow::{Context, Result},
+    anyhow::{self, Context, Result},
     tokio::{
         self,
         io::BufReader,
@@ -257,40 +257,57 @@ impl Connection {
         }
     }
 
+    async fn tor_connect(&self) -> Result<TcpStream> {
+        if self.cfg.tor.enabled {
+            anyhow::bail!("attempted to connect to TorV3 address, but Tor is disabled");
+        }
+        // Connect via Tor SOCKS5 proxy
+        let socks_addr: std::net::SocketAddr = self
+            .cfg
+            .tor
+            .proxy_addr
+            .parse()
+            .context("invalid SOCKS5 proxy address")?;
+
+        // Extract the stored onion address
+        let target = if let NetAddr::TorV3(addr, port) = &self.peer.addr {
+            format!("{}:{}", addr, port)
+        } else {
+            unreachable!("is_tor is true, so this must be TorV3")
+        };
+
+        tracing::trace!(target: TARGET, proxy=%socks_addr, %target, "connecting via Tor SOCKS5");
+        let socks_stream = tokio_socks::tcp::socks5::Socks5Stream::connect(socks_addr, target)
+            .await
+            .context("Tor SOCKS5 connection")?;
+        let stream = socks_stream.into_inner();
+        configure_stream(&stream)?;
+        Ok(stream)
+    }
+
+    async fn ip_connect(&self) -> Result<TcpStream> {
+        let socket_addr = self
+            .peer
+            .addr
+            .to_socket_addr()
+            .context("not an IPv4 or IPv6 address")?;
+        let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
+            .await
+            .context("TCP connect timeout")?
+            .context("TCP connect")?;
+        configure_stream(&stream)?;
+        Ok(stream)
+    }
+
     /// Connect to a peer, using Tor SOCKS5 proxy if the peer is an onion address and Tor is enabled.
     async fn tcp_connect(&self) -> Result<TcpStream> {
-        if matches!(self.peer.addr, NetAddr::TorV3(_, _)) && self.cfg.tor.enabled {
-            // Connect via Tor SOCKS5 proxy
-            let socks_addr: std::net::SocketAddr = self
-                .cfg
-                .tor
-                .proxy_addr
-                .parse()
-                .context("invalid SOCKS5 proxy address")?;
-
-            // Extract the stored onion address
-            let target = if let NetAddr::TorV3(addr, port) = &self.peer.addr {
-                format!("{}:{}", addr, port)
-            } else {
-                unreachable!("is_tor is true, so this must be TorV3")
-            };
-
-            tracing::trace!(target: TARGET, proxy=%socks_addr, %target, "connecting via Tor SOCKS5");
-            let socks_stream = tokio_socks::tcp::socks5::Socks5Stream::connect(socks_addr, target)
-                .await
-                .context("Tor SOCKS5 connection")?;
-            let stream = socks_stream.into_inner();
-            configure_stream(&stream)?;
-            Ok(stream)
-        } else {
-            // Direct TCP connection
-            let socket_addr = self.peer.addr.to_socket_addr().context("no TCP address")?;
-            let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
-                .await
-                .context("TCP connect timeout")?
-                .context("TCP connect")?;
-            configure_stream(&stream)?;
-            Ok(stream)
+        match self.peer.addr {
+            NetAddr::TorV3(..) => self.tor_connect().await,
+            NetAddr::Ipv4(..) | NetAddr::Ipv6(..) => self.ip_connect().await,
+            _ => {
+                tracing::warn!(target: TARGET, addr=%self.peer.addr, "tcp_connect not implemented for");
+                anyhow::bail!("tcp_connect not implemented for address type")
+            }
         }
     }
 
