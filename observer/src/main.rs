@@ -95,6 +95,7 @@ async fn main() {
         event_tx,
         header_tree: header_tree.clone(),
         sync_headers: false,
+        tor: cfg.tor.clone(),
     };
 
     run_loop(&store, cfg, proto_cfg, status_tx, new_addr_tx).await;
@@ -128,6 +129,7 @@ async fn bootstrap_sync(
         event_tx: event_tx.clone(),
         header_tree: header_tree.clone(),
         sync_headers: true,
+        tor: cfg.tor.clone(),
     };
 
     loop {

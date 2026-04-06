@@ -29,6 +29,28 @@ pub struct Config {
 
     #[serde(default = "default_nats_url")]
     pub nats_url: String,
+
+    #[serde(default)]
+    pub tor: TorConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(crate = "common::serde")]
+pub struct TorConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_tor_proxy")]
+    pub proxy_addr: String,
+}
+
+impl Default for TorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            proxy_addr: default_tor_proxy(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,12 +152,17 @@ impl Default for Config {
             user_agent: default_user_agent(),
             bootstrap_addrs: Vec::new(),
             nats_url: default_nats_url(),
+            tor: TorConfig::default(),
         }
     }
 }
 
 fn default_nats_url() -> String {
     "nats://localhost:4222".to_owned()
+}
+
+fn default_tor_proxy() -> String {
+    "127.0.0.1:9050".to_owned()
 }
 
 impl Config {

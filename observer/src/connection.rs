@@ -17,7 +17,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::addresses::{BadReason, PeerAddr, StatusUpdate};
+use crate::addresses::{BadReason, NetAddr, PeerAddr, StatusUpdate};
 use crate::protocol::{Config, run_session};
 use crate::transport::{
     TransportV1Reader, TransportV1Writer, TransportV2Reader, TransportV2Writer,
@@ -257,6 +257,47 @@ impl Connection {
         }
     }
 
+    /// Connect to a peer, using Tor SOCKS5 proxy if the peer is an onion address and Tor is enabled.
+    async fn tcp_connect(&self) -> Result<TcpStream> {
+        let socket_addr = self.peer.addr.to_socket_addr().context("no TCP address")?;
+
+        // Check if this is a Tor onion address
+        let is_tor = matches!(self.peer.addr, NetAddr::TorV3(_, _));
+
+        if is_tor && self.cfg.tor.enabled {
+            // Connect via Tor SOCKS5 proxy
+            let socks_addr: std::net::SocketAddr = self
+                .cfg
+                .tor
+                .proxy_addr
+                .parse()
+                .context("invalid SOCKS5 proxy address")?;
+
+            // Extract the stored onion address
+            let target = if let NetAddr::TorV3(addr, port) = &self.peer.addr {
+                format!("{}:{}", addr, port)
+            } else {
+                unreachable!("is_tor is true, so this must be TorV3")
+            };
+
+            tracing::trace!(target: TARGET, proxy=%socks_addr, %target, "connecting via Tor SOCKS5");
+            let socks_stream = tokio_socks::tcp::socks5::Socks5Stream::connect(socks_addr, target)
+                .await
+                .context("Tor SOCKS5 connection")?;
+            let stream = socks_stream.into_inner();
+            configure_stream(&stream)?;
+            Ok(stream)
+        } else {
+            // Direct TCP connection
+            let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
+                .await
+                .context("TCP connect timeout")?
+                .context("TCP connect")?;
+            configure_stream(&stream)?;
+            Ok(stream)
+        }
+    }
+
     /// Attempts a v2 connection, falling back to v1 on failure.
     /// Once v2 has succeeded once, `skip_v1_fallback` is set and v1 is never tried again.
     pub async fn try_connect(&mut self) -> Result<Instant> {
@@ -288,12 +329,7 @@ impl Connection {
 
     async fn connect_v2(&self) -> Result<Instant> {
         tracing::trace!(target: TARGET, "connecting (v2) ...");
-        let socket_addr = self.peer.addr.to_socket_addr().context("no TCP address")?;
-        let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
-            .await
-            .context("TCP connect timeout")?
-            .context("TCP connect")?;
-        configure_stream(&stream)?;
+        let stream = self.tcp_connect().await?;
         let raw_fd = stream.as_raw_fd();
         let (reader, writer) = stream.into_split();
         let proto = Protocol::new(
@@ -322,13 +358,7 @@ impl Connection {
 
     async fn connect_v1(&self) -> Result<Instant> {
         tracing::trace!(target: TARGET, "connecting (v1) ...");
-        let socket_addr = self.peer.addr.to_socket_addr().context("no TCP address")?;
-        let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
-            .await
-            .context("TCP connect timeout")?
-            .context("TCP connect")?;
-
-        configure_stream(&stream)?;
+        let stream = self.tcp_connect().await?;
         let raw_fd = stream.as_raw_fd();
         let (reader, writer) = stream.into_split();
         run_session(
@@ -488,6 +518,7 @@ mod tests {
                 common::bitcoin::Network::Regtest,
             )))),
             sync_headers: false,
+            tor: crate::settings::TorConfig::default(),
         };
         let conn = Connection::new(
             cfg,
@@ -538,6 +569,7 @@ mod tests {
                 common::bitcoin::Network::Regtest,
             )))),
             sync_headers: false,
+            tor: crate::settings::TorConfig::default(),
         };
         let conn = Connection::new(
             cfg,
@@ -590,6 +622,7 @@ mod tests {
                 common::bitcoin::Network::Regtest,
             )))),
             sync_headers: false,
+            tor: crate::settings::TorConfig::default(),
         };
         tokio::spawn(
             Connection::new(
