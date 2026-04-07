@@ -15,7 +15,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-nats = "0.47"
 futures-util = "0.3"
-prost = "0.13"
+prost = "0.14"
 
 [build-dependencies]
 prost-build = "0.14"
