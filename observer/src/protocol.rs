@@ -1,12 +1,12 @@
 use common::{
     anyhow::Result,
-    bitcoin::BlockHash,
+    bitcoin::{BlockHash, bip152},
     p2p::{
         ProtocolVersion, ServiceFlags, address,
         address::{AddrV2Message, Address},
         message::NetworkMessage,
         message_blockdata::{GetHeadersMessage, Inventory},
-        message_compact_blocks::SendCmpct,
+        message_compact_blocks::{BlockTxn, GetBlockTxn, SendCmpct},
         message_network::{self, UserAgent},
     },
     tokio::{
@@ -292,7 +292,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             NetworkMessage::Pong(nonce) => self.handle_pong(nonce),
             NetworkMessage::Inv(inv) => self.handle_inv(inv.0).await?,
             NetworkMessage::Headers(headers) => self.handle_headers(headers.0).await?,
-            NetworkMessage::CmpctBlock(cmpct) => self.handle_cmpct_block(cmpct),
+            NetworkMessage::CmpctBlock(cmpct) => self.handle_cmpct_block(cmpct).await?,
             NetworkMessage::Addr(payload) => self.handle_addr(&payload.0),
             NetworkMessage::AddrV2(payload) => self.handle_addrv2(&payload.0),
             NetworkMessage::SendCmpct(sc) => self.handle_send_cmpct(sc),
@@ -300,6 +300,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             NetworkMessage::GetHeaders(msg) => self.handle_get_headers(msg).await?,
             NetworkMessage::SendHeaders => self.handle_send_headers(),
             NetworkMessage::SendAddrV2 => self.handle_send_addr_v2(),
+            NetworkMessage::BlockTxn(msg) => self.handle_blocktxn(msg).await,
             other => tracing::trace!(target: TARGET, "received: {:?}", other),
         }
         Ok(())
@@ -368,10 +369,14 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         Ok(())
     }
 
-    fn handle_cmpct_block(&self, cmpct: common::p2p::message_compact_blocks::CmpctBlock) {
+    async fn handle_cmpct_block(
+        &mut self,
+        cmpct: common::p2p::message_compact_blocks::CmpctBlock,
+    ) -> Result<()> {
         let hash = cmpct.compact_block.header.block_hash();
-        tracing::info!(target: TARGET, %hash, "compact block");
         self.emit_block_announcement(hash, common::events::AnnouncementType::CompactBlock);
+        tracing::info!(target: TARGET, %hash, "compact block");
+        self.request_compact_block_coinbase(hash).await
     }
 
     fn emit_block_announcement(
@@ -393,6 +398,32 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                 tcp_stats,
             },
         ));
+    }
+
+    // Requesting a coinbase for a compact block (which we already know through the)
+    // prefilled transactions, allows us to see when the other side has finished
+    // validation of the compact block. Due to the request round-trip-time, this
+    // is only interesting when expecting validation times of more than 100ms.
+    // This is the case for e.g.:
+    // https://delvingbitcoin.org/t/consensus-cleanup-demo-of-slow-blocks-on-signet/2367
+    async fn request_compact_block_coinbase(&mut self, hash: BlockHash) -> Result<()> {
+        tracing::trace!(target: TARGET, %hash, "requesting coinbase for cmpctblock");
+        self.writer
+            .send(NetworkMessage::GetBlockTxn(GetBlockTxn {
+                txs_request: bip152::BlockTransactionsRequest {
+                    block_hash: hash,
+                    indexes: vec![0],
+                },
+            }))
+            .await?;
+        self.emit_block_announcement(hash, common::events::AnnouncementType::Getblocktxn);
+        Ok(())
+    }
+
+    async fn handle_blocktxn(&mut self, blocktxn: BlockTxn) {
+        let hash = blocktxn.transactions.block_hash;
+        tracing::trace!(target: TARGET, %hash, txns=blocktxn.transactions.transactions.len(), "received blocktxn for cmptblock");
+        self.emit_block_announcement(hash, common::events::AnnouncementType::Blocktxn);
     }
 
     async fn handle_ping(&mut self, nonce: u64) -> Result<()> {

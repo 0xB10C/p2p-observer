@@ -44,4 +44,6 @@ enum AnnouncementType {
   INV = 1;
   HEADERS = 2;
   COMPACT_BLOCK = 3;
+  GETBLOCKTXN = 4;
+  BLOCKTXN = 5;
 }
