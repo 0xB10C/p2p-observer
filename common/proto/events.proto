@@ -16,6 +16,8 @@ message PeerEvent {
 
 message PingRtt {
   uint64 rtt_ms = 1;
+  // OS-level TCP statistics sampled at the ping interval.
+  optional TcpStats tcp_stats = 2;
 }
 
 message TcpStats {

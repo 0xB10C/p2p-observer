@@ -32,8 +32,18 @@ async fn main() {
 fn print_event(subject: &str, event: &PeerEvent) {
     match &event.event {
         Some(peer_event::Event::PingRtt(ping)) => {
+            let tcp = ping
+                .tcp_stats
+                .as_ref()
+                .map(|t| {
+                    format!(
+                        " srtt={}µs rttvar={}µs retrans={} cwnd={}",
+                        t.srtt_us, t.rttvar_us, t.total_retrans, t.snd_cwnd
+                    )
+                })
+                .unwrap_or_default();
             println!(
-                "[{subject}] conn={} peer={} ua={:?} transport=v{} rtt={}ms ts={}",
+                "[{subject}] conn={} peer={} ua={:?} transport=v{} rtt={}ms{tcp} ts={}",
                 event.connection_id,
                 event.peer_addr,
                 event.user_agent,

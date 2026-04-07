@@ -446,8 +446,14 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         let rtt_ms = unix_ms().saturating_sub(nonce);
         tracing::debug!(target: TARGET, rtt_ms, "pong");
         self.stats.record_rtt(rtt_ms as u32);
+        let tcp_stats = self.stats.tcp.as_ref().map(|t| common::events::TcpStats {
+            srtt_us: u64::from(t.srtt_us),
+            rttvar_us: u64::from(t.rttvar_us),
+            total_retrans: u64::from(t.total_retrans),
+            snd_cwnd: u64::from(t.snd_cwnd),
+        });
         self.emit_event(common::events::peer_event::Event::PingRtt(
-            common::events::PingRtt { rtt_ms },
+            common::events::PingRtt { rtt_ms, tcp_stats },
         ));
     }
 
