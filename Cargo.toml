@@ -6,4 +6,5 @@ members = [
   "observer",
   "tools/csv",
   "tools/logger",
+  "tools/slot-probe",
 ]

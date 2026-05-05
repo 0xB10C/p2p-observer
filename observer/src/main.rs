@@ -9,15 +9,9 @@ pub(crate) const TARGET_PUBLISHER: &str = "publisher";
 pub(crate) const TARGET_RPC: &str = "rpc";
 pub(crate) const TARGET_HEADERTREE: &str = "headertree";
 
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-/// Number of connection tasks currently running (connecting, retrying, or in message loop).
+/// Number of connection tasks currently running.
 pub(crate) static ACTIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
-/// Number of connections that have completed the handshake and are in the main message loop.
+/// Number of connections in the main message loop.
 pub(crate) static IN_MESSAGE_LOOP: AtomicUsize = AtomicUsize::new(0);
 
 mod addresses;
@@ -30,6 +24,12 @@ mod rpc;
 mod settings;
 mod tcp;
 mod transport;
+
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Result of probing a single peer for inbound connection slots.
 struct ProbeResult {
