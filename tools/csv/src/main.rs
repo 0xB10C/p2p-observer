@@ -1,7 +1,7 @@
 use common::{
     anyhow::Result,
     async_nats,
-    events::{BlockAnnouncement, PeerEvent, PingRtt, peer_event},
+    events::{BlockAnnouncement, InboundSlotCount, PeerEvent, PingRtt, peer_event},
     futures_util::StreamExt,
     prost::Message,
     tokio, tracing, tracing_subscriber,
@@ -25,6 +25,7 @@ const PING_SPECIFIC_HEADER: &str = "rtt_ms";
 struct CsvLogger {
     block_writer: BufWriter<File>,
     ping_writer: BufWriter<File>,
+    slot_writer: BufWriter<File>,
 }
 
 impl CsvLogger {
@@ -36,9 +37,11 @@ impl CsvLogger {
 
         let block_filename = format!("block_announcements_{}.csv", timestamp);
         let ping_filename = format!("ping_rtt_{}.csv", timestamp);
+        let slot_filename = format!("inbound_slots_{}.csv", timestamp);
 
         let mut block_writer = BufWriter::new(File::create(&block_filename)?);
         let mut ping_writer = BufWriter::new(File::create(&ping_filename)?);
+        let mut slot_writer = BufWriter::new(File::create(&slot_filename)?);
 
         // Write headers
         writeln!(
@@ -51,15 +54,21 @@ impl CsvLogger {
             "{},{},{}",
             COMMON_HEADER, PING_SPECIFIC_HEADER, TCP_STATS_HEADER
         )?;
+        writeln!(
+            slot_writer,
+            "peer_addr,max_concurrent_connections,total_opened,timestamp_ms"
+        )?;
 
         block_writer.flush()?;
         ping_writer.flush()?;
+        slot_writer.flush()?;
 
-        tracing::info!(target: TARGET, block_file = %block_filename, ping_file = %ping_filename, "created CSV files");
+        tracing::info!(target: TARGET, block_file = %block_filename, ping_file = %ping_filename, slot_file = %slot_filename, "created CSV files");
 
         Ok(Self {
             block_writer,
             ping_writer,
+            slot_writer,
         })
     }
 
@@ -150,6 +159,24 @@ impl CsvLogger {
         self.ping_writer.flush()?;
         Ok(())
     }
+
+    fn write_inbound_slot_count(
+        &mut self,
+        event: &PeerEvent,
+        slot: &InboundSlotCount,
+    ) -> Result<()> {
+        let peer_addr = escape_csv(&event.peer_addr);
+        writeln!(
+            self.slot_writer,
+            "{},{},{},{}",
+            peer_addr,
+            slot.max_concurrent_connections,
+            slot.total_opened,
+            event.timestamp_ms,
+        )?;
+        self.slot_writer.flush()?;
+        Ok(())
+    }
 }
 
 fn escape_csv(s: &str) -> String {
@@ -192,6 +219,11 @@ async fn main() -> Result<()> {
                 Some(peer_event::Event::BlockAnnouncement(blk)) => {
                     if let Err(e) = logger.write_block_announcement(&event, blk) {
                         tracing::error!(target: TARGET, error = %e, "failed to write block announcement");
+                    }
+                }
+                Some(peer_event::Event::InboundSlotCount(slot)) => {
+                    if let Err(e) = logger.write_inbound_slot_count(&event, slot) {
+                        tracing::error!(target: TARGET, error = %e, "failed to write inbound slot count");
                     }
                 }
                 None => {}

@@ -20,7 +20,7 @@ use common::{
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::RawFd;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +54,10 @@ pub(crate) struct Config {
     pub(crate) header_tree: Arc<RwLock<HeaderTree>>,
     pub(crate) sync_headers: bool,
     pub(crate) networks: crate::settings::NetworksConfig,
+    /// When set, run_session increments this after handshake and decrements on exit.
+    pub(crate) concurrent_gauge: Option<Arc<AtomicUsize>>,
+    /// When set, updated via fetch_max after each concurrent_gauge increment.
+    pub(crate) peak_gauge: Option<Arc<AtomicUsize>>,
 }
 
 /// We want get high-bandwidth compact block relay (BIP152).
@@ -159,6 +163,14 @@ pub(crate) async fn run_session(
         .await;
     tracing::trace!(target: TARGET, "connection established");
 
+    // Track concurrent connections for slot probing.
+    if let Some(gauge) = &cfg.concurrent_gauge {
+        let current = gauge.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(peak) = &cfg.peak_gauge {
+            peak.fetch_max(current, Ordering::Relaxed);
+        }
+    }
+
     let mut conn = Connection {
         reader,
         writer,
@@ -179,6 +191,11 @@ pub(crate) async fn run_session(
         tracing::debug!(target: TARGET, "connection error: {e}");
     }
     crate::IN_MESSAGE_LOOP.fetch_sub(1, Ordering::Relaxed);
+
+    if let Some(gauge) = &cfg.concurrent_gauge {
+        gauge.fetch_sub(1, Ordering::Relaxed);
+    }
+
     Ok(connected_at)
 }
 

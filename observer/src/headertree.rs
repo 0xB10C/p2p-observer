@@ -957,6 +957,8 @@ mod tests {
             header_tree: header_tree.clone(),
             sync_headers,
             networks: crate::settings::NetworksConfig::default(),
+            concurrent_gauge: None,
+            peak_gauge: None,
         };
 
         let make_peer = |port: u16| {

@@ -74,6 +74,15 @@ fn print_event(subject: &str, event: &PeerEvent) {
                 event.connection_id, event.peer_addr, blk.block_hash, atype, event.timestamp_ms,
             );
         }
+        Some(peer_event::Event::InboundSlotCount(slot)) => {
+            println!(
+                "[{subject}] peer={} max_concurrent={} total_opened={} ts={}",
+                event.peer_addr,
+                slot.max_concurrent_connections,
+                slot.total_opened,
+                event.timestamp_ms,
+            );
+        }
         None => {
             println!("[{subject}] unknown event from {}", event.peer_addr);
         }

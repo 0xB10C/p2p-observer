@@ -38,7 +38,7 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 8;
 
 /// Timeout for TCP connection attempts. The OS default (several minutes with SYN retransmits)
 /// is far too long when managing many connections.
-const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A connection shorter than this is considered a likely eviction (peer is full).
 const EVICTION_THRESHOLD: Duration = Duration::from_secs(31);
@@ -537,6 +537,8 @@ mod tests {
             )))),
             sync_headers: false,
             networks: crate::settings::NetworksConfig::default(),
+            concurrent_gauge: None,
+            peak_gauge: None,
         };
         let conn = Connection::new(
             cfg,
@@ -588,6 +590,8 @@ mod tests {
             )))),
             sync_headers: false,
             networks: crate::settings::NetworksConfig::default(),
+            concurrent_gauge: None,
+            peak_gauge: None,
         };
         let conn = Connection::new(
             cfg,
@@ -641,6 +645,8 @@ mod tests {
             )))),
             sync_headers: false,
             networks: crate::settings::NetworksConfig::default(),
+            concurrent_gauge: None,
+            peak_gauge: None,
         };
         tokio::spawn(
             Connection::new(

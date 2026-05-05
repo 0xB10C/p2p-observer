@@ -11,6 +11,7 @@ message PeerEvent {
   oneof event {
     PingRtt ping_rtt = 6;
     BlockAnnouncement block_announcement = 7;
+    InboundSlotCount inbound_slot_count = 8;
   }
 }
 
@@ -39,6 +40,13 @@ message BlockAnnouncement {
   optional uint64 rtt_ms = 3;
   // OS-level TCP statistics sampled at the last ping interval.
   optional TcpStats tcp_stats = 4;
+}
+
+message InboundSlotCount {
+  // Peak number of simultaneous connections we held open to this peer.
+  uint32 max_concurrent_connections = 1;
+  // Total number of connections we successfully opened (handshake completed).
+  uint32 total_opened = 2;
 }
 
 enum AnnouncementType {
