@@ -1,5 +1,5 @@
 use common::{
-    anyhow::Result,
+    anyhow::{Context, Result},
     bitcoin::{BlockHash, bip152},
     p2p::{
         ProtocolVersion, ServiceFlags, address,
@@ -12,7 +12,7 @@ use common::{
     tokio::{
         self,
         sync::mpsc,
-        time::{Duration, interval},
+        time::{Duration, interval, timeout},
     },
     tracing,
     tracing::Instrument,
@@ -44,6 +44,19 @@ impl std::fmt::Display for SyncComplete {
 impl std::error::Error for SyncComplete {}
 
 pub(crate) const USER_AGENT: &str = "/p2p-observer:0.1.0/";
+
+/// Maximum time allowed for the version handshake once the transport is up.
+///
+/// Without this a peer that completes the TCP (and BIP324) handshake and then
+/// simply never sends a version message holds the connection task forever:
+/// TCP_USER_TIMEOUT only aborts a connection with unacknowledged data, and such
+/// a peer is acknowledging everything we send. The task would never finish, so
+/// its slot in the active-address set is never released either.
+#[cfg(not(test))]
+const VERSION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Shortened under test so the silent-peer case doesn't take half a minute.
+#[cfg(test)]
+const VERSION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub(crate) struct Config {
@@ -156,13 +169,17 @@ pub(crate) async fn run_session(
     } = session;
 
     let (_, tip_height) = &cfg.header_tree.read().unwrap().tip();
-    let info = version_handshake(
-        &mut reader,
-        &mut writer,
-        &cfg.user_agent,
-        *tip_height as i32,
+    let info = timeout(
+        VERSION_HANDSHAKE_TIMEOUT,
+        version_handshake(
+            &mut reader,
+            &mut writer,
+            &cfg.user_agent,
+            *tip_height as i32,
+        ),
     )
-    .await?;
+    .await
+    .context("version handshake timed out")??;
     let connected_at = Instant::now();
     let conn_span = tracing::info_span!(target: TARGET, "", v = transport_version, sh=info.version.start_height, ua = %info.version.user_agent);
 
