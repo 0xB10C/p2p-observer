@@ -126,6 +126,9 @@ impl Entry {
 pub struct Gossiped {
     pub addr: PeerAddr,
     pub services: u64,
+    /// The nTime the peer announced, exactly as announced. Carried for the
+    /// published event only: no decision here reads a timestamp a peer chose.
+    pub ntime: u32,
 }
 
 /// An address to dial, with what we know about its transport.
@@ -509,7 +512,7 @@ impl Book {
         match outcome {
             // Our own fault: no route, proxy down. Says nothing about the
             // peer, so no counter moves and the class does not change.
-            Outcome::OurFault => {}
+            Outcome::OurFault(_) => {}
             Outcome::Disconnected { .. } => {
                 entry.last_attempt_failed = false;
                 entry.failures = 0;
@@ -693,7 +696,7 @@ impl Book {
 mod tests {
     use super::*;
     use crate::addrman::banlist::BanEntry;
-    use crate::addrman::policy::Reason;
+    use crate::addrman::policy::{OurFault, Reason};
 
     const DAY: u32 = 24 * 60 * 60;
     const NOW: u32 = 1_000_000;
@@ -770,7 +773,7 @@ mod tests {
         }
 
         // Once the attempt ends it becomes eligible again.
-        t.record_ended(addr, NOW, Outcome::OurFault);
+        t.record_ended(addr, NOW, Outcome::OurFault(OurFault::NetworkUnreachable));
         release_all(&mut t);
         assert_eq!(t.pick(NOW, 10, &EnabledNets::all(), &bl).len(), 1);
     }
@@ -861,6 +864,7 @@ mod tests {
                 .map(|i| Gossiped {
                     addr: PeerAddr::Ipv4([100, chunk, (i / 256) as u8, (i % 256) as u8], 8333),
                     services: 0,
+                    ntime: NOW,
                 })
                 .collect();
             t.ingest(NOW, &batch, &bl);
@@ -890,6 +894,7 @@ mod tests {
                     8333,
                 ),
                 services: 0,
+                ntime: NOW,
             })
             .collect();
         t.ingest(NOW, &batch, &bl);
@@ -919,24 +924,29 @@ mod tests {
             Gossiped {
                 addr: ip(127, 0, 0, 1),
                 services: 0,
+                ntime: NOW,
             },
             Gossiped {
                 addr: ip(10, 0, 0, 1),
                 services: 0,
+                ntime: NOW,
             },
             Gossiped {
                 addr: PeerAddr::Ipv4([1, 2, 3, 4], 0),
                 services: 0,
+                ntime: NOW,
             },
             // Banned.
             Gossiped {
                 addr: ip(8, 8, 8, 8),
                 services: 0,
+                ntime: NOW,
             },
             // The one good one.
             Gossiped {
                 addr: ip(1, 2, 3, 4),
                 services: 0,
+                ntime: NOW,
             },
         ];
         assert_eq!(t.ingest(NOW, &batch, &bl), 1);
@@ -956,6 +966,7 @@ mod tests {
             &[Gossiped {
                 addr,
                 services: 0b1,
+                ntime: NOW - 500,
             }],
             &bl,
         );
@@ -967,6 +978,7 @@ mod tests {
             &[Gossiped {
                 addr,
                 services: 0b1001,
+                ntime: NOW,
             }],
             &bl,
         );
@@ -984,7 +996,15 @@ mod tests {
         let addr = ip(1, 2, 3, 4);
         const P2P_V2: u64 = 1 << 11;
 
-        t.ingest(NOW, &[Gossiped { addr, services: 0 }], &bl);
+        t.ingest(
+            NOW,
+            &[Gossiped {
+                addr,
+                services: 0,
+                ntime: NOW,
+            }],
+            &bl,
+        );
         t.record_v1_only(addr);
         assert_eq!(t.entry(&addr).unwrap().transport, TransportHint::V1Only);
 
@@ -994,6 +1014,7 @@ mod tests {
             &[Gossiped {
                 addr,
                 services: P2P_V2,
+                ntime: NOW,
             }],
             &bl,
         );
@@ -1032,7 +1053,7 @@ mod tests {
 
         // A later failure is a failed attempt, not evidence the peer dropped
         // v2 support.
-        t.record_ended(addr, NOW, Outcome::Failed(Reason::TimedOut));
+        t.record_ended(addr, NOW, Outcome::Failed(Reason::TcpConnectTimeout));
         assert_eq!(t.entry(&addr).unwrap().transport, TransportHint::V2);
         t.record_v1_only(addr);
         assert_eq!(t.entry(&addr).unwrap().transport, TransportHint::V2);
@@ -1068,7 +1089,11 @@ mod tests {
         // network was unavailable.
         for i in 0..5 {
             t.record_dialing(addr, NOW + i);
-            t.record_ended(addr, NOW + i, Outcome::OurFault);
+            t.record_ended(
+                addr,
+                NOW + i,
+                Outcome::OurFault(OurFault::NetworkUnreachable),
+            );
         }
         let e = t.entry(&addr).unwrap();
         assert_eq!(e.failures, 0);
@@ -1117,7 +1142,7 @@ mod tests {
 
         // Fifth failure on an address that has never once connected: dropped
         // regardless of how recently it was announced.
-        t.record_ended(addr, NOW, Outcome::Failed(Reason::TimedOut));
+        t.record_ended(addr, NOW, Outcome::Failed(Reason::TcpConnectTimeout));
         assert!(t.entry(&addr).is_none(), "entry should have been forgotten");
         assert!(t.active.is_empty(), "active slot should have been released");
     }
@@ -1129,7 +1154,7 @@ mod tests {
         t.insert_manual(NOW, &[addr]);
 
         for _ in 0..20 {
-            t.record_ended(addr, NOW, Outcome::Failed(Reason::TimedOut));
+            t.record_ended(addr, NOW, Outcome::Failed(Reason::TcpConnectTimeout));
         }
         let e = t.entry(&addr).expect("manual entry was forgotten");
         // And it keeps a short retry rather than backing off to days.
