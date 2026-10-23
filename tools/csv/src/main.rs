@@ -72,7 +72,12 @@ impl CsvLogger {
         let timestamp_ms = event.timestamp_ms;
         let peer_addr = escape_csv(&event.peer_addr);
         let user_agent = escape_csv(&event.user_agent);
-        let transport_version = event.transport_version;
+        // Empty rather than 0 when absent, matching how the other optional
+        // columns are written. 0 is not a transport version.
+        let transport_version = event
+            .transport_version
+            .map(|v| v.to_string())
+            .unwrap_or_default();
         let block_hash = &blk.block_hash;
         let announcement_type = blk.announcement_type;
 
@@ -117,7 +122,12 @@ impl CsvLogger {
         let timestamp_ms = event.timestamp_ms;
         let peer_addr = escape_csv(&event.peer_addr);
         let user_agent = escape_csv(&event.user_agent);
-        let transport_version = event.transport_version;
+        // Empty rather than 0 when absent, matching how the other optional
+        // columns are written. 0 is not a transport version.
+        let transport_version = event
+            .transport_version
+            .map(|v| v.to_string())
+            .unwrap_or_default();
         let rtt_ms = ping.rtt_ms;
 
         // Optional tcp_stats (flattened)
@@ -194,6 +204,11 @@ async fn main() -> Result<()> {
                         tracing::error!(target: TARGET, error = %e, "failed to write block announcement");
                     }
                 }
+                // This tool logs block announcements and ping RTTs. The
+                // address and attempt events are for a separate archiver;
+                // ignoring them here keeps the two CSV schemas stable.
+                Some(peer_event::Event::AddressAnnouncement(_))
+                | Some(peer_event::Event::ConnectionResult(_)) => {}
                 None => {}
             },
             Err(e) => {

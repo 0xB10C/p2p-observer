@@ -531,6 +531,7 @@ mod tests {
         Gossiped {
             addr: PeerAddr::Ipv4([1, 2, 3, last], 8333),
             services: 0,
+            ntime: NOW,
         }
     }
 
@@ -571,7 +572,7 @@ mod tests {
             m.apply(
                 Lifecycle::Ended {
                     addr: dial.addr,
-                    outcome: Outcome::OurFault,
+                    outcome: Outcome::OurFault(policy::OurFault::NetworkUnreachable),
                 },
                 NOW,
             );
@@ -658,14 +659,17 @@ mod tests {
                 Gossiped {
                     addr: PeerAddr::parse_ip("100.0.0.1:8333").unwrap(),
                     services: 0,
+                    ntime: NOW,
                 },
                 Gossiped {
                     addr: PeerAddr::parse_ip("100.9.9.9:8333").unwrap(),
                     services: 0,
+                    ntime: NOW,
                 },
                 Gossiped {
                     addr: PeerAddr::parse_ip("1.2.3.4:8333").unwrap(),
                     services: 0,
+                    ntime: NOW,
                 },
             ],
         );
@@ -696,6 +700,7 @@ mod tests {
                 &[Gossiped {
                     addr: PeerAddr::parse_ip("100.0.0.1:8333").unwrap(),
                     services: 0,
+                    ntime: NOW
                 }]
             ),
             0
@@ -817,7 +822,11 @@ mod tests {
         let addr = PeerAddr::parse_ip("1.2.3.4:8333").unwrap();
         book.ingest(
             NOW,
-            &[Gossiped { addr, services: 0 }],
+            &[Gossiped {
+                addr,
+                services: 0,
+                ntime: NOW,
+            }],
             &Banlist::from_entries(vec![]),
         );
         book.record_dialing(addr, NOW);

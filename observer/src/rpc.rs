@@ -296,10 +296,12 @@ mod tests {
                 Gossiped {
                     addr: PeerAddr::parse_ip("1.2.3.4:8333").unwrap(),
                     services: 9,
+                    ntime: 900,
                 },
                 Gossiped {
                     addr: PeerAddr::parse_ip("5.6.7.8:8333").unwrap(),
                     services: 0,
+                    ntime: 900,
                 },
             ],
         );

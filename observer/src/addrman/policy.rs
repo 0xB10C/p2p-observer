@@ -44,9 +44,23 @@ const MANUAL_RETRY_SECS: u32 = 60;
 /// Short, because we want to be connected to this peer.
 const STABLE_RECONNECT_SECS: u32 = 5;
 
-/// Wait after our own side failed (no route, proxy down). Not the address's
-/// fault, so it is a short pause rather than a backoff.
-const OUR_FAULT_SECS: u32 = 30;
+// Wait after our own side could not make the attempt at all. None of these is
+// a backoff: the address did nothing wrong and its counters do not move. They
+// differ only in how long the obstacle is likely to last, which is the one
+// thing we do know.
+
+/// The Tor proxy is not answering. Local to this host and often a restart away
+/// from working, so keep checking.
+const PROXY_UNREACHABLE_SECS: u32 = 30;
+/// No route from here to that network. Nothing about that changes until the
+/// host's own connectivity does, and an observer with no IPv6 route holds
+/// thousands of IPv6 addresses — retrying each one every 30 seconds would
+/// spend the dial budget on attempts that cannot succeed.
+const NETWORK_UNREACHABLE_SECS: u32 = 60 * 60;
+/// Configured not to dial this network. The pick already filters these out, so
+/// an address only reaches here if the configuration changed under an attempt
+/// that was already in flight.
+const NETWORK_DISABLED_SECS: u32 = 24 * 60 * 60;
 
 // Each pair below is one exponential backoff: `BASE` is the delay after the
 // first occurrence, and every consecutive one multiplies it until it is
@@ -103,14 +117,34 @@ pub enum Origin {
 }
 
 /// Why a dial attempt did not produce a session.
+///
+/// Timeouts are split by where they fired: a peer that never answers the TCP
+/// connect and one that completes the transport handshake and then goes silent
+/// are different behaviours, and only the second is worth being surprised by.
+/// Nothing in this module branches on the reason — it is carried so the
+/// attempt can be reported faithfully.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
     ConnectionRefused,
     HostUnreachable,
-    TimedOut,
+    TcpConnectTimeout,
+    V2TransportTimeout,
+    VersionHandshakeTimeout,
+    V2TransportHandshake,
+    VersionHandshake,
     UnexpectedEof,
-    HandshakeFailed,
     Other,
+}
+
+/// Why we could not make an attempt at all. Never counted against the address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OurFault {
+    /// No route from here to that network.
+    NetworkUnreachable,
+    /// The Tor SOCKS5 proxy is not answering.
+    ProxyUnreachable,
+    /// Configured not to dial this network, or no transport for it.
+    NetworkDisabled,
 }
 
 /// What became of a dial attempt.
@@ -123,7 +157,7 @@ pub enum Outcome {
     /// We could not even make the attempt: no route to that network, the Tor
     /// proxy is down, and so on. Never counted against the address, because it
     /// says nothing about the peer.
-    OurFault,
+    OurFault(OurFault),
 }
 
 impl Outcome {
@@ -190,7 +224,11 @@ pub fn retry_delay_secs(
     }
 
     match outcome {
-        Outcome::OurFault => OUR_FAULT_SECS,
+        Outcome::OurFault(reason) => match reason {
+            OurFault::ProxyUnreachable => PROXY_UNREACHABLE_SECS,
+            OurFault::NetworkUnreachable => NETWORK_UNREACHABLE_SECS,
+            OurFault::NetworkDisabled => NETWORK_DISABLED_SECS,
+        },
 
         Outcome::Disconnected { uptime_secs } => {
             if *uptime_secs >= SHORT_SESSION_SECS {
@@ -269,7 +307,7 @@ mod tests {
     const DAY: u32 = 24 * 60 * 60;
 
     fn failed() -> Outcome {
-        Outcome::Failed(Reason::TimedOut)
+        Outcome::Failed(Reason::TcpConnectTimeout)
     }
 
     #[test]
@@ -354,12 +392,21 @@ mod tests {
     }
 
     #[test]
-    fn test_our_fault_is_a_short_pause_and_not_a_failure() {
+    fn test_our_fault_waits_on_the_obstacle_and_is_not_a_failure() {
+        let delay =
+            |reason| retry_delay_secs(&Outcome::OurFault(reason), Origin::Gossip, false, 0, 0);
+        // A missing route lasts until the host is reconfigured; a dead proxy
+        // may be back in a moment.
+        assert_eq!(delay(OurFault::ProxyUnreachable), PROXY_UNREACHABLE_SECS);
         assert_eq!(
-            retry_delay_secs(&Outcome::OurFault, Origin::Gossip, false, 0, 0),
-            OUR_FAULT_SECS
+            delay(OurFault::NetworkUnreachable),
+            NETWORK_UNREACHABLE_SECS
         );
-        assert!(!Outcome::OurFault.counts_as_failure());
+        assert_eq!(delay(OurFault::NetworkDisabled), NETWORK_DISABLED_SECS);
+        assert!(delay(OurFault::NetworkUnreachable) > delay(OurFault::ProxyUnreachable));
+
+        // Whichever it was, it says nothing about the address.
+        assert!(!Outcome::OurFault(OurFault::NetworkUnreachable).counts_as_failure());
         assert!(failed().counts_as_failure());
     }
 
@@ -368,7 +415,7 @@ mod tests {
         // However bad its history, and whatever the outcome.
         for outcome in [
             failed(),
-            Outcome::OurFault,
+            Outcome::OurFault(OurFault::NetworkUnreachable),
             Outcome::Disconnected { uptime_secs: 0 },
         ] {
             assert_eq!(

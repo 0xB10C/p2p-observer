@@ -1,5 +1,5 @@
 use common::{
-    anyhow::{Context, Result},
+    anyhow::Result,
     bitcoin::{BlockHash, bip152},
     p2p::{
         ProtocolVersion, ServiceFlags, address,
@@ -183,7 +183,8 @@ pub(crate) async fn run_session(
         ),
     )
     .await
-    .context("version handshake timed out")??;
+    .map_err(|_| crate::connection::Stage::VersionHandshakeTimeout)?
+    .map_err(|e| e.context(crate::connection::Stage::VersionHandshake))?;
     let connected_at = Instant::now();
     let conn_span = tracing::info_span!(target: TARGET, "", v = transport_version, sh=info.version.start_height, ua = %info.version.user_agent);
 
@@ -474,7 +475,8 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             timestamp_ms: unix_ms(),
             peer_addr: self.addr.to_string(),
             user_agent: self.handshake_info.version.user_agent.to_string(),
-            transport_version: self.transport_version as u32,
+            // Always known here: nothing is emitted before the handshake.
+            transport_version: Some(self.transport_version as u32),
             connection_id: self.connection_id,
             event: Some(event),
         });
@@ -496,16 +498,19 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     }
 
     fn handle_addr(&mut self, addrs: &[(u32, Address)]) {
+        // The announced nTime goes on the published event and no further: see
+        // `Gossiped::ntime`.
         let parsed: Vec<Gossiped> = addrs
             .iter()
-            .filter_map(|(_, a)| {
+            .filter_map(|(ntime, a)| {
                 Some(Gossiped {
                     addr: PeerAddr::try_from(a).ok()?,
                     services: a.services.to_u64(),
+                    ntime: *ntime,
                 })
             })
             .collect();
-        self.offer_gossip("addr", addrs.len(), parsed);
+        self.offer_gossip(common::events::AddrMessage::Addr, addrs.len(), parsed);
     }
 
     fn handle_addrv2(&mut self, addrs: &[AddrV2Message]) {
@@ -515,10 +520,11 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                 Some(Gossiped {
                     addr: PeerAddr::try_from(m).ok()?,
                     services: m.services.to_u64(),
+                    ntime: m.time,
                 })
             })
             .collect();
-        self.offer_gossip("addrv2", addrs.len(), parsed);
+        self.offer_gossip(common::events::AddrMessage::Addrv2, addrs.len(), parsed);
     }
 
     /// Rate-limit gossiped addresses and hand the survivors to the manager.
@@ -526,11 +532,23 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     /// A token bucket per connection, as Bitcoin Core does it: this is the
     /// single most effective bound on how fast the book grows, because inventing
     /// addresses is free and sending them costs the peer almost nothing.
-    /// The reply to our own GETADDR is exempt -- we asked for it, and it is
-    /// capped by the protocol at 1000 entries anyway.
-    fn offer_gossip(&mut self, kind: &str, received: usize, mut parsed: Vec<Gossiped>) {
+    /// The reply to our own GETADDR is exempt -- we asked for it, and the
+    /// protocol caps it at 1000 entries anyway.
+    ///
+    /// The research event is emitted with everything that was announced, before
+    /// the rate limit takes effect, so a flood shows up in the archive instead
+    /// of vanishing. That is also what makes crawl bias measurable after the
+    /// fact: the source peer is on the event, so the share of the book owed to
+    /// any one peer can be worked out offline.
+    fn offer_gossip(
+        &mut self,
+        message: common::events::AddrMessage,
+        received: usize,
+        mut parsed: Vec<Gossiped>,
+    ) {
         let solicited = std::mem::take(&mut self.getaddr_outstanding);
 
+        let mut rate_limited = 0;
         if !solicited {
             let elapsed = self.addr_tokens_updated.elapsed().as_secs_f64();
             self.addr_tokens_updated = Instant::now();
@@ -539,18 +557,54 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
 
             let allowed = self.addr_tokens.floor().max(0.0) as usize;
             if parsed.len() > allowed {
+                rate_limited = parsed.len() - allowed;
+                // Rare, and says something: this peer is announcing faster
+                // than we are willing to learn.
+                // `kind`, not `message`: tracing reserves that field name for
+                // the log text itself.
                 tracing::debug!(target: TARGET,
-                    kind, received, dropped = parsed.len() - allowed,
+                    kind = ?message, received, rate_limited,
                     "rate-limiting gossiped addresses"
                 );
-                parsed.truncate(allowed);
             }
-            self.addr_tokens -= parsed.len() as f64;
+            // Spend a token per address we keep, not per address announced:
+            // the bucket is about how fast we are willing to learn.
+            self.addr_tokens -= (parsed.len() - rate_limited) as f64;
         }
 
-        tracing::debug!(target: TARGET,
-            kind, received, accepted = parsed.len(), solicited, "gossip"
-        );
+        self.emit_event(common::events::peer_event::Event::AddressAnnouncement(
+            common::events::AddressAnnouncement {
+                message: message.into(),
+                // Still pre-truncation here, so this is the parse shortfall
+                // rather than anything the rate limit did.
+                unparsed: (received - parsed.len()) as u32,
+                addresses: parsed
+                    .iter()
+                    .map(|g| common::events::GossipedAddress {
+                        addr: g.addr.to_string(),
+                        services: g.services,
+                        ntime: g.ntime,
+                    })
+                    .collect(),
+            },
+        ));
+
+        // Entries we could not turn into an address — an AddrV2 type we do not
+        // understand, say. Rare, and the only part of the parse worth a line:
+        // the usual case, where everything parsed, says nothing by definition.
+        //
+        // There is deliberately no line for the message itself. Every addr
+        // message would produce one, and the event emitted just above already
+        // carries the counts, the flags and the addresses, so anyone wanting
+        // per-message detail can read the stream instead.
+        if parsed.len() < received {
+            tracing::debug!(target: TARGET,
+                kind = ?message, received, unparsed = received - parsed.len(),
+                "dropped gossiped addresses we could not parse"
+            );
+        }
+
+        parsed.truncate(parsed.len() - rate_limited);
         if !parsed.is_empty() {
             self.addrman.gossip(parsed);
         }
