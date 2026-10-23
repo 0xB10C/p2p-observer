@@ -9,5 +9,7 @@
 // have no callers and every item in them looks unused.
 #![allow(dead_code)]
 
+pub(crate) mod banlist;
+pub(crate) mod book;
 pub(crate) mod peer_addr;
 pub(crate) mod policy;

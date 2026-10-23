@@ -151,13 +151,21 @@ pub enum Class {
 }
 
 /// Classify an address from its history. `last_success` of 0 means never.
-pub fn classify(attempted: bool, last_success: u32, last_attempt_failed: bool) -> Class {
-    match (attempted, last_success > 0) {
-        (false, _) => Class::Unknown,
-        (true, false) => Class::Bad,
-        (true, true) if last_attempt_failed => Class::WasGood,
-        (true, true) => Class::Good,
+///
+/// `tried` means we hold at least one real *result* for this address, not that
+/// a dial was started. An address handed to a dial task that has not reported
+/// back yet is still Unknown: nothing has failed, so calling it bad would be a
+/// lie, and it cannot be picked again while the attempt is in flight.
+pub fn classify(tried: bool, last_success: u32, last_attempt_failed: bool) -> Class {
+    // A success implies the address was tried, whatever `tried` says.
+    if last_success > 0 {
+        return if last_attempt_failed {
+            Class::WasGood
+        } else {
+            Class::Good
+        };
     }
+    if tried { Class::Bad } else { Class::Unknown }
 }
 
 /// Seconds to wait before dialling this address again, before jitter.
@@ -267,6 +275,10 @@ mod tests {
         assert_eq!(classify(true, 0, true), Class::Bad);
         assert_eq!(classify(true, 1000, false), Class::Good);
         assert_eq!(classify(true, 1000, true), Class::WasGood);
+        // A recorded success outranks the `tried` flag, so the two can never
+        // disagree into a nonsensical class.
+        assert_eq!(classify(false, 1000, false), Class::Good);
+        assert_eq!(classify(false, 1000, true), Class::WasGood);
     }
 
     #[test]
