@@ -933,10 +933,11 @@ mod tests {
     /// connections use real Connection instances sharing a single HeaderTree.
     #[tokio::test]
     async fn test_sync_and_serve_headers() {
-        use crate::addresses::{NetAddr, PeerAddr, StatusUpdate};
+        use crate::addrman;
+        use crate::addrman::key::AddrKey;
         use crate::connection;
         use crate::protocol;
-        use common::p2p::{Magic, ServiceFlags};
+        use common::p2p::Magic;
         use common::tokio::sync::mpsc;
         use std::sync::{Arc, RwLock};
 
@@ -945,9 +946,10 @@ mod tests {
         let exe = bitcoind::exe_path().unwrap();
 
         let header_tree = Arc::new(RwLock::new(regtest_tree()));
-        let (status_tx, _) = mpsc::channel::<StatusUpdate>(256);
-        let (new_addr_tx, _) = mpsc::channel::<Vec<PeerAddr>>(256);
         let (event_tx, _) = mpsc::channel(1024);
+        // Only the handle is needed: nothing in this test dials through the
+        // manager, and the lifecycle reports go nowhere.
+        let (addrman, _gossip_rx, _life_rx, _cmd_rx) = addrman::channels();
 
         let make_cfg = |sync_headers: bool| protocol::Config {
             magic: Magic::REGTEST,
@@ -959,12 +961,7 @@ mod tests {
             networks: crate::settings::NetworksConfig::default(),
         };
 
-        let make_peer = |port: u16| {
-            PeerAddr::new(
-                NetAddr::Ipv4("127.0.0.1".parse().unwrap(), port),
-                ServiceFlags::NONE,
-            )
-        };
+        let make_key = |port: u16| AddrKey::Ipv4([127, 0, 0, 1], port);
 
         let node_conf = |p2p| {
             let mut conf = bitcoind::Conf::default();
@@ -989,13 +986,9 @@ mod tests {
         // Sync from Node A
         println!("syncing headers from node A...");
         let port_a = node_a.params.p2p_socket.unwrap().port();
-        let mut conn = connection::Connection::new(
-            make_cfg(true),
-            status_tx.clone(),
-            new_addr_tx.clone(),
-            make_peer(port_a),
-        );
-        conn.try_connect().await.unwrap();
+        connection::bootstrap_attempt(make_key(port_a), &make_cfg(true), &addrman)
+            .await
+            .unwrap();
         println!("tree at height {}", header_tree.read().unwrap().tip().1);
         assert_eq!(header_tree.read().unwrap().tip().1, TOTAL as u32);
 
@@ -1003,10 +996,11 @@ mod tests {
         let node_b = bitcoind::Node::with_conf(&exe, &node_conf(bitcoind::P2P::Yes)).unwrap();
         let port_b = node_b.params.p2p_socket.unwrap().port();
         println!("serving headers to node B...");
-        let mut conn =
-            connection::Connection::new(make_cfg(false), status_tx, new_addr_tx, make_peer(port_b));
+        let serve_cfg = make_cfg(false);
+        let serve_addrman = addrman.clone();
         let handle = common::tokio::spawn(async move {
-            let _ = conn.try_connect().await;
+            let _ =
+                connection::bootstrap_attempt(make_key(port_b), &serve_cfg, &serve_addrman).await;
         });
 
         // Wait for Node B to sync

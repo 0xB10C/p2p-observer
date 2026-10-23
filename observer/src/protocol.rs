@@ -20,11 +20,10 @@ use common::{
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::RawFd;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::addresses::{NetAddr, PeerAddr, StatusUpdate};
+use crate::addrman::{Handle, key::AddrKey, policy, table::Gossiped};
 use crate::headertree::HeaderTree;
 use crate::transport::{TransportReader, TransportWriter};
 
@@ -121,13 +120,20 @@ pub(crate) struct HandshakeInfo {
 struct Connection<R: TransportReader, W: TransportWriter> {
     reader: R,
     writer: W,
-    new_addr_tx: mpsc::Sender<Vec<PeerAddr>>,
+    addrman: Handle,
+    /// Token bucket over gossiped addresses, so one peer cannot grow the table
+    /// as fast as it can send.
+    addr_tokens: f64,
+    addr_tokens_updated: Instant,
+    /// Set while we are expecting the reply to our own GETADDR. That reply is
+    /// solicited, so it is not charged against the bucket.
+    getaddr_outstanding: bool,
     handshake_info: HandshakeInfo,
     stats: ConnectionStats,
     /// Raw file descriptor of the TCP socket, used to query OS-level TCP stats.
     raw_fd: RawFd,
     ping_interval: Duration,
-    addr: NetAddr,
+    key: AddrKey,
     transport_version: u8,
     connection_id: u64,
     event_tx: mpsc::Sender<common::events::PeerEvent>,
@@ -141,12 +147,11 @@ pub(crate) struct Session<'a> {
     /// tracing span and on every emitted event.
     pub(crate) transport_version: u8,
     pub(crate) connection_id: u64,
-    pub(crate) addr: &'a NetAddr,
+    pub(crate) key: AddrKey,
     /// Raw file descriptor of the TCP socket, used to query OS-level TCP stats.
     pub(crate) raw_fd: RawFd,
     pub(crate) cfg: &'a Config,
-    pub(crate) status_tx: &'a mpsc::Sender<StatusUpdate>,
-    pub(crate) new_addr_tx: &'a mpsc::Sender<Vec<PeerAddr>>,
+    pub(crate) addrman: &'a Handle,
 }
 
 /// Run the Bitcoin P2P session on an already-established transport.
@@ -161,11 +166,10 @@ pub(crate) async fn run_session(
     let Session {
         transport_version,
         connection_id,
-        addr,
+        key,
         raw_fd,
         cfg,
-        status_tx,
-        new_addr_tx,
+        addrman,
     } = session;
 
     let (_, tip_height) = &cfg.header_tree.read().unwrap().tip();
@@ -183,35 +187,35 @@ pub(crate) async fn run_session(
     let connected_at = Instant::now();
     let conn_span = tracing::info_span!(target: TARGET, "", v = transport_version, sh=info.version.start_height, ua = %info.version.user_agent);
 
-    let _ = status_tx
-        .send(StatusUpdate::Good {
-            addr: addr.clone(),
-            at: unix_secs(),
-            services: Some(info.version.services),
-        })
-        .await;
+    // The peer's own version message is the most trustworthy source of its
+    // service flags, so hand them straight to the manager.
+    addrman.connected(key, info.version.services.to_u64(), transport_version);
     tracing::trace!(target: TARGET, "connection established");
 
     let mut conn = Connection {
         reader,
         writer,
-        new_addr_tx: new_addr_tx.clone(),
+        addrman: addrman.clone(),
+        addr_tokens: policy::ADDR_BURST,
+        addr_tokens_updated: Instant::now(),
+        getaddr_outstanding: false,
         handshake_info: info,
         stats: ConnectionStats::new(),
         raw_fd,
         ping_interval: cfg.ping_interval,
-        addr: addr.clone(),
+        key,
         transport_version,
         connection_id,
         event_tx: cfg.event_tx.clone(),
         header_tree: cfg.header_tree.clone(),
         sync_headers: cfg.sync_headers,
     };
-    crate::IN_MESSAGE_LOOP.fetch_add(1, Ordering::Relaxed);
+    // The session running out is not an error: the peer disconnected, which is
+    // an ordinary outcome. The caller turns the elapsed time into
+    // Outcome::Disconnected, and the manager decides when to try again.
     if let Err(e) = conn.run().instrument(conn_span).await {
         tracing::debug!(target: TARGET, "connection error: {e}");
     }
-    crate::IN_MESSAGE_LOOP.fetch_sub(1, Ordering::Relaxed);
     Ok(connected_at)
 }
 
@@ -289,6 +293,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             .await?;
 
         // request addresses from this peer
+        self.getaddr_outstanding = true;
         self.writer.send(NetworkMessage::GetAddr).await?;
 
         // request headers (BIP130) from this peer
@@ -467,7 +472,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     fn emit_event(&self, event: common::events::peer_event::Event) {
         let _ = self.event_tx.try_send(common::events::PeerEvent {
             timestamp_ms: unix_ms(),
-            peer_addr: self.addr.to_string(),
+            peer_addr: self.key.to_string(),
             user_agent: self.handshake_info.version.user_agent.to_string(),
             transport_version: self.transport_version as u32,
             connection_id: self.connection_id,
@@ -490,25 +495,67 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         ));
     }
 
-    fn handle_addr(&self, addrs: &[(u32, Address)]) {
-        let converted: Vec<PeerAddr> = addrs
+    fn handle_addr(&mut self, addrs: &[(u32, Address)]) {
+        // The gossiped timestamp is kept now; the old code discarded it.
+        let parsed: Vec<Gossiped> = addrs
             .iter()
-            .filter_map(|(_, a)| PeerAddr::try_from(a).ok())
+            .filter_map(|(ntime, a)| {
+                Some(Gossiped {
+                    key: AddrKey::try_from(a).ok()?,
+                    services: a.services.to_u64(),
+                    ntime: *ntime,
+                })
+            })
             .collect();
-        tracing::debug!(target: TARGET, received = addrs.len(), parsed = converted.len(), "addr");
-        if !converted.is_empty() {
-            let _ = self.new_addr_tx.try_send(converted);
-        }
+        self.offer_gossip("addr", addrs.len(), parsed);
     }
 
-    fn handle_addrv2(&self, addrs: &[AddrV2Message]) {
-        let converted: Vec<PeerAddr> = addrs
+    fn handle_addrv2(&mut self, addrs: &[AddrV2Message]) {
+        let parsed: Vec<Gossiped> = addrs
             .iter()
-            .filter_map(|m| PeerAddr::try_from(m).ok())
+            .filter_map(|m| {
+                Some(Gossiped {
+                    key: AddrKey::try_from(m).ok()?,
+                    services: m.services.to_u64(),
+                    ntime: m.time,
+                })
+            })
             .collect();
-        tracing::debug!(target: TARGET, received = addrs.len(), parsed = converted.len(), "addrv2");
-        if !converted.is_empty() {
-            let _ = self.new_addr_tx.try_send(converted);
+        self.offer_gossip("addrv2", addrs.len(), parsed);
+    }
+
+    /// Rate-limit gossiped addresses and hand the survivors to the manager.
+    ///
+    /// A token bucket per connection, as Bitcoin Core does it: this is the
+    /// single most effective bound on table growth, because inventing
+    /// addresses is free and sending them costs the peer almost nothing.
+    /// The reply to our own GETADDR is exempt -- we asked for it, and it is
+    /// capped by the protocol at 1000 entries anyway.
+    fn offer_gossip(&mut self, kind: &str, received: usize, mut parsed: Vec<Gossiped>) {
+        let solicited = std::mem::take(&mut self.getaddr_outstanding);
+
+        if !solicited {
+            let elapsed = self.addr_tokens_updated.elapsed().as_secs_f64();
+            self.addr_tokens_updated = Instant::now();
+            self.addr_tokens =
+                (self.addr_tokens + elapsed * policy::ADDR_RATE_PER_SEC).min(policy::ADDR_BURST);
+
+            let allowed = self.addr_tokens.floor().max(0.0) as usize;
+            if parsed.len() > allowed {
+                tracing::debug!(target: TARGET,
+                    kind, received, dropped = parsed.len() - allowed,
+                    "rate-limiting gossiped addresses"
+                );
+                parsed.truncate(allowed);
+            }
+            self.addr_tokens -= parsed.len() as f64;
+        }
+
+        tracing::debug!(target: TARGET,
+            kind, received, accepted = parsed.len(), solicited, "gossip"
+        );
+        if !parsed.is_empty() {
+            self.addrman.gossip(parsed);
         }
     }
 
@@ -595,13 +642,6 @@ fn unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-fn unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(test)]
