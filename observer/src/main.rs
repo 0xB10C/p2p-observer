@@ -9,6 +9,7 @@ pub(crate) const TARGET_MAIN: &str = "main";
 pub(crate) const TARGET_PUBLISHER: &str = "publisher";
 pub(crate) const TARGET_RPC: &str = "rpc";
 pub(crate) const TARGET_HEADERTREE: &str = "headertree";
+pub(crate) const TARGET_ADDRMAN: &str = "addrman";
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};

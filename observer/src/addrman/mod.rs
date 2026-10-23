@@ -11,5 +11,6 @@
 
 pub(crate) mod banlist;
 pub(crate) mod key;
+pub(crate) mod persist;
 pub(crate) mod policy;
 pub(crate) mod table;
