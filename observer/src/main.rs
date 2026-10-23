@@ -19,6 +19,7 @@ pub(crate) static ACTIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static IN_MESSAGE_LOOP: AtomicUsize = AtomicUsize::new(0);
 
 mod addresses;
+mod addrman;
 mod connection;
 mod headertree;
 mod logging;
