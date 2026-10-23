@@ -6,6 +6,8 @@
 //! change against a table of expected values rather than by running a crawler
 //! for a day.
 
+use common::serde::{Deserialize, Serialize};
+
 /// A session shorter than this is read as an eviction rather than an ordinary
 /// disconnect: the peer accepted us and then dropped us almost immediately,
 /// most likely because its inbound slots are full.
@@ -90,7 +92,8 @@ const BAD_FORGET_FAILURES_ALWAYS: u8 = 5;
 const BAD_ANNOUNCE_GRACE_SECS: u32 = 30 * 24 * 60 * 60;
 
 /// How we came to know an address, which decides how patient we are with it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(crate = "common::serde")]
 pub enum Origin {
     /// Configured as a bootstrap peer or added by the operator over RPC.
     /// Retried on a short fixed interval and never forgotten.

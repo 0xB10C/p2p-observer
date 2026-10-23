@@ -7,14 +7,18 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use common::p2p::address::{AddrV2, AddrV2Message, Address};
+use common::{
+    p2p::address::{AddrV2, AddrV2Message, Address},
+    serde::{Deserialize, Serialize},
+};
 
 /// A peer address, stored in its most compact form.
 ///
 /// Sized by its largest variant (a 32-byte Tor or I2P key), so an enum costs
 /// exactly what a flat tagged byte array would while keeping each network's
 /// address length in the type instead of in a comment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(crate = "common::serde")]
 pub enum PeerAddr {
     Ipv4([u8; 4], u16),
     Ipv6([u8; 16], u16),
