@@ -38,6 +38,16 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 8;
 /// is far too long when managing many connections.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Timeout for opening a connection through the Tor SOCKS5 proxy. Covers both
+/// talking to the proxy and the circuit it builds to the onion service, so it is
+/// more generous than a direct TCP connect.
+const TOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for the BIP324 transport handshake, which runs before the version
+/// handshake and is just as capable of stalling forever against a peer that
+/// accepts the connection and then goes quiet.
+const V2_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A connection shorter than this is considered a likely eviction (peer is full).
 const EVICTION_THRESHOLD: Duration = Duration::from_secs(31);
 /// Minimum wait before retrying after a short-lived successful connection, to avoid
@@ -281,9 +291,13 @@ impl Connection {
         };
 
         tracing::trace!(target: TARGET, proxy=%socks_addr, %target, "connecting via Tor SOCKS5");
-        let socks_stream = tokio_socks::tcp::socks5::Socks5Stream::connect(socks_addr, target)
-            .await
-            .context("Tor SOCKS5 connection")?;
+        let socks_stream = timeout(
+            TOR_CONNECT_TIMEOUT,
+            tokio_socks::tcp::socks5::Socks5Stream::connect(socks_addr, target),
+        )
+        .await
+        .context("Tor SOCKS5 connect timed out")?
+        .context("Tor SOCKS5 connection")?;
         let stream = socks_stream.into_inner();
         configure_stream(&stream)?;
         Ok(stream)
@@ -348,15 +362,19 @@ impl Connection {
         let stream = self.tcp_connect().await?;
         let raw_fd = stream.as_raw_fd();
         let (reader, writer) = stream.into_split();
-        let proto = Protocol::new(
-            self.cfg.magic,
-            Role::Initiator,
-            None,
-            None,
-            BufReader::new(reader),
-            writer,
+        let proto = timeout(
+            V2_TRANSPORT_TIMEOUT,
+            Protocol::new(
+                self.cfg.magic,
+                Role::Initiator,
+                None,
+                None,
+                BufReader::new(reader),
+                writer,
+            ),
         )
-        .await?;
+        .await
+        .context("BIP324 transport handshake timed out")??;
         let (pr, pw) = proto.into_split();
         run_session(
             TransportV2Reader { reader: pr },
@@ -497,6 +515,57 @@ mod tests {
                 break;
             }
         }
+    }
+
+    /// A peer that accepts the TCP connection and then never sends anything
+    /// must not hold the connection task open indefinitely. TCP_USER_TIMEOUT
+    /// does not help here: it only aborts connections with unacknowledged data,
+    /// and this peer acknowledges everything we send.
+    #[tokio::test]
+    async fn test_silent_peer_aborts_handshake() {
+        setup();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Accept, then hold the connection open without ever replying. Holding
+        // it matters: dropping the stream would be an EOF, not a stall.
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(stream);
+        });
+
+        let net_addr = NetAddr::Ipv4("127.0.0.1".parse().unwrap(), addr.port());
+        let (status_tx, _status_rx) = mpsc::channel(1);
+        let (tx, _rx) = mpsc::channel::<Vec<PeerAddr>>(1);
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let cfg = Config {
+            magic: MAGIC,
+            ping_interval: Duration::from_secs(120),
+            user_agent: crate::protocol::USER_AGENT.to_owned(),
+            event_tx,
+            header_tree: Arc::new(RwLock::new(HeaderTree::new(Params::new(
+                common::bitcoin::Network::Regtest,
+            )))),
+            sync_headers: false,
+            networks: crate::settings::NetworksConfig::default(),
+        };
+        let conn = Connection::new(
+            cfg,
+            status_tx,
+            tx,
+            PeerAddr::new(net_addr, ServiceFlags::NETWORK),
+        );
+
+        let err = conn
+            .connect_v1()
+            .await
+            .expect_err("a silent peer must not yield a session");
+        assert!(
+            is_timed_out(&err),
+            "expected the handshake to time out, got: {err:#}"
+        );
+        server.abort();
     }
 
     const MAGIC: Magic = Magic::REGTEST;
