@@ -12,4 +12,5 @@
 pub(crate) mod banlist;
 pub(crate) mod book;
 pub(crate) mod peer_addr;
+pub(crate) mod persist;
 pub(crate) mod policy;

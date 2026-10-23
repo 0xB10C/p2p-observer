@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 
+use common::serde::{Deserialize, Serialize};
+
 use super::banlist::Banlist;
 use super::peer_addr::{Net, PeerAddr};
 use super::policy::{self, Class, Origin, Outcome};
@@ -29,7 +31,8 @@ pub const DEFAULT_CAPACITY: usize = 2_000_000;
 const CREDIT_CAP: f32 = 4.0;
 
 /// What we have learned about which transport a peer speaks.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(crate = "common::serde")]
 pub enum TransportHint {
     /// Nothing known yet. Try v2, and fall back to v1 inside the same attempt.
     #[default]
@@ -57,7 +60,8 @@ pub enum Phase {
 }
 
 /// What we know about one address.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(crate = "common::serde")]
 pub struct Entry {
     /// Service flags, from gossip or from the peer's own version message.
     pub services: u64,
@@ -82,7 +86,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    fn new(now: u32, services: u64, origin: Origin) -> Self {
+    pub(super) fn new(now: u32, services: u64, origin: Origin) -> Self {
         Self {
             services,
             last_announced: now,
