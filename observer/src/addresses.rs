@@ -53,6 +53,7 @@ fn base32_encode(bytes: &[u8]) -> String {
 /// - pubkey is 32 bytes
 /// - checksum is 2 bytes = SHA3-256(".onion checksum" || pubkey || version)[0..2]
 /// - version is 1 byte = 0x03
+///
 /// Result is always 56 base32 chars + ".onion".
 fn tor_v3_address(key: &[u8; 32]) -> String {
     use sha3::Digest;
@@ -562,7 +563,7 @@ impl AddrStore {
         let mut batch = Vec::with_capacity(n);
 
         let base = |peer: &PeerAddr| {
-            !active.contains(&peer)
+            !active.contains(peer)
                 && !self.is_banned(&peer.addr)
                 && match &peer.addr {
                     NetAddr::Ipv4(_, _) => networks.ipv4.enabled,

@@ -65,17 +65,11 @@ impl Default for NetworksConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(crate = "common::serde")]
 pub struct NetworkConfig {
     #[serde(default)]
     pub enabled: bool,
-}
-
-impl Default for NetworkConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 fn default_enabled() -> NetworkConfig {

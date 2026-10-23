@@ -53,10 +53,10 @@ impl Rpc {
 
             let reply = self.handler.dispatch(method, &msg.payload);
 
-            if let Some(reply_to) = msg.reply {
-                if let Err(e) = self.nats.publish(reply_to, reply.into()).await {
-                    tracing::warn!(target: TARGET, "failed to send RPC reply: {e}");
-                }
+            if let Some(reply_to) = msg.reply
+                && let Err(e) = self.nats.publish(reply_to, reply.into()).await
+            {
+                tracing::warn!(target: TARGET, "failed to send RPC reply: {e}");
             }
         }
     }
