@@ -278,6 +278,9 @@ impl Book {
         self.entries.len()
     }
 
+    /// Kept alongside `len` because clippy's `len_without_is_empty` asks for
+    /// it; the manager only ever reports the count.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -507,10 +510,10 @@ impl Book {
             // Our own fault: no route, proxy down. Says nothing about the
             // peer, so no counter moves and the class does not change.
             Outcome::OurFault => {}
-            Outcome::Disconnected { uptime_secs } => {
+            Outcome::Disconnected { .. } => {
                 entry.last_attempt_failed = false;
                 entry.failures = 0;
-                if uptime_secs < policy::SHORT_SESSION_SECS {
+                if outcome.is_short_session() {
                     entry.short_sessions = entry.short_sessions.saturating_add(1);
                 } else {
                     entry.short_sessions = 0;

@@ -7,8 +7,18 @@ network: signet
 # How often to send a ping to connected peers, in seconds.
 ping_interval_secs: 120
 
-# How many new connection tasks should be spawned per second.
+# How many new connection attempts to start per second.
 connections_per_second: 1
+
+# Bounds on the address manager.
+addrman:
+  # Hard ceiling on stored addresses. Inventing addresses costs a peer
+  # almost nothing, so this bound cannot depend on peers behaving.
+  capacity: 2000000
+  # Maximum connection attempts in flight at once. Each one costs a socket
+  # and a task, so this is the real limit on how hard we crawl --
+  # connections_per_second only controls how fast we ramp up to it.
+  max_dialing: 200
 
 # Initial bootstrap peers to connect to.
 # These are used to:
@@ -44,7 +54,7 @@ log_levels:
   main: debug
   connection: info
   protocol: debug
-  addresses: debug
+  addrman: info
   publisher: info
   rpc: info
   headertree: info
