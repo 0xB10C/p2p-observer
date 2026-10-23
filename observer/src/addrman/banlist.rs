@@ -182,6 +182,9 @@ impl Banlist {
             .sum()
     }
 
+    /// Kept alongside `len` because clippy's `len_without_is_empty` asks for
+    /// it; the manager only ever reports the count.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

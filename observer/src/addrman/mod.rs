@@ -14,10 +14,6 @@
 //! dial, handshake, run the session, report what happened, exit. They hold no
 //! backoff state and decide nothing about when an address is tried again.
 
-// Removed once main.rs drives the manager; until then some of this has no
-// caller and looks unused.
-#![allow(dead_code)]
-
 pub(crate) mod banlist;
 pub(crate) mod book;
 pub(crate) mod peer_addr;
@@ -233,6 +229,33 @@ impl Handle {
     }
 }
 
+/// Create the manager's channels, returning the handle and the three
+/// receivers the manager task needs.
+///
+/// Separate from `Manager::new` so the handle exists before the dialer does:
+/// the dialer needs a handle to give each connection task, and the manager
+/// needs the dialer.
+pub fn channels() -> (
+    Handle,
+    mpsc::Receiver<Vec<Gossiped>>,
+    mpsc::UnboundedReceiver<Lifecycle>,
+    mpsc::Receiver<Command>,
+) {
+    let (gossip_tx, gossip_rx) = mpsc::channel(GOSSIP_QUEUE);
+    let (life_tx, life_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
+    (
+        Handle {
+            gossip_tx,
+            life_tx,
+            cmd_tx,
+        },
+        gossip_rx,
+        life_rx,
+        cmd_rx,
+    )
+}
+
 pub struct Config {
     /// Dials started per tick, before the in-flight ceiling is applied.
     pub dials_per_tick: usize,
@@ -275,31 +298,6 @@ impl<D: Dialer> Manager<D> {
         })
     }
 
-    pub fn handles() -> (
-        Handle,
-        mpsc::Receiver<Vec<Gossiped>>,
-        mpsc::UnboundedReceiver<Lifecycle>,
-        mpsc::Receiver<Command>,
-    ) {
-        let (gossip_tx, gossip_rx) = mpsc::channel(GOSSIP_QUEUE);
-        let (life_tx, life_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
-        (
-            Handle {
-                gossip_tx,
-                life_tx,
-                cmd_tx,
-            },
-            gossip_rx,
-            life_rx,
-            cmd_rx,
-        )
-    }
-
-    pub fn book(&self) -> &Book {
-        &self.book
-    }
-
     /// Seed bootstrap and operator addresses.
     pub fn add_manual(&mut self, now: u32, addrs: &[PeerAddr]) -> usize {
         self.book.insert_manual(now, addrs)
@@ -332,12 +330,27 @@ impl<D: Dialer> Manager<D> {
                 .book
                 .record_connected(addr, now, services, transport_version),
             Lifecycle::V1Only { addr } => self.book.record_v1_only(addr),
-            Lifecycle::Ended { addr, outcome } => self.book.record_ended(addr, now, outcome),
+            Lifecycle::Ended { addr, outcome } => {
+                tracing::debug!(target: TARGET,
+                    %addr,
+                    ?outcome,
+                    counted = outcome.counts_as_failure(),
+                    "attempt ended"
+                );
+                self.book.record_ended(addr, now, outcome)
+            }
         }
     }
 
     fn ingest(&mut self, now: u32, addrs: &[Gossiped]) -> usize {
         self.book.ingest(now, addrs, &self.banlist)
+    }
+
+    /// Seed the book directly, for tests that need a populated manager
+    /// without a dialer or a running task.
+    #[cfg(test)]
+    pub(crate) fn ingest_for_test(&mut self, now: u32, addrs: &[Gossiped]) -> usize {
+        self.ingest(now, addrs)
     }
 
     fn command(&mut self, cmd: Command, now: u32) {
@@ -608,7 +621,7 @@ mod tests {
 
     #[test]
     fn test_end_guard_reports_even_when_dropped_silently() {
-        let (handle, _gossip_rx, mut life_rx, _cmd_rx) = Manager::<RecordingDialer>::handles();
+        let (handle, _gossip_rx, mut life_rx, _cmd_rx) = channels();
         let addr = PeerAddr::parse_ip("1.2.3.4:8333").unwrap();
 
         // A task that simply vanishes -- panicked, aborted, early return --
