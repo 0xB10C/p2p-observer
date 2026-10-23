@@ -11,14 +11,12 @@ use common::{
     tracing,
     tracing::Instrument,
 };
-#[cfg(target_os = "linux")]
-use libc;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::addresses::{BadReason, NetAddr, PeerAddr, StatusUpdate};
-use crate::protocol::{Config, run_session};
+use crate::protocol::{Config, Session, run_session};
 use crate::transport::{
     TransportV1Reader, TransportV1Writer, TransportV2Reader, TransportV2Writer,
 };
@@ -363,13 +361,15 @@ impl Connection {
         run_session(
             TransportV2Reader { reader: pr },
             TransportV2Writer { writer: pw },
-            2,
-            self.id,
-            &self.peer.addr,
-            raw_fd,
-            &self.cfg,
-            &self.status_tx,
-            &self.new_addr_tx,
+            Session {
+                transport_version: 2,
+                connection_id: self.id,
+                addr: &self.peer.addr,
+                raw_fd,
+                cfg: &self.cfg,
+                status_tx: &self.status_tx,
+                new_addr_tx: &self.new_addr_tx,
+            },
         )
         .await
     }
@@ -385,13 +385,15 @@ impl Connection {
                 magic: self.cfg.magic,
                 writer,
             },
-            1,
-            self.id,
-            &self.peer.addr,
-            raw_fd,
-            &self.cfg,
-            &self.status_tx,
-            &self.new_addr_tx,
+            Session {
+                transport_version: 1,
+                connection_id: self.id,
+                addr: &self.peer.addr,
+                raw_fd,
+                cfg: &self.cfg,
+                status_tx: &self.status_tx,
+                new_addr_tx: &self.new_addr_tx,
+            },
         )
         .await
     }
@@ -617,12 +619,9 @@ mod tests {
             server_handshake(&mut r, &mut w).await;
             // Respond to the first ping; ignore everything else (GetAddr, SendHeaders, ...)
             loop {
-                match r.recv().await.unwrap() {
-                    NetworkMessage::Ping(nonce) => {
-                        w.send(NetworkMessage::Pong(nonce)).await.unwrap();
-                        break;
-                    }
-                    _ => {}
+                if let NetworkMessage::Ping(nonce) = r.recv().await.unwrap() {
+                    w.send(NetworkMessage::Pong(nonce)).await.unwrap();
+                    break;
                 }
             }
         });

@@ -188,7 +188,7 @@ impl HeaderTree {
             return Err(HeaderError::TargetTooEasy);
         }
 
-        let expected_bits = if height % 2016 == 0 && height > 0 {
+        let expected_bits = if height.is_multiple_of(2016) && height > 0 {
             // Retarget: we need the first block of the epoch (height - 2016) to
             // compute the new difficulty. We can't use best_chain[height - 2016]
             // because on test networks deep reorgs spanning a retarget boundary
@@ -509,7 +509,7 @@ mod tests {
     fn test_duplicate_insert_returns_false() {
         let mut tree = regtest_tree();
         let genesis =
-            *common::bitcoin::blockdata::constants::genesis_block(&regtest_params()).header();
+            *common::bitcoin::blockdata::constants::genesis_block(regtest_params()).header();
         let (accepted, err) = tree.insert_batch(&[genesis]);
         assert_eq!(accepted, 0);
         assert!(err.is_none());
@@ -520,7 +520,7 @@ mod tests {
     fn test_orphan_rejected() {
         let mut tree = regtest_tree();
         let mut header =
-            *common::bitcoin::blockdata::constants::genesis_block(&regtest_params()).header();
+            *common::bitcoin::blockdata::constants::genesis_block(regtest_params()).header();
         header.prev_blockhash = BlockHash::from_byte_array([0xab; 32]);
         let (_, err) = tree.insert_batch(&[header]);
         assert!(matches!(err, Some(HeaderError::OrphanHeader)));

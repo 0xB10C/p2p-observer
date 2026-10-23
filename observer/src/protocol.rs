@@ -122,23 +122,39 @@ struct Connection<R: TransportReader, W: TransportWriter> {
     sync_headers: bool,
 }
 
+/// Everything a session needs besides the transport itself.
+pub(crate) struct Session<'a> {
+    /// Transport version: 1 for plaintext, 2 for BIP324. Reported in the
+    /// tracing span and on every emitted event.
+    pub(crate) transport_version: u8,
+    pub(crate) connection_id: u64,
+    pub(crate) addr: &'a NetAddr,
+    /// Raw file descriptor of the TCP socket, used to query OS-level TCP stats.
+    pub(crate) raw_fd: RawFd,
+    pub(crate) cfg: &'a Config,
+    pub(crate) status_tx: &'a mpsc::Sender<StatusUpdate>,
+    pub(crate) new_addr_tx: &'a mpsc::Sender<Vec<PeerAddr>>,
+}
+
 /// Run the Bitcoin P2P session on an already-established transport.
 ///
 /// Performs the version handshake, then drives the message loop until the
 /// peer disconnects. Returns the `Instant` at which the handshake completed.
-///
-/// `v` is the transport version (1 or 2) used only for the tracing span.
 pub(crate) async fn run_session(
     mut reader: impl TransportReader,
     mut writer: impl TransportWriter,
-    v: u8,
-    connection_id: u64,
-    addr: &NetAddr,
-    raw_fd: RawFd,
-    cfg: &Config,
-    status_tx: &mpsc::Sender<StatusUpdate>,
-    new_addr_tx: &mpsc::Sender<Vec<PeerAddr>>,
+    session: Session<'_>,
 ) -> Result<Instant> {
+    let Session {
+        transport_version,
+        connection_id,
+        addr,
+        raw_fd,
+        cfg,
+        status_tx,
+        new_addr_tx,
+    } = session;
+
     let (_, tip_height) = &cfg.header_tree.read().unwrap().tip();
     let info = version_handshake(
         &mut reader,
@@ -148,7 +164,7 @@ pub(crate) async fn run_session(
     )
     .await?;
     let connected_at = Instant::now();
-    let conn_span = tracing::info_span!(target: TARGET, "", v, sh=info.version.start_height, ua = %info.version.user_agent);
+    let conn_span = tracing::info_span!(target: TARGET, "", v = transport_version, sh=info.version.start_height, ua = %info.version.user_agent);
 
     let _ = status_tx
         .send(StatusUpdate::Good {
@@ -168,7 +184,7 @@ pub(crate) async fn run_session(
         raw_fd,
         ping_interval: cfg.ping_interval,
         addr: addr.clone(),
-        transport_version: v,
+        transport_version,
         connection_id,
         event_tx: cfg.event_tx.clone(),
         header_tree: cfg.header_tree.clone(),
