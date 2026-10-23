@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::addrman::key::{AddrKey, Net};
-use crate::addrman::policy::{Outcome, Reason};
+use crate::addrman::policy::{OurFault, Outcome, Reason};
 use crate::addrman::table::{Dial, TransportHint};
 use crate::addrman::{Dialer, Handle};
 use crate::protocol::{Config, Session, run_session};
@@ -84,23 +84,142 @@ pub(crate) async fn attempt(dial: Dial, cfg: Config, addrman: Handle) {
         let guard = addrman.end_guard(dial.key);
         tracing::debug!(target: TARGET, transport = ?dial.transport, "attempting");
 
-        match connect_and_run(id, &dial, &cfg, &addrman).await {
-            Ok(connected_at) => {
-                let uptime = connected_at.elapsed();
-                tracing::debug!(target: TARGET, ?uptime, "session ended");
-                guard.finish(Outcome::Disconnected {
-                    uptime_secs: uptime.as_secs() as u32,
-                });
-            }
-            Err(e) => {
-                let outcome = classify(&e, dial.key.net());
-                tracing::debug!(target: TARGET, ?outcome, "attempt failed: {e:#}");
-                guard.finish(outcome);
-            }
-        }
+        let started = Instant::now();
+        let (outcome, transport_version, result) =
+            match connect_and_run(id, &dial, &cfg, &addrman).await {
+                Ok((version, connected_at)) => {
+                    let uptime = connected_at.elapsed();
+                    tracing::debug!(target: TARGET, ?uptime, "session ended");
+                    // Setup is everything before the handshake completed, the
+                    // session is the rest. Reported separately so neither is
+                    // hidden inside one "duration".
+                    let setup = started.elapsed().saturating_sub(uptime);
+                    (
+                        Outcome::Disconnected {
+                            uptime_secs: uptime.as_secs() as u32,
+                        },
+                        // The session ran, so the transport is settled whatever
+                        // the hint said going in.
+                        Some(u32::from(version)),
+                        disconnected_result(setup, uptime),
+                    )
+                }
+                Err(e) => {
+                    let outcome = classify(&e, dial.key.net());
+                    tracing::debug!(target: TARGET, ?outcome, "attempt failed: {e:#}");
+                    // Only a hint that named a transport tells us what we tried.
+                    // Still detecting means the attempt settled nothing.
+                    let attempted = match dial.transport {
+                        TransportHint::V2 => Some(2),
+                        TransportHint::V1Only { .. } => Some(1),
+                        TransportHint::Unknown => None,
+                    };
+                    (
+                        outcome,
+                        attempted,
+                        failed_result(outcome, started.elapsed()),
+                    )
+                }
+            };
+
+        // One event per attempt whether or not it reached a session, so the
+        // archive shows reachability over time rather than only the contacts
+        // that happened to work.
+        emit_result(&cfg, id, &dial, transport_version, result);
+        guard.finish(outcome);
     }
     .instrument(span)
     .await
+}
+
+/// Publish the outcome of an attempt as a research event.
+fn disconnected_result(
+    setup: Duration,
+    uptime: Duration,
+) -> common::events::connection_result::Result {
+    common::events::connection_result::Result::Disconnected(
+        common::events::connection_result::Disconnected {
+            setup_ms: setup.as_millis() as u64,
+            uptime_ms: uptime.as_millis() as u64,
+        },
+    )
+}
+
+/// An attempt that never reached a session, as the oneof variant for it.
+///
+/// Splits on whether the failure was the peer's or ours, which is the
+/// distinction the whole classification exists to make.
+fn failed_result(outcome: Outcome, elapsed: Duration) -> common::events::connection_result::Result {
+    use common::events::{FailureReason, OurFaultReason, connection_result};
+
+    let setup_ms = elapsed.as_millis() as u64;
+    match outcome {
+        Outcome::OurFault(reason) => {
+            connection_result::Result::OurFault(connection_result::OurFault {
+                reason: match reason {
+                    OurFault::NetworkUnreachable => OurFaultReason::NetworkUnreachable,
+                    OurFault::ProxyUnreachable => OurFaultReason::ProxyUnreachable,
+                    OurFault::NetworkDisabled => OurFaultReason::NetworkDisabled,
+                }
+                .into(),
+                setup_ms,
+            })
+        }
+        Outcome::Failed(reason) => connection_result::Result::Failed(connection_result::Failed {
+            reason: match reason {
+                Reason::ConnectionRefused => FailureReason::ConnectionRefused,
+                Reason::HostUnreachable => FailureReason::HostUnreachable,
+                Reason::TcpConnectTimeout => FailureReason::TcpConnectTimeout,
+                Reason::V2TransportTimeout => FailureReason::V2TransportTimeout,
+                Reason::VersionHandshakeTimeout => FailureReason::VersionHandshakeTimeout,
+                Reason::V2TransportHandshake => FailureReason::V2TransportHandshake,
+                Reason::VersionHandshake => FailureReason::VersionHandshake,
+                Reason::UnexpectedEof => FailureReason::UnexpectedEof,
+                Reason::Other => FailureReason::Other,
+            }
+            .into(),
+            setup_ms,
+        }),
+        // Unreachable: a session has its own constructor above.
+        Outcome::Disconnected { .. } => {
+            connection_result::Result::Failed(connection_result::Failed {
+                reason: FailureReason::Unknown.into(),
+                setup_ms,
+            })
+        }
+    }
+}
+
+/// Publish the outcome of an attempt as a research event.
+fn emit_result(
+    cfg: &Config,
+    id: u64,
+    dial: &Dial,
+    transport_version: Option<u32>,
+    result: common::events::connection_result::Result,
+) {
+    // try_send: dropping an event under pressure is better than stalling a
+    // connection task on the publisher.
+    let _ = cfg.event_tx.try_send(common::events::PeerEvent {
+        timestamp_ms: unix_ms(),
+        peer_addr: dial.key.to_string(),
+        // Unknown unless the handshake completed; the session event carries it.
+        user_agent: String::new(),
+        transport_version,
+        connection_id: id,
+        event: Some(common::events::peer_event::Event::ConnectionResult(
+            common::events::ConnectionResult {
+                result: Some(result),
+            },
+        )),
+    });
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// One attempt for the bootstrap header sync.
@@ -123,22 +242,34 @@ pub(crate) async fn bootstrap_attempt(
     connect_and_run(id, &dial, cfg, addrman)
         .instrument(span)
         .await
+        .map(|(_, at)| at)
 }
 
 /// Connect with whichever transport the hint calls for, then run the session.
-/// Returns the instant the handshake completed.
-async fn connect_and_run(id: u64, dial: &Dial, cfg: &Config, addrman: &Handle) -> Result<Instant> {
+/// Returns the transport version that actually carried the session, and the
+/// instant the handshake completed.
+///
+/// The version is returned rather than inferred from the hint by the caller:
+/// a dial that starts out detecting resolves to v1 or v2 here, and the caller
+/// has no other way to learn which.
+async fn connect_and_run(
+    id: u64,
+    dial: &Dial,
+    cfg: &Config,
+    addrman: &Handle,
+) -> Result<(u8, Instant)> {
     match dial.transport {
         // Known to speak v2. A failure is a failed attempt, never a reason to
         // fall back and conclude the peer lost the feature.
-        TransportHint::V2 => connect_v2(id, dial, cfg, addrman).await,
+        TransportHint::V2 => connect_v2(id, dial, cfg, addrman).await.map(|at| (2, at)),
 
         // v2 did not work last time. Skip straight to v1 and save a round trip.
-        TransportHint::V1Only { .. } => connect_v1(id, dial, cfg, addrman).await,
+        TransportHint::V1Only { .. } => connect_v1(id, dial, cfg, addrman).await.map(|at| (1, at)),
 
+        // Detecting: we do not know yet what this peer speaks.
         TransportHint::Unknown => {
             match connect_v2(id, dial, cfg, addrman).await {
-                ok @ Ok(_) => ok,
+                Ok(at) => Ok((2, at)),
                 Err(e) => {
                     // A TCP-level failure says nothing about which transport
                     // the peer speaks, so there is nothing to learn and
@@ -151,7 +282,7 @@ async fn connect_and_run(id: u64, dial: &Dial, cfg: &Config, addrman: &Handle) -
                     // even if v1 then fails for an unrelated reason.
                     tracing::trace!(target: TARGET, "v2 handshake failed, trying v1: {e:#}");
                     addrman.v1_only(dial.key);
-                    connect_v1(id, dial, cfg, addrman).await
+                    connect_v1(id, dial, cfg, addrman).await.map(|at| (1, at))
                 }
             }
         }
@@ -199,7 +330,8 @@ fn configure_stream(stream: &TcpStream) -> Result<()> {
 
 async fn tor_connect(key: &AddrKey, cfg: &Config) -> Result<TcpStream> {
     if !cfg.networks.tor.enabled {
-        anyhow::bail!("attempted to connect to a TorV3 address, but Tor is disabled");
+        return Err(Stage::NetworkDisabled)
+            .context("attempted to connect to a TorV3 address, but Tor is disabled");
     }
     let proxy: std::net::SocketAddr = cfg
         .networks
@@ -215,8 +347,8 @@ async fn tor_connect(key: &AddrKey, cfg: &Config) -> Result<TcpStream> {
         tokio_socks::tcp::socks5::Socks5Stream::connect(proxy, target),
     )
     .await
-    .context("Tor SOCKS5 connect timed out")?
-    .context("Tor SOCKS5 connection")?;
+    .map_err(|_| Stage::TorProxyTimeout)?
+    .map_err(|e| anyhow::Error::new(e).context(Stage::ProxyUnreachable))?;
 
     let stream = socks.into_inner();
     configure_stream(&stream)?;
@@ -227,7 +359,7 @@ async fn ip_connect(key: &AddrKey) -> Result<TcpStream> {
     let socket_addr = key.socket_addr().context("address has no socket address")?;
     let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
         .await
-        .context("TCP connect timed out")?
+        .map_err(|_| Stage::TcpConnectTimeout)?
         .context("TCP connect")?;
     configure_stream(&stream)?;
     Ok(stream)
@@ -237,7 +369,7 @@ async fn tcp_connect(key: &AddrKey, cfg: &Config) -> Result<TcpStream> {
     match key.net() {
         Net::TorV3 => tor_connect(key, cfg).await,
         Net::Ipv4 | Net::Ipv6 | Net::Cjdns => ip_connect(key).await,
-        Net::I2p => anyhow::bail!("I2P is not supported yet"),
+        Net::I2p => Err(Stage::NetworkDisabled).context("I2P is not supported yet"),
     }
 }
 
@@ -259,8 +391,8 @@ async fn connect_v2(id: u64, dial: &Dial, cfg: &Config, addrman: &Handle) -> Res
         ),
     )
     .await
-    .context("BIP324 transport handshake timed out")?
-    .context("BIP324 transport handshake")?;
+    .map_err(|_| Stage::V2TransportTimeout)?
+    .map_err(|e| anyhow::Error::new(e).context(Stage::V2TransportHandshake))?;
 
     let (pr, pw) = proto.into_split();
     run_session(
@@ -304,6 +436,55 @@ async fn connect_v1(id: u64, dial: &Dial, cfg: &Config, addrman: &Handle) -> Res
 
 // ── Error classification ─────────────────────────────────────────────────────
 
+/// A failure at a point in the attempt worth telling apart from the others.
+///
+/// Returned as a typed error rather than recognised from the wording of a
+/// context string: grepping prose for "handshake" worked, but it broke
+/// silently the moment anyone reworded a message, and it could not separate
+/// the two handshakes from each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stage {
+    /// Nothing answered the TCP connect.
+    TcpConnectTimeout,
+    /// The Tor SOCKS5 proxy, or the circuit it was building.
+    TorProxyTimeout,
+    /// TCP was up; the BIP324 handshake stalled.
+    V2TransportTimeout,
+    /// TCP and the transport were up; no version message followed.
+    VersionHandshakeTimeout,
+    /// The BIP324 handshake failed outright rather than stalling.
+    V2TransportHandshake,
+    /// The version handshake failed outright rather than stalling.
+    VersionHandshake,
+    /// The Tor proxy is not answering at all.
+    ProxyUnreachable,
+    /// This network is switched off in the config, or has no transport here.
+    NetworkDisabled,
+}
+
+impl std::fmt::Display for Stage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Stage::TcpConnectTimeout => "TCP connect timed out",
+            Stage::TorProxyTimeout => "Tor SOCKS5 connect timed out",
+            Stage::V2TransportTimeout => "BIP324 transport handshake timed out",
+            Stage::VersionHandshakeTimeout => "version handshake timed out",
+            Stage::V2TransportHandshake => "BIP324 transport handshake failed",
+            Stage::VersionHandshake => "version handshake failed",
+            Stage::ProxyUnreachable => "Tor SOCKS5 proxy unreachable",
+            Stage::NetworkDisabled => "network disabled or unsupported",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::error::Error for Stage {}
+
+/// The stage a failure was tagged with, if any.
+fn stage_of(err: &anyhow::Error) -> Option<Stage> {
+    err.chain().find_map(|c| c.downcast_ref::<Stage>().copied())
+}
+
 /// Turn a failure into the outcome the manager should record.
 ///
 /// The important distinction is `OurFault`. A missing route to a network, or a
@@ -314,13 +495,30 @@ async fn connect_v1(id: u64, dial: &Dial, cfg: &Config, addrman: &Handle) -> Res
 /// the reconnect path.
 fn classify(err: &anyhow::Error, net: Net) -> Outcome {
     if has_kind(err, std::io::ErrorKind::NetworkUnreachable) {
-        return Outcome::OurFault;
+        return Outcome::OurFault(OurFault::NetworkUnreachable);
     }
 
-    // A Tor address can only be reached through our proxy, so a failure to
-    // reach the proxy itself is our problem, not the onion service's.
-    if net == Net::TorV3 && is_proxy_failure(err) {
-        return Outcome::OurFault;
+    match stage_of(err) {
+        Some(Stage::NetworkDisabled) => return Outcome::OurFault(OurFault::NetworkDisabled),
+        Some(Stage::ProxyUnreachable) => return Outcome::OurFault(OurFault::ProxyUnreachable),
+        Some(Stage::TorProxyTimeout) => {
+            // The onion service is only reachable through our proxy, so a
+            // proxy that will not answer is our problem, not the peer's.
+            return Outcome::OurFault(OurFault::ProxyUnreachable);
+        }
+        Some(Stage::TcpConnectTimeout) => return Outcome::Failed(Reason::TcpConnectTimeout),
+        Some(Stage::V2TransportTimeout) => return Outcome::Failed(Reason::V2TransportTimeout),
+        Some(Stage::VersionHandshakeTimeout) => {
+            return Outcome::Failed(Reason::VersionHandshakeTimeout);
+        }
+        Some(Stage::V2TransportHandshake) => return Outcome::Failed(Reason::V2TransportHandshake),
+        Some(Stage::VersionHandshake) => return Outcome::Failed(Reason::VersionHandshake),
+        None => {}
+    }
+
+    // A refused connection to an onion address means our proxy is not running.
+    if net == Net::TorV3 && has_kind(err, std::io::ErrorKind::ConnectionRefused) {
+        return Outcome::OurFault(OurFault::ProxyUnreachable);
     }
 
     if has_kind(err, std::io::ErrorKind::ConnectionRefused) {
@@ -331,14 +529,8 @@ fn classify(err: &anyhow::Error, net: Net) -> Outcome {
         // this is evidence about the peer rather than about us.
         return Outcome::Failed(Reason::HostUnreachable);
     }
-    if is_timed_out(err) {
-        return Outcome::Failed(Reason::TimedOut);
-    }
     if has_kind(err, std::io::ErrorKind::UnexpectedEof) {
         return Outcome::Failed(Reason::UnexpectedEof);
-    }
-    if mentions(err, "handshake") {
-        return Outcome::Failed(Reason::HandshakeFailed);
     }
     Outcome::Failed(Reason::Other)
 }
@@ -352,16 +544,21 @@ fn is_tcp_level(err: &anyhow::Error) -> bool {
         || is_timed_out(err)
 }
 
-fn is_proxy_failure(err: &anyhow::Error) -> bool {
-    has_kind(err, std::io::ErrorKind::ConnectionRefused) || mentions(err, "SOCKS5")
-}
-
 fn is_timed_out(err: &anyhow::Error) -> bool {
-    // One of our explicit tokio::time::timeout wrappers fired.
-    if err.chain().any(|c| c.is::<tokio::time::error::Elapsed>()) {
+    if matches!(
+        stage_of(err),
+        Some(
+            Stage::TcpConnectTimeout
+                | Stage::TorProxyTimeout
+                | Stage::V2TransportTimeout
+                | Stage::VersionHandshakeTimeout
+        )
+    ) {
         return true;
     }
-    has_kind(err, std::io::ErrorKind::TimedOut)
+    // A tokio timeout we did not tag, or one from the OS.
+    err.chain().any(|c| c.is::<tokio::time::error::Elapsed>())
+        || has_kind(err, std::io::ErrorKind::TimedOut)
 }
 
 fn has_kind(err: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
@@ -370,10 +567,6 @@ fn has_kind(err: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io_err| io_err.kind() == kind)
     })
-}
-
-fn mentions(err: &anyhow::Error, needle: &str) -> bool {
-    format!("{err:#}").contains(needle)
 }
 
 #[cfg(test)]
@@ -583,7 +776,12 @@ mod tests {
             .await
             .expect_err("a silent peer must not yield a session");
         assert!(is_timed_out(&err), "expected a timeout, got: {err:#}");
-        assert_eq!(classify(&err, Net::Ipv4), Outcome::Failed(Reason::TimedOut));
+        // The peer completed TCP and then said nothing, which is the case the
+        // split tells apart from a host that never answers at all.
+        assert_eq!(
+            classify(&err, Net::Ipv4),
+            Outcome::Failed(Reason::VersionHandshakeTimeout)
+        );
         server.abort();
     }
 
@@ -620,8 +818,11 @@ mod tests {
         let err = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NetworkUnreachable))
             .context("TCP connect");
         // Running without an IPv6 route must not mark every IPv6 address bad.
-        assert_eq!(classify(&err, Net::Ipv6), Outcome::OurFault);
-        assert!(!Outcome::OurFault.counts_as_failure());
+        assert_eq!(
+            classify(&err, Net::Ipv6),
+            Outcome::OurFault(OurFault::NetworkUnreachable)
+        );
+        assert!(!Outcome::OurFault(OurFault::NetworkUnreachable).counts_as_failure());
     }
 
     #[test]
@@ -641,7 +842,10 @@ mod tests {
     fn test_refused_proxy_is_our_fault_for_tor() {
         let err = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
             .context("Tor SOCKS5 connection");
-        assert_eq!(classify(&err, Net::TorV3), Outcome::OurFault);
+        assert_eq!(
+            classify(&err, Net::TorV3),
+            Outcome::OurFault(OurFault::ProxyUnreachable)
+        );
         // The same error for an IP peer is the peer's problem.
         assert_eq!(
             classify(&err, Net::Ipv4),
@@ -663,17 +867,54 @@ mod tests {
         assert_eq!(classify(&other, Net::Ipv4), Outcome::Failed(Reason::Other));
     }
 
+    /// Recognised from the typed stage, not from the wording of a message —
+    /// the point of tagging failures rather than grepping them.
     #[test]
     fn test_handshake_failure_is_recognised() {
-        let err = anyhow::anyhow!("boom").context("BIP324 transport handshake");
+        let err = anyhow::Error::new(Stage::V2TransportHandshake).context("boom");
         assert_eq!(
             classify(&err, Net::Ipv4),
-            Outcome::Failed(Reason::HandshakeFailed)
+            Outcome::Failed(Reason::V2TransportHandshake)
         );
         assert!(
             !is_tcp_level(&err),
             "a handshake failure should allow a v1 fallback"
         );
+    }
+
+    /// The four timeouts are told apart, which a single TIMED_OUT could not do.
+    #[test]
+    fn test_timeouts_are_distinguished() {
+        for (stage, want) in [
+            (Stage::TcpConnectTimeout, Reason::TcpConnectTimeout),
+            (Stage::V2TransportTimeout, Reason::V2TransportTimeout),
+            (
+                Stage::VersionHandshakeTimeout,
+                Reason::VersionHandshakeTimeout,
+            ),
+        ] {
+            let err = anyhow::Error::new(stage).context("dialling");
+            assert_eq!(classify(&err, Net::Ipv4), Outcome::Failed(want));
+            assert!(is_timed_out(&err), "{stage:?} should read as a timeout");
+        }
+
+        // A Tor proxy that will not answer is ours, not the peer's.
+        let err = anyhow::Error::new(Stage::TorProxyTimeout).context("dialling");
+        assert_eq!(
+            classify(&err, Net::TorV3),
+            Outcome::OurFault(OurFault::ProxyUnreachable)
+        );
+    }
+
+    /// A network switched off in the config is our doing, not the address's.
+    #[test]
+    fn test_disabled_network_is_our_fault() {
+        let err = anyhow::Error::new(Stage::NetworkDisabled).context("Tor is disabled");
+        assert_eq!(
+            classify(&err, Net::TorV3),
+            Outcome::OurFault(OurFault::NetworkDisabled)
+        );
+        assert!(!classify(&err, Net::TorV3).counts_as_failure());
     }
 
     #[test]

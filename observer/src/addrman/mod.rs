@@ -573,7 +573,7 @@ mod tests {
             m.apply(
                 Lifecycle::Ended {
                     key: dial.key,
-                    outcome: Outcome::OurFault,
+                    outcome: Outcome::OurFault(policy::OurFault::NetworkUnreachable),
                 },
                 NOW,
             );

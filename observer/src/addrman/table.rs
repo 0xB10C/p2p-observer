@@ -509,7 +509,7 @@ impl Table {
         match outcome {
             // Our own fault: no route, proxy down. Says nothing about the
             // peer, so no counter moves and the class does not change.
-            Outcome::OurFault => {}
+            Outcome::OurFault(_) => {}
             Outcome::Disconnected { .. } => {
                 entry.last_attempt_failed = false;
                 entry.failures = 0;
@@ -694,7 +694,7 @@ impl Table {
 mod tests {
     use super::*;
     use crate::addrman::banlist::BanEntry;
-    use crate::addrman::policy::Reason;
+    use crate::addrman::policy::{OurFault, Reason};
 
     const DAY: u32 = 24 * 60 * 60;
     const NOW: u32 = 1_000_000;
@@ -771,7 +771,7 @@ mod tests {
         }
 
         // Once the attempt ends it becomes eligible again.
-        t.record_ended(key, NOW, Outcome::OurFault);
+        t.record_ended(key, NOW, Outcome::OurFault(OurFault::NetworkUnreachable));
         release_all(&mut t);
         assert_eq!(t.pick(NOW, 10, &EnabledNets::all(), &bl).len(), 1);
     }
@@ -1070,7 +1070,7 @@ mod tests {
 
         // A later failure is a failed attempt, not evidence the peer dropped
         // v2 support.
-        t.record_ended(key, NOW, Outcome::Failed(Reason::TimedOut));
+        t.record_ended(key, NOW, Outcome::Failed(Reason::TcpConnectTimeout));
         assert_eq!(t.entry(&key).unwrap().transport, TransportHint::V2);
         t.record_v1_only(key, NOW);
         assert_eq!(t.entry(&key).unwrap().transport, TransportHint::V2);
@@ -1106,7 +1106,11 @@ mod tests {
         // addresses whenever a network was unavailable.
         for i in 0..5 {
             t.record_dialing(key, NOW + i);
-            t.record_ended(key, NOW + i, Outcome::OurFault);
+            t.record_ended(
+                key,
+                NOW + i,
+                Outcome::OurFault(OurFault::NetworkUnreachable),
+            );
         }
         let e = t.entry(&key).unwrap();
         assert_eq!(e.failures, 0);
@@ -1155,7 +1159,7 @@ mod tests {
 
         // Fifth failure on an address that has never once connected: dropped
         // regardless of how recently it was announced.
-        t.record_ended(key, NOW, Outcome::Failed(Reason::TimedOut));
+        t.record_ended(key, NOW, Outcome::Failed(Reason::TcpConnectTimeout));
         assert!(t.entry(&key).is_none(), "entry should have been forgotten");
         assert!(t.active.is_empty(), "active slot should have been released");
     }
@@ -1167,7 +1171,7 @@ mod tests {
         t.insert_manual(NOW, &[key]);
 
         for _ in 0..20 {
-            t.record_ended(key, NOW, Outcome::Failed(Reason::TimedOut));
+            t.record_ended(key, NOW, Outcome::Failed(Reason::TcpConnectTimeout));
         }
         let e = t.entry(&key).expect("manual entry was forgotten");
         // And it keeps a short retry rather than backing off to days.

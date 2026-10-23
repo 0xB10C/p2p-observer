@@ -86,14 +86,34 @@ pub enum Origin {
 }
 
 /// Why a dial attempt did not produce a session.
+///
+/// Timeouts are split by where they fired: a peer that never answers the TCP
+/// connect and one that completes the transport handshake and then goes silent
+/// are different behaviours, and only the second is worth being surprised by.
+/// Nothing in this module branches on the reason — it is carried so the
+/// attempt can be reported faithfully.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
     ConnectionRefused,
     HostUnreachable,
-    TimedOut,
+    TcpConnectTimeout,
+    V2TransportTimeout,
+    VersionHandshakeTimeout,
+    V2TransportHandshake,
+    VersionHandshake,
     UnexpectedEof,
-    HandshakeFailed,
     Other,
+}
+
+/// Why we could not make an attempt at all. Never counted against the address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OurFault {
+    /// No route from here to that network.
+    NetworkUnreachable,
+    /// The Tor SOCKS5 proxy is not answering.
+    ProxyUnreachable,
+    /// Configured not to dial this network, or no transport for it.
+    NetworkDisabled,
 }
 
 /// What became of a dial attempt.
@@ -106,7 +126,7 @@ pub enum Outcome {
     /// We could not even make the attempt: no route to that network, the Tor
     /// proxy is down, and so on. Never counted against the address, because it
     /// says nothing about the peer.
-    OurFault,
+    OurFault(OurFault),
 }
 
 impl Outcome {
@@ -173,7 +193,7 @@ pub fn retry_delay_secs(
     }
 
     match outcome {
-        Outcome::OurFault => OUR_FAULT_SECS,
+        Outcome::OurFault(_) => OUR_FAULT_SECS,
 
         Outcome::Disconnected { uptime_secs } => {
             if *uptime_secs >= SHORT_SESSION_SECS {
@@ -258,7 +278,7 @@ mod tests {
     const DAY: u32 = 24 * 60 * 60;
 
     fn failed() -> Outcome {
-        Outcome::Failed(Reason::TimedOut)
+        Outcome::Failed(Reason::TcpConnectTimeout)
     }
 
     #[test]
@@ -345,10 +365,16 @@ mod tests {
     #[test]
     fn test_our_fault_is_a_short_pause_and_not_a_failure() {
         assert_eq!(
-            retry_delay_secs(&Outcome::OurFault, Origin::Gossip, false, 0, 0),
+            retry_delay_secs(
+                &Outcome::OurFault(OurFault::NetworkUnreachable),
+                Origin::Gossip,
+                false,
+                0,
+                0
+            ),
             OUR_FAULT_SECS
         );
-        assert!(!Outcome::OurFault.counts_as_failure());
+        assert!(!Outcome::OurFault(OurFault::NetworkUnreachable).counts_as_failure());
         assert!(failed().counts_as_failure());
     }
 
@@ -357,7 +383,7 @@ mod tests {
         // However bad its history, and whatever the outcome.
         for outcome in [
             failed(),
-            Outcome::OurFault,
+            Outcome::OurFault(OurFault::NetworkUnreachable),
             Outcome::Disconnected { uptime_secs: 0 },
         ] {
             assert_eq!(
