@@ -7,7 +7,7 @@ edition = "2024"
 common = { path = "../common" }
 bip324 = { git = "https://github.com/rust-bitcoin/bip324", package = "bip324", features = ["tokio"] }
 tokio-socks = "0.5"
-sha3 = "0.11"
+sha3 = "0.12"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
