@@ -534,7 +534,7 @@ impl AddrStore {
         inserted
     }
 
-    /// Insert addresses into the manual table. Returns the number of new addresses added.
+    /// Insert addresses into the manual book. Returns the number of new addresses added.
     pub fn insert_manual(&mut self, addrs: Vec<PeerAddr>) -> usize {
         let mut inserted = 0;
         for peer in addrs {
@@ -728,7 +728,7 @@ impl AddrStore {
         });
     }
 
-    /// Look up the `PeerAddr` for a `NetAddr` in any table, preserving its services.
+    /// Look up the `PeerAddr` for a `NetAddr` in any book, preserving its services.
     fn take(&mut self, addr: &NetAddr) -> Option<PeerAddr> {
         let key = PeerAddr::new(addr.clone(), ServiceFlags::NONE);
         if let Some(peer) = self.manual.take(&key) {

@@ -2,7 +2,7 @@
 
 ## `addresses.info`
 
-Returns counts of addresses in each table (unknown, good, bad, manual, banned).
+Returns counts of addresses in each book (unknown, good, bad, manual, banned).
 
 ```bash
 $ nats request p2p-observer.signet.rpc.addresses.info ''
@@ -11,7 +11,7 @@ $ nats request p2p-observer.signet.rpc.addresses.info ''
 
 ## `addresses.add`
 
-Add addresses to the manual table. Returns count of addresses added.
+Add addresses to the manual book. Returns count of addresses added.
 
 ```bash
 $ nats request p2p-observer.signet.rpc.addresses.add '["1.2.3.4:8333", "5.6.7.8:8333"]'
