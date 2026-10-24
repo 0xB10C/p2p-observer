@@ -1,3 +1,16 @@
+//! One connection attempt.
+//!
+//! Single-shot by design: dial, handshake, run the session, report what
+//! happened, exit. Nothing here decides when an address is tried again — all
+//! retry and backoff timing lives in the address manager, which is the only
+//! place that can see an address's whole history.
+//!
+//! The previous version carried its own retry loops (`initial_connect`,
+//! `reconnect_loop`, two attempt counters and a doubling backoff) while the
+//! address store separately had a one-hour retry for bad addresses. Two
+//! schedules for the same decision meant some cases were handled twice and
+//! others not at all.
+
 use bip324::{Role, futures::Protocol};
 use common::{
     anyhow::{self, Context, Result},
@@ -5,61 +18,278 @@ use common::{
         self,
         io::BufReader,
         net::TcpStream,
-        sync::mpsc,
-        time::{Duration, sleep, timeout},
+        time::{Duration, timeout},
     },
     tracing,
     tracing::Instrument,
 };
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
-use crate::addresses::{BadReason, NetAddr, PeerAddr, StatusUpdate};
+use crate::addresses::key::{AddrKey, Net};
+use crate::addresses::policy::{OurFault, Outcome, Reason};
+use crate::addresses::table::{Dial, TransportHint};
+use crate::addresses::{Dialer, Handle};
 use crate::protocol::{Config, Session, run_session};
 use crate::transport::{
     TransportV1Reader, TransportV1Writer, TransportV2Reader, TransportV2Writer,
 };
-use common::p2p::ServiceFlags;
 
 use crate::TARGET_CONNECTION as TARGET;
 
-/// Initial wait before the first reconnect attempt after a failure.
-/// Doubles on each consecutive failure, reset to this value after a successful connection.
-const BACKOFF_BASE: Duration = Duration::from_secs(1);
-
-/// Maximum number of attempts when connecting to a peer for the first time.
-const MAX_INITIAL_ATTEMPTS: u32 = 2;
-/// Maximum number of reconnect attempts after a peer we once successfully connected to drops us.
-/// With BACKOFF_BASE doubling each attempt: 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s.
-const MAX_RECONNECT_ATTEMPTS: u32 = 8;
-
-/// Timeout for TCP connection attempts. The OS default (several minutes with SYN retransmits)
-/// is far too long when managing many connections.
+/// Timeout for TCP connection attempts. The OS default (several minutes with
+/// SYN retransmits) is far too long when managing many connections.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A connection shorter than this is considered a likely eviction (peer is full).
-const EVICTION_THRESHOLD: Duration = Duration::from_secs(31);
-/// Minimum wait before retrying after a short-lived successful connection, to avoid
-/// hammering a peer that is repeatedly evicting us.
-const EVICTION_COOLDOWN: Duration = Duration::from_secs(60);
+/// Timeout for opening a connection through the Tor SOCKS5 proxy. Covers both
+/// talking to the proxy and the circuit it builds, so it is more generous than
+/// a direct TCP connect.
+const TOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for the BIP324 transport handshake, which runs before the version
+/// handshake and is just as capable of stalling forever against a peer that
+/// accepts the connection and then goes quiet.
+const V2_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(30);
 
 static PEER_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Per-peer connection state. Drives the full lifecycle for a single peer:
-/// initial connect, message loop, and reconnect loop.
-pub struct Connection {
-    id: u64,
-    cfg: Config,
-    status_tx: mpsc::Sender<StatusUpdate>,
-    new_addr_tx: mpsc::Sender<Vec<PeerAddr>>,
-    peer: PeerAddr,
-    /// Once we've connected via v2, never fall back to v1.
-    skip_v1_fallback: bool,
+/// Spawns one task per dial. This is the manager's only way of starting work,
+/// and it is behind the [`Dialer`] trait so tests can drive the manager
+/// without opening sockets.
+pub(crate) struct TaskDialer {
+    pub(crate) cfg: Config,
+    pub(crate) addrman: Handle,
 }
 
-/// Apply socket-level options that improve latency and reliability for
-/// long-lived Bitcoin P2P connections.
+impl Dialer for TaskDialer {
+    fn dial(&self, dial: Dial) {
+        let cfg = self.cfg.clone();
+        let addrman = self.addrman.clone();
+        tokio::spawn(attempt(dial, cfg, addrman));
+    }
+}
+
+/// Run one attempt and report the outcome.
+///
+/// The [`EndGuard`](crate::addresses::EndGuard) is taken first and dropped last,
+/// so the manager hears that the attempt is over even if this task panics or
+/// is aborted. Without that the address would stay in the in-flight set
+/// forever and never be dialled again.
+pub(crate) async fn attempt(dial: Dial, cfg: Config, addrman: Handle) {
+    let id = PEER_ID.fetch_add(1, Ordering::Relaxed);
+    let span = tracing::info_span!(target: TARGET, "c", id, addr = %dial.key);
+
+    async move {
+        let guard = addrman.end_guard(dial.key);
+        tracing::debug!(target: TARGET, transport = ?dial.transport, "attempting");
+
+        let started = Instant::now();
+        let (outcome, transport_version, result) =
+            match connect_and_run(id, &dial, &cfg, &addrman).await {
+                Ok((version, connected_at)) => {
+                    let uptime = connected_at.elapsed();
+                    tracing::debug!(target: TARGET, ?uptime, "session ended");
+                    // Setup is everything before the handshake completed, the
+                    // session is the rest. Reported separately so neither is
+                    // hidden inside one "duration".
+                    let setup = started.elapsed().saturating_sub(uptime);
+                    (
+                        Outcome::Disconnected {
+                            uptime_secs: uptime.as_secs() as u32,
+                        },
+                        // The session ran, so the transport is settled whatever
+                        // the hint said going in.
+                        Some(u32::from(version)),
+                        disconnected_result(setup, uptime),
+                    )
+                }
+                Err(e) => {
+                    let outcome = classify(&e, dial.key.net());
+                    tracing::debug!(target: TARGET, ?outcome, "attempt failed: {e:#}");
+                    // Only a hint that named a transport tells us what we tried.
+                    // Still detecting means the attempt settled nothing.
+                    let attempted = match dial.transport {
+                        TransportHint::V2 => Some(2),
+                        TransportHint::V1Only { .. } => Some(1),
+                        TransportHint::Unknown => None,
+                    };
+                    (
+                        outcome,
+                        attempted,
+                        failed_result(outcome, started.elapsed()),
+                    )
+                }
+            };
+
+        // One event per attempt whether or not it reached a session, so the
+        // archive shows reachability over time rather than only the contacts
+        // that happened to work.
+        emit_result(&cfg, id, &dial, transport_version, result);
+        guard.finish(outcome);
+    }
+    .instrument(span)
+    .await
+}
+
+/// Publish the outcome of an attempt as a research event.
+fn disconnected_result(
+    setup: Duration,
+    uptime: Duration,
+) -> common::events::connection_result::Result {
+    common::events::connection_result::Result::Disconnected(
+        common::events::connection_result::Disconnected {
+            setup_ms: setup.as_millis() as u64,
+            uptime_ms: uptime.as_millis() as u64,
+        },
+    )
+}
+
+/// An attempt that never reached a session, as the oneof variant for it.
+///
+/// Splits on whether the failure was the peer's or ours, which is the
+/// distinction the whole classification exists to make.
+fn failed_result(outcome: Outcome, elapsed: Duration) -> common::events::connection_result::Result {
+    use common::events::{FailureReason, OurFaultReason, connection_result};
+
+    let setup_ms = elapsed.as_millis() as u64;
+    match outcome {
+        Outcome::OurFault(reason) => {
+            connection_result::Result::OurFault(connection_result::OurFault {
+                reason: match reason {
+                    OurFault::NetworkUnreachable => OurFaultReason::NetworkUnreachable,
+                    OurFault::ProxyUnreachable => OurFaultReason::ProxyUnreachable,
+                    OurFault::NetworkDisabled => OurFaultReason::NetworkDisabled,
+                }
+                .into(),
+                setup_ms,
+            })
+        }
+        Outcome::Failed(reason) => connection_result::Result::Failed(connection_result::Failed {
+            reason: match reason {
+                Reason::ConnectionRefused => FailureReason::ConnectionRefused,
+                Reason::HostUnreachable => FailureReason::HostUnreachable,
+                Reason::TcpConnectTimeout => FailureReason::TcpConnectTimeout,
+                Reason::V2TransportTimeout => FailureReason::V2TransportTimeout,
+                Reason::VersionHandshakeTimeout => FailureReason::VersionHandshakeTimeout,
+                Reason::V2TransportHandshake => FailureReason::V2TransportHandshake,
+                Reason::VersionHandshake => FailureReason::VersionHandshake,
+                Reason::UnexpectedEof => FailureReason::UnexpectedEof,
+                Reason::Other => FailureReason::Other,
+            }
+            .into(),
+            setup_ms,
+        }),
+        // Unreachable: a session has its own constructor above.
+        Outcome::Disconnected { .. } => {
+            connection_result::Result::Failed(connection_result::Failed {
+                reason: FailureReason::Unknown.into(),
+                setup_ms,
+            })
+        }
+    }
+}
+
+/// Publish the outcome of an attempt as a research event.
+fn emit_result(
+    cfg: &Config,
+    id: u64,
+    dial: &Dial,
+    transport_version: Option<u32>,
+    result: common::events::connection_result::Result,
+) {
+    // try_send: dropping an event under pressure is better than stalling a
+    // connection task on the publisher.
+    let _ = cfg.event_tx.try_send(common::events::PeerEvent {
+        timestamp_ms: unix_ms(),
+        peer_addr: dial.key.to_string(),
+        // Unknown unless the handshake completed; the session event carries it.
+        user_agent: String::new(),
+        transport_version,
+        connection_id: id,
+        event: Some(common::events::peer_event::Event::ConnectionResult(
+            common::events::ConnectionResult {
+                result: Some(result),
+            },
+        )),
+    });
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// One attempt for the bootstrap header sync.
+///
+/// Separate from [`attempt`] because the caller has to see the error — a
+/// finished sync is signalled by `SyncComplete` — and because bootstrap runs
+/// before the manager is dialling, so there is no in-flight slot to release
+/// and no outcome to record.
+pub(crate) async fn bootstrap_attempt(
+    key: AddrKey,
+    cfg: &Config,
+    addrman: &Handle,
+) -> Result<Instant> {
+    let id = PEER_ID.fetch_add(1, Ordering::Relaxed);
+    let span = tracing::info_span!(target: TARGET, "boot", id, addr = %key);
+    let dial = Dial {
+        key,
+        transport: TransportHint::Unknown,
+    };
+    connect_and_run(id, &dial, cfg, addrman)
+        .instrument(span)
+        .await
+        .map(|(_, at)| at)
+}
+
+/// Connect with whichever transport the hint calls for, then run the session.
+/// Returns the transport version that actually carried the session, and the
+/// instant the handshake completed.
+///
+/// The version is returned rather than inferred from the hint by the caller:
+/// a dial that starts out detecting resolves to v1 or v2 here, and the caller
+/// has no other way to learn which.
+async fn connect_and_run(
+    id: u64,
+    dial: &Dial,
+    cfg: &Config,
+    addrman: &Handle,
+) -> Result<(u8, Instant)> {
+    match dial.transport {
+        // Known to speak v2. A failure is a failed attempt, never a reason to
+        // fall back and conclude the peer lost the feature.
+        TransportHint::V2 => connect_v2(id, dial, cfg, addrman).await.map(|at| (2, at)),
+
+        // v2 did not work last time. Skip straight to v1 and save a round trip.
+        TransportHint::V1Only { .. } => connect_v1(id, dial, cfg, addrman).await.map(|at| (1, at)),
+
+        // Detecting: we do not know yet what this peer speaks.
+        TransportHint::Unknown => {
+            match connect_v2(id, dial, cfg, addrman).await {
+                Ok(at) => Ok((2, at)),
+                Err(e) => {
+                    // A TCP-level failure says nothing about which transport
+                    // the peer speaks, so there is nothing to learn and
+                    // nothing to retry differently.
+                    if is_tcp_level(&e) {
+                        return Err(e);
+                    }
+                    // The TCP connection worked and the v2 handshake did not.
+                    // Record that before trying v1, so the knowledge survives
+                    // even if v1 then fails for an unrelated reason.
+                    tracing::trace!(target: TARGET, "v2 handshake failed, trying v1: {e:#}");
+                    addrman.v1_only(dial.key);
+                    connect_v1(id, dial, cfg, addrman).await.map(|at| (1, at))
+                }
+            }
+        }
+    }
+}
+
+/// Apply socket options that matter for long-lived Bitcoin P2P connections.
 fn configure_stream(stream: &TcpStream) -> Result<()> {
     // Disable Nagle's algorithm so every write goes on the wire immediately.
     // Without this the kernel buffers small messages until a full MSS
@@ -70,12 +300,14 @@ fn configure_stream(stream: &TcpStream) -> Result<()> {
     stream.set_nodelay(true).context("set_nodelay")?;
 
     // Cap how long the kernel will retransmit unacknowledged data before
-    // aborting the connection. The default is unbounded — the OS can spend
-    // many minutes retransmitting while the connection appears alive to us.
-    // A dead peer (crashed node, network partition) would go undetected for
-    // that entire window, stalling the reconnect loop. 30 seconds is long
-    // enough to ride out transient packet loss but short enough to detect
-    // real failures promptly.
+    // aborting. The default is effectively unbounded: the OS can spend many
+    // minutes retransmitting while the connection still looks alive to us, so
+    // a crashed peer or a network partition would go undetected that whole
+    // time. Thirty seconds rides out transient loss but notices real failures.
+    //
+    // Note this only fires when there is unacknowledged data. A peer that
+    // acknowledges our bytes and then says nothing is caught by the handshake
+    // timeouts instead.
     #[cfg(target_os = "linux")]
     {
         let timeout_ms: u32 = 30_000;
@@ -96,346 +328,240 @@ fn configure_stream(stream: &TcpStream) -> Result<()> {
     Ok(())
 }
 
-impl Connection {
-    pub fn new(
-        cfg: Config,
-        status_tx: mpsc::Sender<StatusUpdate>,
-        new_addr_tx: mpsc::Sender<Vec<PeerAddr>>,
-        peer: PeerAddr,
-    ) -> Self {
-        Self {
-            id: PEER_ID.fetch_add(1, Ordering::Relaxed),
-            cfg,
-            status_tx,
-            new_addr_tx,
-            peer,
-            skip_v1_fallback: false,
-        }
+async fn tor_connect(key: &AddrKey, cfg: &Config) -> Result<TcpStream> {
+    if !cfg.networks.tor.enabled {
+        return Err(Stage::NetworkDisabled)
+            .context("attempted to connect to a TorV3 address, but Tor is disabled");
     }
+    let proxy: std::net::SocketAddr = cfg
+        .networks
+        .tor
+        .proxy_addr
+        .parse()
+        .context("invalid SOCKS5 proxy address")?;
 
-    pub async fn run(mut self) {
-        let span = tracing::info_span!(target: TARGET, "c", id = self.id, addr = %self.peer.addr);
-        async move {
-            tracing::debug!(target: TARGET, "opening new connection");
-            crate::ACTIVE_TASKS.fetch_add(1, Ordering::Relaxed);
-            if self.initial_connect().await {
-                // initial connection succeeded. Retry for a bit on the next connection drop.
-                self.reconnect_loop().await;
-            }
-            crate::ACTIVE_TASKS.fetch_sub(1, Ordering::Relaxed);
-        }
-        .instrument(span)
+    let target = key.to_string();
+    tracing::trace!(target: TARGET, %proxy, %target, "connecting via the Tor SOCKS5 proxy");
+    let socks = timeout(
+        TOR_CONNECT_TIMEOUT,
+        tokio_socks::tcp::socks5::Socks5Stream::connect(proxy, target),
+    )
+    .await
+    .map_err(|_| Stage::TorProxyTimeout)?
+    .map_err(|e| anyhow::Error::new(e).context(Stage::ProxyUnreachable))?;
+
+    let stream = socks.into_inner();
+    configure_stream(&stream)?;
+    Ok(stream)
+}
+
+async fn ip_connect(key: &AddrKey) -> Result<TcpStream> {
+    let socket_addr = key.socket_addr().context("address has no socket address")?;
+    let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
         .await
+        .map_err(|_| Stage::TcpConnectTimeout)?
+        .context("TCP connect")?;
+    configure_stream(&stream)?;
+    Ok(stream)
+}
+
+async fn tcp_connect(key: &AddrKey, cfg: &Config) -> Result<TcpStream> {
+    match key.net() {
+        Net::TorV3 => tor_connect(key, cfg).await,
+        Net::Ipv4 | Net::Ipv6 | Net::Cjdns => ip_connect(key).await,
+        Net::I2p => Err(Stage::NetworkDisabled).context("I2P is not supported yet"),
     }
+}
 
-    /// Tries to connect for the first time, up to `MAX_INITIAL_ATTEMPTS` attempts.
-    /// Hard errors (refused, unreachable) give up immediately.
-    /// Returns true if we connected at least once (triggering the reconnect loop).
-    async fn initial_connect(&mut self) -> bool {
-        let mut backoff = BACKOFF_BASE;
-        let mut last_reason: Option<BadReason> = None;
-        for attempt in 1..=MAX_INITIAL_ATTEMPTS {
-            match self.try_connect().await {
-                Ok(_) => return true,
-                Err(e) => {
-                    let bad = |reason| StatusUpdate::Bad {
-                        addr: self.peer.addr.clone(),
-                        at: unix_secs(),
-                        reason,
-                    };
+async fn connect_v2(id: u64, dial: &Dial, cfg: &Config, addrman: &Handle) -> Result<Instant> {
+    tracing::trace!(target: TARGET, "connecting (v2) ...");
+    let stream = tcp_connect(&dial.key, cfg).await?;
+    let raw_fd = stream.as_raw_fd();
+    let (reader, writer) = stream.into_split();
 
-                    if is_network_unreachable(&e) {
-                        tracing::debug!(target: TARGET, "network unreachable");
-                        let _ = self
-                            .status_tx
-                            .send(bad(BadReason::NetworkUnreachable))
-                            .await;
-                        return false;
-                    }
-
-                    if is_connection_refused(&e) {
-                        tracing::debug!(target: TARGET, "connection refused");
-                        let _ = self.status_tx.send(bad(BadReason::ConnectionRefused)).await;
-                        return false;
-                    }
-
-                    if is_host_unreachable(&e) {
-                        tracing::debug!(target: TARGET, "host unreachable");
-                        let _ = self.status_tx.send(bad(BadReason::HostUnreachable)).await;
-                        return false;
-                    }
-
-                    // Don't early exit for these, but track the reason:
-                    if is_timed_out(&e) {
-                        tracing::debug!(target: TARGET, "connection timed out");
-                        last_reason = Some(BadReason::TimedOut);
-                    } else if is_unexpected_eof(&e) {
-                        tracing::debug!(target: TARGET, "unexpected EOF");
-                        last_reason = Some(BadReason::UnexpectedEOF);
-                    } else {
-                        last_reason.get_or_insert(BadReason::Other);
-                    }
-
-                    if attempt >= MAX_INITIAL_ATTEMPTS {
-                        tracing::debug!(target: TARGET, attempt, error=%e, "initial connect failed, giving up");
-                        let _ = self
-                            .status_tx
-                            .send(bad(last_reason.unwrap_or(BadReason::Other)))
-                            .await;
-                        return false;
-                    }
-                    backoff *= 2;
-                    tracing::trace!(target: TARGET,
-                        error = format!("{:#}", e),
-                        "initial connect failed, retrying in {}s", backoff.as_secs()
-                    );
-                    sleep(backoff).await;
-                }
-            }
-        }
-        false
-    }
-
-    /// Reconnects to a peer we've previously connected to, up to `MAX_RECONNECT_ATTEMPTS` per drop.
-    async fn reconnect_loop(&mut self) {
-        let mut backoff = BACKOFF_BASE;
-        let mut attempts = 0u32;
-
-        loop {
-            let result = self.try_connect().await;
-            attempts += 1;
-            backoff *= 2;
-
-            match result {
-                Ok(connected_at) => {
-                    let _ = self
-                        .status_tx
-                        .send(StatusUpdate::Good {
-                            addr: self.peer.addr.clone(),
-                            at: unix_secs(),
-                            services: None,
-                        })
-                        .await;
-                    let uptime = connected_at.elapsed();
-
-                    // Reset backoff if the connection was stable long enough.
-                    if uptime > backoff {
-                        backoff = BACKOFF_BASE;
-                        attempts = 0;
-                    }
-
-                    let uptime_str = format!("{:?}", uptime);
-                    if uptime < EVICTION_THRESHOLD {
-                        tracing::debug!(target: TARGET,
-                            "connection lost after only {uptime_str}. Cooling down for {}s",
-                            EVICTION_COOLDOWN.as_secs(),
-                        );
-                        sleep(EVICTION_COOLDOWN).await;
-                    }
-
-                    let backoff_secs = backoff.as_secs();
-                    tracing::warn!(target: TARGET,
-                        "connection lost after {uptime_str}. reconnecting in {backoff_secs}s"
-                    );
-                }
-                Err(e) => {
-                    if is_network_unreachable(&e) {
-                        tracing::debug!(target: TARGET, "network unreachable, stopping reconnect");
-                        break;
-                    }
-                    let backoff_secs = backoff.as_secs();
-                    tracing::trace!(target: TARGET,
-                        error = format!("{:#}", e),
-                        "re-connect failed; retrying in {backoff_secs}s (attempt={attempts})"
-                    );
-                }
-            }
-
-            if attempts >= MAX_RECONNECT_ATTEMPTS {
-                tracing::debug!(target: TARGET, attempts, "giving up re-connect");
-                break;
-            }
-
-            sleep(backoff).await;
-        }
-    }
-
-    async fn tor_connect(&self) -> Result<TcpStream> {
-        if !self.cfg.networks.tor.enabled {
-            anyhow::bail!("attempted to connect to TorV3 address, but Tor is disabled");
-        }
-        // Connect via Tor SOCKS5 proxy
-        let socks_addr: std::net::SocketAddr = self
-            .cfg
-            .networks
-            .tor
-            .proxy_addr
-            .parse()
-            .context("invalid SOCKS5 proxy address")?;
-
-        // Extract the stored onion address
-        let target = if let NetAddr::TorV3(addr, port) = &self.peer.addr {
-            format!("{}:{}", addr, port)
-        } else {
-            unreachable!("is_tor is true, so this must be TorV3")
-        };
-
-        tracing::trace!(target: TARGET, proxy=%socks_addr, %target, "connecting via Tor SOCKS5");
-        let socks_stream = tokio_socks::tcp::socks5::Socks5Stream::connect(socks_addr, target)
-            .await
-            .context("Tor SOCKS5 connection")?;
-        let stream = socks_stream.into_inner();
-        configure_stream(&stream)?;
-        Ok(stream)
-    }
-
-    async fn ip_connect(&self) -> Result<TcpStream> {
-        let socket_addr = self
-            .peer
-            .addr
-            .to_socket_addr()
-            .context("not an IPv4 or IPv6 address")?;
-        let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
-            .await
-            .context("TCP connect timeout")?
-            .context("TCP connect")?;
-        configure_stream(&stream)?;
-        Ok(stream)
-    }
-
-    /// Connect to a peer, using Tor SOCKS5 proxy if the peer is an onion address and Tor is enabled.
-    async fn tcp_connect(&self) -> Result<TcpStream> {
-        match self.peer.addr {
-            NetAddr::TorV3(..) => self.tor_connect().await,
-            NetAddr::Ipv4(..) | NetAddr::Ipv6(..) => self.ip_connect().await,
-            _ => {
-                anyhow::bail!("unsupported address type: {}", self.peer.addr)
-            }
-        }
-    }
-
-    /// Attempts a v2 connection, falling back to v1 on failure.
-    /// Once v2 has succeeded once, `skip_v1_fallback` is set and v1 is never tried again.
-    pub async fn try_connect(&mut self) -> Result<Instant> {
-        // We set ServiceFlags::NONE on addresses we don't know, so also try a V2 connection there.
-        if !self.peer.services().has(ServiceFlags::P2P_V2)
-            && self.peer.services().has(ServiceFlags::NONE)
-        {
-            tracing::trace!(target: TARGET, services=%self.peer.services(), "not attemping a v2 connection, as ServiceFlags indicate this node does not support P2Pv2");
-            return self.connect_v1().await;
-        }
-        if self.skip_v1_fallback {
-            tracing::trace!(target: TARGET, "not attemping a v1 connection, as we were previously connected as v2 to this node");
-            return self.connect_v2().await;
-        }
-        match self.connect_v2().await {
-            ok @ Ok(_) => {
-                self.skip_v1_fallback = true;
-                ok
-            }
-            Err(e) => {
-                if is_tcp_connect_error(&e) {
-                    return Err(e);
-                }
-                tracing::trace!(target: TARGET, "trying transport v1 as v2 failed: {e:#}");
-                self.connect_v1().await
-            }
-        }
-    }
-
-    async fn connect_v2(&self) -> Result<Instant> {
-        tracing::trace!(target: TARGET, "connecting (v2) ...");
-        let stream = self.tcp_connect().await?;
-        let raw_fd = stream.as_raw_fd();
-        let (reader, writer) = stream.into_split();
-        let proto = Protocol::new(
-            self.cfg.magic,
+    let proto = timeout(
+        V2_TRANSPORT_TIMEOUT,
+        Protocol::new(
+            cfg.magic,
             Role::Initiator,
             None,
             None,
             BufReader::new(reader),
             writer,
-        )
-        .await?;
-        let (pr, pw) = proto.into_split();
-        run_session(
-            TransportV2Reader { reader: pr },
-            TransportV2Writer { writer: pw },
-            Session {
-                transport_version: 2,
-                connection_id: self.id,
-                addr: &self.peer.addr,
-                raw_fd,
-                cfg: &self.cfg,
-                status_tx: &self.status_tx,
-                new_addr_tx: &self.new_addr_tx,
-            },
-        )
-        .await
+        ),
+    )
+    .await
+    .map_err(|_| Stage::V2TransportTimeout)?
+    .map_err(|e| anyhow::Error::new(e).context(Stage::V2TransportHandshake))?;
+
+    let (pr, pw) = proto.into_split();
+    run_session(
+        TransportV2Reader { reader: pr },
+        TransportV2Writer { writer: pw },
+        Session {
+            transport_version: 2,
+            connection_id: id,
+            key: dial.key,
+            raw_fd,
+            cfg,
+            addrman,
+        },
+    )
+    .await
+}
+
+async fn connect_v1(id: u64, dial: &Dial, cfg: &Config, addrman: &Handle) -> Result<Instant> {
+    tracing::trace!(target: TARGET, "connecting (v1) ...");
+    let stream = tcp_connect(&dial.key, cfg).await?;
+    let raw_fd = stream.as_raw_fd();
+    let (reader, writer) = stream.into_split();
+
+    run_session(
+        TransportV1Reader::new(BufReader::new(reader)),
+        TransportV1Writer {
+            magic: cfg.magic,
+            writer,
+        },
+        Session {
+            transport_version: 1,
+            connection_id: id,
+            key: dial.key,
+            raw_fd,
+            cfg,
+            addrman,
+        },
+    )
+    .await
+}
+
+// ── Error classification ─────────────────────────────────────────────────────
+
+/// A failure at a point in the attempt worth telling apart from the others.
+///
+/// Returned as a typed error rather than recognised from the wording of a
+/// context string: grepping prose for "handshake" worked, but it broke
+/// silently the moment anyone reworded a message, and it could not separate
+/// the two handshakes from each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stage {
+    /// Nothing answered the TCP connect.
+    TcpConnectTimeout,
+    /// The Tor SOCKS5 proxy, or the circuit it was building.
+    TorProxyTimeout,
+    /// TCP was up; the BIP324 handshake stalled.
+    V2TransportTimeout,
+    /// TCP and the transport were up; no version message followed.
+    VersionHandshakeTimeout,
+    /// The BIP324 handshake failed outright rather than stalling.
+    V2TransportHandshake,
+    /// The version handshake failed outright rather than stalling.
+    VersionHandshake,
+    /// The Tor proxy is not answering at all.
+    ProxyUnreachable,
+    /// This network is switched off in the config, or has no transport here.
+    NetworkDisabled,
+}
+
+impl std::fmt::Display for Stage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Stage::TcpConnectTimeout => "TCP connect timed out",
+            Stage::TorProxyTimeout => "Tor SOCKS5 connect timed out",
+            Stage::V2TransportTimeout => "BIP324 transport handshake timed out",
+            Stage::VersionHandshakeTimeout => "version handshake timed out",
+            Stage::V2TransportHandshake => "BIP324 transport handshake failed",
+            Stage::VersionHandshake => "version handshake failed",
+            Stage::ProxyUnreachable => "Tor SOCKS5 proxy unreachable",
+            Stage::NetworkDisabled => "network disabled or unsupported",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::error::Error for Stage {}
+
+/// The stage a failure was tagged with, if any.
+fn stage_of(err: &anyhow::Error) -> Option<Stage> {
+    err.chain().find_map(|c| c.downcast_ref::<Stage>().copied())
+}
+
+/// Turn a failure into the outcome the manager should record.
+///
+/// The important distinction is `OurFault`. A missing route to a network, or a
+/// Tor proxy that is not running, says nothing whatsoever about the peer. The
+/// old code recorded `NetworkUnreachable` as a bad address, so running without
+/// IPv6 connectivity quietly poisoned the store with every IPv6 address it was
+/// ever told about — and then inconsistently did *not* record it that way on
+/// the reconnect path.
+fn classify(err: &anyhow::Error, net: Net) -> Outcome {
+    if has_kind(err, std::io::ErrorKind::NetworkUnreachable) {
+        return Outcome::OurFault(OurFault::NetworkUnreachable);
     }
 
-    async fn connect_v1(&self) -> Result<Instant> {
-        tracing::trace!(target: TARGET, "connecting (v1) ...");
-        let stream = self.tcp_connect().await?;
-        let raw_fd = stream.as_raw_fd();
-        let (reader, writer) = stream.into_split();
-        run_session(
-            TransportV1Reader::new(BufReader::new(reader)),
-            TransportV1Writer {
-                magic: self.cfg.magic,
-                writer,
-            },
-            Session {
-                transport_version: 1,
-                connection_id: self.id,
-                addr: &self.peer.addr,
-                raw_fd,
-                cfg: &self.cfg,
-                status_tx: &self.status_tx,
-                new_addr_tx: &self.new_addr_tx,
-            },
-        )
-        .await
+    match stage_of(err) {
+        Some(Stage::NetworkDisabled) => return Outcome::OurFault(OurFault::NetworkDisabled),
+        Some(Stage::ProxyUnreachable) => return Outcome::OurFault(OurFault::ProxyUnreachable),
+        Some(Stage::TorProxyTimeout) => {
+            // The onion service is only reachable through our proxy, so a
+            // proxy that will not answer is our problem, not the peer's.
+            return Outcome::OurFault(OurFault::ProxyUnreachable);
+        }
+        Some(Stage::TcpConnectTimeout) => return Outcome::Failed(Reason::TcpConnectTimeout),
+        Some(Stage::V2TransportTimeout) => return Outcome::Failed(Reason::V2TransportTimeout),
+        Some(Stage::VersionHandshakeTimeout) => {
+            return Outcome::Failed(Reason::VersionHandshakeTimeout);
+        }
+        Some(Stage::V2TransportHandshake) => return Outcome::Failed(Reason::V2TransportHandshake),
+        Some(Stage::VersionHandshake) => return Outcome::Failed(Reason::VersionHandshake),
+        None => {}
     }
+
+    // A refused connection to an onion address means our proxy is not running.
+    if net == Net::TorV3 && has_kind(err, std::io::ErrorKind::ConnectionRefused) {
+        return Outcome::OurFault(OurFault::ProxyUnreachable);
+    }
+
+    if has_kind(err, std::io::ErrorKind::ConnectionRefused) {
+        return Outcome::Failed(Reason::ConnectionRefused);
+    }
+    if has_kind(err, std::io::ErrorKind::HostUnreachable) {
+        // Usually an ICMP unreachable from a router near the destination, so
+        // this is evidence about the peer rather than about us.
+        return Outcome::Failed(Reason::HostUnreachable);
+    }
+    if has_kind(err, std::io::ErrorKind::UnexpectedEof) {
+        return Outcome::Failed(Reason::UnexpectedEof);
+    }
+    Outcome::Failed(Reason::Other)
 }
 
-// ── Error classification ──────────────────────────────────────────────────────
-
-fn is_network_unreachable(err: &common::anyhow::Error) -> bool {
-    has_io_error_kind(err, std::io::ErrorKind::NetworkUnreachable)
-}
-
-fn is_host_unreachable(err: &common::anyhow::Error) -> bool {
-    has_io_error_kind(err, std::io::ErrorKind::HostUnreachable)
-}
-
-fn is_unexpected_eof(err: &common::anyhow::Error) -> bool {
-    has_io_error_kind(err, std::io::ErrorKind::UnexpectedEof)
-}
-
-/// Returns true for TCP-level errors where retrying with a different transport
-/// version (v1 vs v2) would not help.
-fn is_tcp_connect_error(err: &common::anyhow::Error) -> bool {
-    is_connection_refused(err)
-        || is_network_unreachable(err)
-        || is_host_unreachable(err)
+/// TCP-level failures, where retrying with a different transport version
+/// cannot help.
+fn is_tcp_level(err: &anyhow::Error) -> bool {
+    has_kind(err, std::io::ErrorKind::ConnectionRefused)
+        || has_kind(err, std::io::ErrorKind::NetworkUnreachable)
+        || has_kind(err, std::io::ErrorKind::HostUnreachable)
         || is_timed_out(err)
 }
 
-fn is_connection_refused(err: &common::anyhow::Error) -> bool {
-    has_io_error_kind(err, std::io::ErrorKind::ConnectionRefused)
-}
-
-fn is_timed_out(err: &common::anyhow::Error) -> bool {
-    // Our explicit tokio::time::timeout fired.
-    if err.chain().any(|c| c.is::<tokio::time::error::Elapsed>()) {
+fn is_timed_out(err: &anyhow::Error) -> bool {
+    if matches!(
+        stage_of(err),
+        Some(
+            Stage::TcpConnectTimeout
+                | Stage::TorProxyTimeout
+                | Stage::V2TransportTimeout
+                | Stage::VersionHandshakeTimeout
+        )
+    ) {
         return true;
     }
-    // OS-level timeout (rare when our explicit timeout is shorter, but possible).
-    has_io_error_kind(err, std::io::ErrorKind::TimedOut)
+    // A tokio timeout we did not tag, or one from the OS.
+    err.chain().any(|c| c.is::<tokio::time::error::Elapsed>())
+        || has_kind(err, std::io::ErrorKind::TimedOut)
 }
 
-fn has_io_error_kind(err: &common::anyhow::Error, kind: std::io::ErrorKind) -> bool {
+fn has_kind(err: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
@@ -443,34 +569,41 @@ fn has_io_error_kind(err: &common::anyhow::Error, kind: std::io::ErrorKind) -> b
     })
 }
 
-fn unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addresses::{NetAddr, PeerAddr};
     use crate::headertree::HeaderTree;
     use crate::protocol::build_version;
-    use crate::transport::{
-        TransportReader, TransportV1Reader, TransportV1Writer, TransportV2Reader,
-        TransportV2Writer, TransportWriter,
-    };
-    use bip324::{Role, futures::Protocol};
-    use common::p2p::{Magic, ServiceFlags};
+    use crate::transport::{TransportReader, TransportWriter};
+    use common::p2p::{Magic, message::NetworkMessage};
     use common::{
         bitcoin::network::Params,
-        p2p::message::NetworkMessage,
-        tokio::{io::BufReader, net::TcpListener, sync::mpsc},
+        tokio::{net::TcpListener, sync::mpsc},
         tracing_subscriber,
     };
     use std::sync::{Arc, RwLock};
+
+    const MAGIC: Magic = Magic::REGTEST;
+
+    fn setup() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .try_init();
+    }
+
+    fn test_config(event_tx: mpsc::Sender<common::events::PeerEvent>) -> Config {
+        Config {
+            magic: MAGIC,
+            ping_interval: Duration::from_secs(120),
+            user_agent: crate::protocol::USER_AGENT.to_owned(),
+            event_tx,
+            header_tree: Arc::new(RwLock::new(HeaderTree::new(Params::new(
+                common::bitcoin::Network::Regtest,
+            )))),
+            sync_headers: false,
+            networks: crate::settings::NetworksConfig::default(),
+        }
+    }
 
     /// Complete the server side of the version handshake.
     async fn server_handshake(
@@ -499,14 +632,6 @@ mod tests {
         }
     }
 
-    const MAGIC: Magic = Magic::REGTEST;
-
-    fn setup() {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .try_init();
-    }
-
     #[tokio::test]
     async fn test_v1_handshake_mock() {
         setup();
@@ -522,31 +647,16 @@ mod tests {
                 writer,
             };
             server_handshake(&mut r, &mut w).await;
-            // Drop → EOF → client message loop exits → connect_v1 returns Ok
+            // Drop -> EOF -> the client's message loop exits.
         });
 
-        let net_addr = NetAddr::Ipv4("127.0.0.1".parse().unwrap(), addr.port());
-        let (status_tx, _status_rx) = mpsc::channel(1);
-        let (tx, _rx) = mpsc::channel::<Vec<PeerAddr>>(1);
         let (event_tx, _event_rx) = mpsc::channel(1);
-        let cfg = Config {
-            magic: MAGIC,
-            ping_interval: Duration::from_secs(120),
-            user_agent: crate::protocol::USER_AGENT.to_owned(),
-            event_tx,
-            header_tree: Arc::new(RwLock::new(HeaderTree::new(Params::new(
-                common::bitcoin::Network::Regtest,
-            )))),
-            sync_headers: false,
-            networks: crate::settings::NetworksConfig::default(),
+        let (handle, _g, _l, _c) = crate::addresses::channels();
+        let dial = Dial {
+            key: AddrKey::Ipv4([127, 0, 0, 1], addr.port()),
+            transport: TransportHint::Unknown,
         };
-        let conn = Connection::new(
-            cfg,
-            status_tx,
-            tx,
-            PeerAddr::new(net_addr, ServiceFlags::NONE),
-        );
-        let result = conn.connect_v1().await;
+        let result = connect_v1(0, &dial, &test_config(event_tx), &handle).await;
         server.await.unwrap();
         assert!(result.is_ok(), "connect_v1 failed: {result:?}");
     }
@@ -576,28 +686,13 @@ mod tests {
             server_handshake(&mut r, &mut w).await;
         });
 
-        let net_addr = NetAddr::Ipv4("127.0.0.1".parse().unwrap(), addr.port());
-        let (status_tx, _status_rx) = mpsc::channel(1);
-        let (tx, _rx) = mpsc::channel::<Vec<PeerAddr>>(1);
         let (event_tx, _event_rx) = mpsc::channel(1);
-        let cfg = Config {
-            magic: MAGIC,
-            ping_interval: Duration::from_secs(120),
-            user_agent: crate::protocol::USER_AGENT.to_owned(),
-            event_tx,
-            header_tree: Arc::new(RwLock::new(HeaderTree::new(Params::new(
-                common::bitcoin::Network::Regtest,
-            )))),
-            sync_headers: false,
-            networks: crate::settings::NetworksConfig::default(),
+        let (handle, _g, _l, _c) = crate::addresses::channels();
+        let dial = Dial {
+            key: AddrKey::Ipv4([127, 0, 0, 1], addr.port()),
+            transport: TransportHint::V2,
         };
-        let conn = Connection::new(
-            cfg,
-            status_tx,
-            tx,
-            PeerAddr::new(net_addr, ServiceFlags::P2P_V2),
-        );
-        let result = conn.connect_v2().await;
+        let result = connect_v2(0, &dial, &test_config(event_tx), &handle).await;
         server.await.unwrap();
         assert!(result.is_ok(), "connect_v2 failed: {result:?}");
     }
@@ -617,7 +712,7 @@ mod tests {
                 writer,
             };
             server_handshake(&mut r, &mut w).await;
-            // Respond to the first ping; ignore everything else (GetAddr, SendHeaders, ...)
+            // Respond to the first ping; ignore everything else.
             loop {
                 if let NetworkMessage::Ping(nonce) = r.recv().await.unwrap() {
                     w.send(NetworkMessage::Pong(nonce)).await.unwrap();
@@ -626,34 +721,22 @@ mod tests {
             }
         });
 
-        let net_addr = NetAddr::Ipv4("127.0.0.1".parse().unwrap(), addr.port());
-        let (status_tx, _status_rx) = mpsc::channel(1);
-        let (addr_tx, _addr_rx) = mpsc::channel::<Vec<PeerAddr>>(1);
         let (event_tx, mut event_rx) = mpsc::channel(4);
-        let cfg = Config {
-            magic: MAGIC,
-            ping_interval: Duration::from_millis(50),
-            user_agent: crate::protocol::USER_AGENT.to_owned(),
-            event_tx,
-            header_tree: Arc::new(RwLock::new(HeaderTree::new(Params::new(
-                common::bitcoin::Network::Regtest,
-            )))),
-            sync_headers: false,
-            networks: crate::settings::NetworksConfig::default(),
+        let mut cfg = test_config(event_tx);
+        cfg.ping_interval = Duration::from_millis(50);
+
+        let (handle, _g, _l, _c) = crate::addresses::channels();
+        // V1Only, so the attempt goes straight to v1 and matches the v1-only
+        // listener above, which accepts exactly once.
+        let dial = Dial {
+            key: AddrKey::Ipv4([127, 0, 0, 1], addr.port()),
+            transport: TransportHint::V1Only { since: 0 },
         };
-        tokio::spawn(
-            Connection::new(
-                cfg,
-                status_tx,
-                addr_tx,
-                PeerAddr::new(net_addr, ServiceFlags::NONE),
-            )
-            .run(),
-        );
+        tokio::spawn(attempt(dial, cfg, handle));
 
         let event = common::tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
             .await
-            .expect("timed out waiting for ping_rtt event")
+            .expect("timed out waiting for a ping_rtt event")
             .expect("event channel closed");
 
         assert!(
@@ -665,5 +748,192 @@ mod tests {
             event.event,
         );
         server.await.unwrap();
+    }
+
+    /// A peer that accepts the connection and then never speaks must not hold
+    /// the task open. TCP_USER_TIMEOUT does not help: it only aborts
+    /// connections with unacknowledged data, and this peer acknowledges ours.
+    #[tokio::test]
+    async fn test_silent_peer_aborts_handshake() {
+        setup();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(stream);
+        });
+
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (handle, _g, _l, _c) = crate::addresses::channels();
+        let dial = Dial {
+            key: AddrKey::Ipv4([127, 0, 0, 1], addr.port()),
+            transport: TransportHint::V1Only { since: 0 },
+        };
+
+        let err = connect_v1(0, &dial, &test_config(event_tx), &handle)
+            .await
+            .expect_err("a silent peer must not yield a session");
+        assert!(is_timed_out(&err), "expected a timeout, got: {err:#}");
+        // The peer completed TCP and then said nothing, which is the case the
+        // split tells apart from a host that never answers at all.
+        assert_eq!(
+            classify(&err, Net::Ipv4),
+            Outcome::Failed(Reason::VersionHandshakeTimeout)
+        );
+        server.abort();
+    }
+
+    /// The attempt always reports back, so the manager can free the slot.
+    #[tokio::test]
+    async fn test_attempt_always_reports_an_outcome() {
+        setup();
+        // Nothing listening: the connection is refused immediately.
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (handle, _g, mut life_rx, _c) = crate::addresses::channels();
+        let key = AddrKey::Ipv4([127, 0, 0, 1], 1);
+
+        attempt(
+            Dial {
+                key,
+                transport: TransportHint::V1Only { since: 0 },
+            },
+            test_config(event_tx),
+            handle,
+        )
+        .await;
+
+        match life_rx.try_recv().expect("no outcome reported") {
+            crate::addresses::Lifecycle::Ended { key: got, outcome } => {
+                assert_eq!(got, key);
+                assert!(outcome.counts_as_failure());
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_network_unreachable_is_our_fault_not_the_peers() {
+        let err = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NetworkUnreachable))
+            .context("TCP connect");
+        // Running without an IPv6 route must not mark every IPv6 address bad.
+        assert_eq!(
+            classify(&err, Net::Ipv6),
+            Outcome::OurFault(OurFault::NetworkUnreachable)
+        );
+        assert!(!Outcome::OurFault(OurFault::NetworkUnreachable).counts_as_failure());
+    }
+
+    #[test]
+    fn test_refused_is_the_peers_problem() {
+        let err = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+            .context("TCP connect");
+        assert_eq!(
+            classify(&err, Net::Ipv4),
+            Outcome::Failed(Reason::ConnectionRefused)
+        );
+        assert!(is_tcp_level(&err));
+    }
+
+    /// A refused connection to an onion address means our Tor proxy is not
+    /// running, which is our problem rather than the onion service's.
+    #[test]
+    fn test_refused_proxy_is_our_fault_for_tor() {
+        let err = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+            .context("Tor SOCKS5 connection");
+        assert_eq!(
+            classify(&err, Net::TorV3),
+            Outcome::OurFault(OurFault::ProxyUnreachable)
+        );
+        // The same error for an IP peer is the peer's problem.
+        assert_eq!(
+            classify(&err, Net::Ipv4),
+            Outcome::Failed(Reason::ConnectionRefused)
+        );
+    }
+
+    #[test]
+    fn test_unexpected_eof_and_other() {
+        let eof = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        assert_eq!(
+            classify(&eof, Net::Ipv4),
+            Outcome::Failed(Reason::UnexpectedEof)
+        );
+        // Not TCP-level: worth trying the other transport version.
+        assert!(!is_tcp_level(&eof));
+
+        let other = anyhow::anyhow!("something else entirely");
+        assert_eq!(classify(&other, Net::Ipv4), Outcome::Failed(Reason::Other));
+    }
+
+    /// Recognised from the typed stage, not from the wording of a message —
+    /// the point of tagging failures rather than grepping them.
+    #[test]
+    fn test_handshake_failure_is_recognised() {
+        let err = anyhow::Error::new(Stage::V2TransportHandshake).context("boom");
+        assert_eq!(
+            classify(&err, Net::Ipv4),
+            Outcome::Failed(Reason::V2TransportHandshake)
+        );
+        assert!(
+            !is_tcp_level(&err),
+            "a handshake failure should allow a v1 fallback"
+        );
+    }
+
+    /// The four timeouts are told apart, which a single TIMED_OUT could not do.
+    #[test]
+    fn test_timeouts_are_distinguished() {
+        for (stage, want) in [
+            (Stage::TcpConnectTimeout, Reason::TcpConnectTimeout),
+            (Stage::V2TransportTimeout, Reason::V2TransportTimeout),
+            (
+                Stage::VersionHandshakeTimeout,
+                Reason::VersionHandshakeTimeout,
+            ),
+        ] {
+            let err = anyhow::Error::new(stage).context("dialling");
+            assert_eq!(classify(&err, Net::Ipv4), Outcome::Failed(want));
+            assert!(is_timed_out(&err), "{stage:?} should read as a timeout");
+        }
+
+        // A Tor proxy that will not answer is ours, not the peer's.
+        let err = anyhow::Error::new(Stage::TorProxyTimeout).context("dialling");
+        assert_eq!(
+            classify(&err, Net::TorV3),
+            Outcome::OurFault(OurFault::ProxyUnreachable)
+        );
+    }
+
+    /// A network switched off in the config is our doing, not the address's.
+    #[test]
+    fn test_disabled_network_is_our_fault() {
+        let err = anyhow::Error::new(Stage::NetworkDisabled).context("Tor is disabled");
+        assert_eq!(
+            classify(&err, Net::TorV3),
+            Outcome::OurFault(OurFault::NetworkDisabled)
+        );
+        assert!(!classify(&err, Net::TorV3).counts_as_failure());
+    }
+
+    #[test]
+    fn test_disabled_networks_are_not_dialled() {
+        // Belt and braces: pick() filters these out, but a stale Dial must
+        // not open a Tor connection when Tor is off.
+        let cfg = test_config(mpsc::channel(1).0);
+        assert!(!cfg.networks.tor.enabled);
+        let key = AddrKey::TorV3([7u8; 32], 8333);
+        let err = futures_block_on(tor_connect(&key, &cfg)).expect_err("Tor is disabled");
+        assert!(format!("{err:#}").contains("Tor is disabled"));
+    }
+
+    /// Minimal blocking executor for the one synchronous test above.
+    fn futures_block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
     }
 }

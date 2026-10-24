@@ -32,6 +32,43 @@ pub struct Config {
 
     #[serde(default)]
     pub networks: NetworksConfig,
+
+    #[serde(default)]
+    pub addrman: AddrmanConfig,
+}
+
+/// Bounds on the address manager. Both are about resource use rather than
+/// policy, which is why they are configurable and the weights are not.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(crate = "common::serde")]
+pub struct AddrmanConfig {
+    /// Hard ceiling on stored addresses. Inventing addresses is free for a
+    /// peer, so this bound cannot depend on peers behaving.
+    #[serde(default = "default_addr_capacity")]
+    pub capacity: usize,
+
+    /// Maximum connection attempts in flight at once. Each one costs a socket
+    /// and a task, so this is the real limit on how hard we crawl;
+    /// connections_per_second only controls how fast we ramp up to it.
+    #[serde(default = "default_max_dialing")]
+    pub max_dialing: usize,
+}
+
+impl Default for AddrmanConfig {
+    fn default() -> Self {
+        Self {
+            capacity: default_addr_capacity(),
+            max_dialing: default_max_dialing(),
+        }
+    }
+}
+
+fn default_addr_capacity() -> usize {
+    crate::addresses::table::DEFAULT_CAPACITY
+}
+
+fn default_max_dialing() -> usize {
+    200
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -104,14 +141,14 @@ pub struct LogLevels {
     pub connection: String,
     #[serde(default = "default_protocol_level")]
     pub protocol: String,
-    #[serde(default = "default_addresses_level")]
-    pub addresses: String,
     #[serde(default = "default_publisher_level")]
     pub publisher: String,
     #[serde(default = "default_rpc_level")]
     pub rpc: String,
     #[serde(default = "default_headertree_level")]
     pub headertree: String,
+    #[serde(default = "default_addrman_level")]
+    pub addrman: String,
 }
 
 impl Default for LogLevels {
@@ -120,10 +157,10 @@ impl Default for LogLevels {
             main: default_main_level(),
             connection: default_connection_level(),
             protocol: default_protocol_level(),
-            addresses: default_addresses_level(),
             publisher: default_publisher_level(),
             rpc: default_rpc_level(),
             headertree: default_headertree_level(),
+            addrman: default_addrman_level(),
         }
     }
 }
@@ -138,14 +175,14 @@ impl LogLevels {
             self.connection,
             crate::TARGET_PROTOCOL,
             self.protocol,
-            crate::TARGET_ADDRESSES,
-            self.addresses,
             crate::TARGET_PUBLISHER,
             self.publisher,
             crate::TARGET_RPC,
             self.rpc,
             crate::TARGET_HEADERTREE,
             self.headertree,
+            crate::TARGET_ADDRMAN,
+            self.addrman,
         )
     }
 }
@@ -171,9 +208,6 @@ fn default_connection_level() -> String {
 fn default_protocol_level() -> String {
     "debug".to_owned()
 }
-fn default_addresses_level() -> String {
-    "debug".to_owned()
-}
 fn default_publisher_level() -> String {
     "warn".to_owned()
 }
@@ -181,6 +215,9 @@ fn default_rpc_level() -> String {
     "info".to_owned()
 }
 fn default_headertree_level() -> String {
+    "info".to_owned()
+}
+fn default_addrman_level() -> String {
     "info".to_owned()
 }
 
@@ -195,6 +232,7 @@ impl Default for Config {
             bootstrap_addrs: Vec::new(),
             nats_url: default_nats_url(),
             networks: NetworksConfig::default(),
+            addrman: AddrmanConfig::default(),
         }
     }
 }
@@ -271,7 +309,7 @@ mod tests {
         assert_eq!(cfg.log_levels.main, "debug");
         assert_eq!(cfg.log_levels.connection, "info");
         assert_eq!(cfg.log_levels.protocol, "debug");
-        assert_eq!(cfg.log_levels.addresses, "debug");
+        assert_eq!(cfg.log_levels.addrman, "info");
     }
 
     #[test]
@@ -289,7 +327,7 @@ mod tests {
                   main: warn
                   connection: trace
                   protocol: info
-                  addresses: error
+                  addrman: error
             "#,
         );
         assert_eq!(cfg.network, "mainnet");
@@ -300,7 +338,7 @@ mod tests {
         assert_eq!(cfg.log_levels.main, "warn");
         assert_eq!(cfg.log_levels.connection, "trace");
         assert_eq!(cfg.log_levels.protocol, "info");
-        assert_eq!(cfg.log_levels.addresses, "error");
+        assert_eq!(cfg.log_levels.addrman, "error");
     }
 
     #[test]

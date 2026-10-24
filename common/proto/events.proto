@@ -6,12 +6,138 @@ message PeerEvent {
   uint64 timestamp_ms      = 2;
   string peer_addr         = 3;  // e.g. "1.2.3.4:38333"
   string user_agent        = 4;
-  uint32 transport_version = 5;  // 1 or 2
+  // 1 or 2. Absent only on a connection attempt that failed while still
+  // detecting, i.e. before either transport was settled on. Such an attempt
+  // has no transport version, and reporting 0 would put a version that does
+  // not exist into the data.
+  optional uint32 transport_version = 5;
 
   oneof event {
     PingRtt ping_rtt = 6;
     BlockAnnouncement block_announcement = 7;
+    AddressAnnouncement address_announcement = 8;
+    ConnectionResult connection_result = 9;
   }
+}
+
+// Addresses a peer told us about.
+//
+// Carries what was announced, not what we decided to keep: the entries are
+// listed before the per-connection rate limit is applied, so a flood is
+// visible in the archived data rather than silently discarded. This is also
+// what makes it possible to detect crawl bias after the fact: the source peer
+// is on the enclosing PeerEvent, so the share of the table attributable to any
+// one peer or network can be measured offline.
+//
+// Deliberately carries no observer-side policy. How much the rate limit
+// dropped is not here, because the full list is, and the bucket can be
+// replayed from the archive. Nor is any claim about whether this answered a
+// GETADDR: the protocol has no request/response correlation, so that can only
+// be guessed at, and a guess in a permanent archive is worse than nothing.
+// A self-announcement is identifiable offline — a single entry matching the
+// peer on the enclosing PeerEvent — with better information than we have here.
+message AddressAnnouncement {
+  // Which message carried these addresses. Not derivable from the entries: an
+  // addrv2 message may still carry only IPv4.
+  AddrMessage message = 1;
+  // Entries we could not parse, almost always zero. Non-zero means an AddrV2
+  // type we do not understand, which is the one thing the raw count was
+  // carrying that the list below does not.
+  uint32 unparsed = 2;
+  // Every entry we could parse, before the rate limit was applied.
+  repeated GossipedAddress addresses = 3;
+}
+
+// The P2P message that carried an address announcement.
+enum AddrMessage {
+  ADDR_MESSAGE_UNKNOWN = 0;
+  ADDR_MESSAGE_ADDR = 1;
+  ADDR_MESSAGE_ADDRV2 = 2;
+}
+
+message GossipedAddress {
+  // Rendered form, e.g. "1.2.3.4:8333" or "<56 chars>.onion:8333".
+  string addr = 1;
+  uint64 services = 2;
+  // The peer's claimed nTime, unclamped and exactly as announced.
+  uint32 ntime = 3;
+}
+
+// The outcome of one connection attempt.
+//
+// One of these per attempt, whether or not it got as far as a session, so the
+// archive shows reachability over time rather than only successful contacts.
+//
+// A oneof rather than a result code beside optional fields: every variant
+// carries exactly what applies to it, so there is no "duration" that means two
+// different things and no failure reason sitting unset on a success. An unset
+// oneof is the only malformed state.
+message ConnectionResult {
+  // A session ran and then ended.
+  message Disconnected {
+    // Dial and handshake, before the session began.
+    uint64 setup_ms = 1;
+    // The session itself. setup_ms + uptime_ms is the whole attempt.
+    uint64 uptime_ms = 2;
+  }
+
+  // Never reached a session.
+  message Failed {
+    FailureReason reason = 1;
+    // How far it got before failing, and how long that took.
+    uint64 setup_ms = 2;
+  }
+
+  // We could not make the attempt. Says nothing about the peer, and is not
+  // counted against it.
+  message OurFault {
+    OurFaultReason reason = 1;
+    uint64 setup_ms = 2;
+  }
+
+  oneof result {
+    Disconnected disconnected = 1;
+    Failed failed = 2;
+    OurFault our_fault = 3;
+  }
+}
+
+// Why an attempt never reached a session.
+//
+// Timeouts are split by where they fired. A peer that never answers at all and
+// one that completes TCP and then goes silent are very different behaviours,
+// and collapsing them into a single TIMED_OUT lost the more interesting of the
+// two.
+enum FailureReason {
+  FAILURE_REASON_UNKNOWN = 0;
+  FAILURE_REASON_CONNECTION_REFUSED = 1;
+  FAILURE_REASON_HOST_UNREACHABLE = 2;
+  // Nothing answered the TCP connect.
+  FAILURE_REASON_TCP_CONNECT_TIMEOUT = 3;
+  // TCP was up; the BIP324 handshake stalled.
+  FAILURE_REASON_V2_TRANSPORT_TIMEOUT = 4;
+  // TCP and the transport were up; the peer then sent no version message.
+  FAILURE_REASON_VERSION_HANDSHAKE_TIMEOUT = 5;
+  // Handshakes that failed outright rather than stalling.
+  FAILURE_REASON_V2_TRANSPORT_HANDSHAKE = 6;
+  FAILURE_REASON_VERSION_HANDSHAKE = 7;
+  FAILURE_REASON_UNEXPECTED_EOF = 8;
+  FAILURE_REASON_OTHER = 9;
+  // A Tor proxy timeout is deliberately absent: the onion service is only
+  // reachable through our proxy, so that is OUR_FAULT_REASON_PROXY_UNREACHABLE
+  // rather than anything the peer did.
+}
+
+// Why we could not make the attempt at all.
+enum OurFaultReason {
+  OUR_FAULT_REASON_UNKNOWN = 0;
+  // No route from here to that network.
+  OUR_FAULT_REASON_NETWORK_UNREACHABLE = 1;
+  // The Tor SOCKS5 proxy is not answering.
+  OUR_FAULT_REASON_PROXY_UNREACHABLE = 2;
+  // The address is on a network this observer is configured not to dial, or
+  // does not support.
+  OUR_FAULT_REASON_NETWORK_DISABLED = 3;
 }
 
 message PingRtt {
