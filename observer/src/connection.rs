@@ -27,10 +27,10 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::addrman::key::{AddrKey, Net};
-use crate::addrman::policy::{OurFault, Outcome, Reason};
-use crate::addrman::table::{Dial, TransportHint};
-use crate::addrman::{Dialer, Handle};
+use crate::addresses::key::{AddrKey, Net};
+use crate::addresses::policy::{OurFault, Outcome, Reason};
+use crate::addresses::table::{Dial, TransportHint};
+use crate::addresses::{Dialer, Handle};
 use crate::protocol::{Config, Session, run_session};
 use crate::transport::{
     TransportV1Reader, TransportV1Writer, TransportV2Reader, TransportV2Writer,
@@ -72,7 +72,7 @@ impl Dialer for TaskDialer {
 
 /// Run one attempt and report the outcome.
 ///
-/// The [`EndGuard`](crate::addrman::EndGuard) is taken first and dropped last,
+/// The [`EndGuard`](crate::addresses::EndGuard) is taken first and dropped last,
 /// so the manager hears that the attempt is over even if this task panics or
 /// is aborted. Without that the address would stay in the in-flight set
 /// forever and never be dialled again.
@@ -651,7 +651,7 @@ mod tests {
         });
 
         let (event_tx, _event_rx) = mpsc::channel(1);
-        let (handle, _g, _l, _c) = crate::addrman::channels();
+        let (handle, _g, _l, _c) = crate::addresses::channels();
         let dial = Dial {
             key: AddrKey::Ipv4([127, 0, 0, 1], addr.port()),
             transport: TransportHint::Unknown,
@@ -687,7 +687,7 @@ mod tests {
         });
 
         let (event_tx, _event_rx) = mpsc::channel(1);
-        let (handle, _g, _l, _c) = crate::addrman::channels();
+        let (handle, _g, _l, _c) = crate::addresses::channels();
         let dial = Dial {
             key: AddrKey::Ipv4([127, 0, 0, 1], addr.port()),
             transport: TransportHint::V2,
@@ -725,7 +725,7 @@ mod tests {
         let mut cfg = test_config(event_tx);
         cfg.ping_interval = Duration::from_millis(50);
 
-        let (handle, _g, _l, _c) = crate::addrman::channels();
+        let (handle, _g, _l, _c) = crate::addresses::channels();
         // V1Only, so the attempt goes straight to v1 and matches the v1-only
         // listener above, which accepts exactly once.
         let dial = Dial {
@@ -766,7 +766,7 @@ mod tests {
         });
 
         let (event_tx, _event_rx) = mpsc::channel(1);
-        let (handle, _g, _l, _c) = crate::addrman::channels();
+        let (handle, _g, _l, _c) = crate::addresses::channels();
         let dial = Dial {
             key: AddrKey::Ipv4([127, 0, 0, 1], addr.port()),
             transport: TransportHint::V1Only { since: 0 },
@@ -791,7 +791,7 @@ mod tests {
         setup();
         // Nothing listening: the connection is refused immediately.
         let (event_tx, _event_rx) = mpsc::channel(1);
-        let (handle, _g, mut life_rx, _c) = crate::addrman::channels();
+        let (handle, _g, mut life_rx, _c) = crate::addresses::channels();
         let key = AddrKey::Ipv4([127, 0, 0, 1], 1);
 
         attempt(
@@ -805,7 +805,7 @@ mod tests {
         .await;
 
         match life_rx.try_recv().expect("no outcome reported") {
-            crate::addrman::Lifecycle::Ended { key: got, outcome } => {
+            crate::addresses::Lifecycle::Ended { key: got, outcome } => {
                 assert_eq!(got, key);
                 assert!(outcome.counts_as_failure());
             }

@@ -11,9 +11,9 @@ use std::sync::{Arc, RwLock};
 use crate::TARGET_RPC as TARGET;
 use common::{async_nats, futures_util::StreamExt, serde_json, tracing};
 
-use crate::addrman::banlist::BanEntry;
-use crate::addrman::key::AddrKey;
-use crate::addrman::{Handle, policy::Class};
+use crate::addresses::banlist::BanEntry;
+use crate::addresses::key::AddrKey;
+use crate::addresses::{Handle, policy::Class};
 use crate::headertree::{ChainTipStatus, HeaderTree};
 
 pub(crate) struct Rpc {
@@ -239,8 +239,8 @@ fn class_name(class: Class) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addrman::table::{EnabledNets, Gossiped};
-    use crate::addrman::{self, Dialer, table::Dial};
+    use crate::addresses::table::{EnabledNets, Gossiped};
+    use crate::addresses::{self, Dialer, table::Dial};
     use common::bitcoin::{Network, network::Params};
     use common::tokio;
 
@@ -276,9 +276,9 @@ mod tests {
             std::env::temp_dir().join(format!("p2p-observer-rpc-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let (handle, gossip_rx, life_rx, cmd_rx) = addrman::channels();
-        let mut manager = addrman::Manager::new(
-            addrman::Config {
+        let (handle, gossip_rx, life_rx, cmd_rx) = addresses::channels();
+        let mut manager = addresses::Manager::new(
+            addresses::Config {
                 // Nothing is dialled in these tests.
                 dials_per_tick: 0,
                 max_dialing: 0,

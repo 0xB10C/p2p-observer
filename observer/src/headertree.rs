@@ -933,8 +933,8 @@ mod tests {
     /// connections use real Connection instances sharing a single HeaderTree.
     #[tokio::test]
     async fn test_sync_and_serve_headers() {
-        use crate::addrman;
-        use crate::addrman::key::AddrKey;
+        use crate::addresses;
+        use crate::addresses::key::AddrKey;
         use crate::connection;
         use crate::protocol;
         use common::p2p::Magic;
@@ -949,7 +949,7 @@ mod tests {
         let (event_tx, _) = mpsc::channel(1024);
         // Only the handle is needed: nothing in this test dials through the
         // manager, and the lifecycle reports go nowhere.
-        let (addrman, _gossip_rx, _life_rx, _cmd_rx) = addrman::channels();
+        let (addrman, _gossip_rx, _life_rx, _cmd_rx) = addresses::channels();
 
         let make_cfg = |sync_headers: bool| protocol::Config {
             magic: Magic::REGTEST,

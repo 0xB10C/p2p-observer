@@ -2,7 +2,7 @@
 
 How the observer decides who to connect to, and what it remembers about them.
 
-Lives in `observer/src/addrman/`. Replaced the previous `addresses.rs` store
+Lives in `observer/src/addresses/`. Replaced the previous `addresses.rs` store
 plus the retry loops that used to sit inside `connection.rs`.
 
 ## The central decision

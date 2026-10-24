@@ -693,8 +693,8 @@ impl Table {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addrman::banlist::BanEntry;
-    use crate::addrman::policy::{OurFault, Reason};
+    use crate::addresses::banlist::BanEntry;
+    use crate::addresses::policy::{OurFault, Reason};
 
     const DAY: u32 = 24 * 60 * 60;
     const NOW: u32 = 1_000_000;

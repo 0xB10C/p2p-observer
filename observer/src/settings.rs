@@ -64,7 +64,7 @@ impl Default for AddrmanConfig {
 }
 
 fn default_addr_capacity() -> usize {
-    crate::addrman::table::DEFAULT_CAPACITY
+    crate::addresses::table::DEFAULT_CAPACITY
 }
 
 fn default_max_dialing() -> usize {

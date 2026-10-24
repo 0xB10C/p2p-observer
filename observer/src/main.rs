@@ -10,7 +10,7 @@ pub(crate) const TARGET_RPC: &str = "rpc";
 pub(crate) const TARGET_HEADERTREE: &str = "headertree";
 pub(crate) const TARGET_ADDRMAN: &str = "addrman";
 
-mod addrman;
+mod addresses;
 mod connection;
 mod headertree;
 mod logging;
@@ -21,8 +21,8 @@ mod settings;
 mod tcp;
 mod transport;
 
-use addrman::key::AddrKey;
-use addrman::table::EnabledNets;
+use addresses::key::AddrKey;
+use addresses::table::EnabledNets;
 
 #[tokio::main]
 async fn main() {
@@ -59,7 +59,7 @@ async fn main() {
 
     // The handle has to exist before the dialer, which needs one for every
     // connection task, and the manager needs the dialer.
-    let (addrman, gossip_rx, life_rx, cmd_rx) = addrman::channels();
+    let (addrman, gossip_rx, life_rx, cmd_rx) = addresses::channels();
 
     tokio::spawn(rpc::Rpc::new(nats, &cfg.network, addrman.clone(), header_tree.clone()).run());
 
@@ -97,8 +97,8 @@ async fn main() {
         addrman: addrman.clone(),
     };
 
-    let mut manager = addrman::Manager::new(
-        addrman::Config {
+    let mut manager = addresses::Manager::new(
+        addresses::Config {
             dials_per_tick: cfg.connections_per_second as usize,
             max_dialing: cfg.addrman.max_dialing,
             capacity: cfg.addrman.capacity,
@@ -110,10 +110,10 @@ async fn main() {
     )
     // A bad ban list is fatal on purpose: it is operator intent, and quietly
     // dialling addresses we were told never to dial is worse than not
-    // starting. A bad address snapshot is not fatal -- see addrman::persist.
+    // starting. A bad address snapshot is not fatal -- see addresses::persist.
     .expect("failed to start the address manager");
 
-    let seeded = manager.add_manual(addrman::unix_now(), &bootstrap);
+    let seeded = manager.add_manual(addresses::unix_now(), &bootstrap);
     tracing::info!(target: TARGET_MAIN, seeded, "seeded bootstrap addresses");
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -151,7 +151,7 @@ async fn bootstrap_sync(
     cfg: &settings::Config,
     header_tree: &Arc<RwLock<headertree::HeaderTree>>,
     event_tx: &tokio::sync::mpsc::Sender<common::events::PeerEvent>,
-    addrman: &addrman::Handle,
+    addrman: &addresses::Handle,
 ) {
     if bootstrap.is_empty() {
         tracing::warn!(target: TARGET_MAIN, "no bootstrap peers configured, skipping header sync");
