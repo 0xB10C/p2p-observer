@@ -98,7 +98,7 @@ pub fn load(path: &Path) -> HashMap<PeerAddr, Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addrman::policy::Origin;
+    use crate::addresses::policy::Origin;
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
         let dir =

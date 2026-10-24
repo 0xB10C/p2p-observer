@@ -23,7 +23,7 @@ use std::os::unix::io::RawFd;
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::addrman::{Handle, book::Gossiped, peer_addr::PeerAddr, policy};
+use crate::addresses::{Handle, book::Gossiped, peer_addr::PeerAddr, policy};
 use crate::headertree::HeaderTree;
 use crate::transport::{TransportReader, TransportWriter};
 
