@@ -17,4 +17,8 @@ pub mod events {
     include!(concat!(env!("OUT_DIR"), "/p2p_observer.rs"));
 }
 
+pub mod archive {
+    include!(concat!(env!("OUT_DIR"), "/p2p_observer.archive.rs"));
+}
+
 pub mod render;
