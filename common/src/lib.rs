@@ -16,3 +16,5 @@ pub extern crate tracing_subscriber;
 pub mod events {
     include!(concat!(env!("OUT_DIR"), "/p2p_observer.rs"));
 }
+
+pub mod render;
