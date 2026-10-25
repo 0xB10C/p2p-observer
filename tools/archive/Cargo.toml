@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 common = { path = "../../common" }
+time = { version = "0.3", features = ["formatting", "macros"] }
 zstd = "0.14"
