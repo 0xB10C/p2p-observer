@@ -17,6 +17,7 @@ async-nats = "0.50"
 futures-util = "0.3"
 prost = "0.14"
 postcard = { version = "1", features = ["use-std"] }
+clap = { version = "4.6.7", features = ["derive"] }
 
 [build-dependencies]
 prost-build = "0.14"

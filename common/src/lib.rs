@@ -2,6 +2,7 @@
 pub extern crate anyhow;
 pub extern crate async_nats;
 pub extern crate bitcoin;
+pub extern crate clap;
 pub extern crate config;
 pub extern crate futures_util;
 pub extern crate p2p;
