@@ -31,8 +31,6 @@ addresses*.json
 
 config.yaml
 
-headers-*.bin
-
 # Tool output. The csv logger and slot probe write these into the working
 # directory, where they otherwise show up as untracked noise -- and they get
 # large: a single block_announcements file has reached several GB.
@@ -40,6 +38,7 @@ block_announcements_*.csv
 ping_rtt_*.csv
 inbound_slots_*.csv
 
-# Address manager state
-addresses-*.bin
-banlist-*.json
+# Observer state. Everything the observer persists -- the header tree, the
+# address snapshot, the ban list -- lives under the configured datadir, one
+# subdirectory per network.
+/data/
