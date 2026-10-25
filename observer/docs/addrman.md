@@ -247,9 +247,9 @@ upgraded looks like from the outside.
 
 ## Persistence
 
-`addresses-<network>.bin`, postcard, written to a temp file, fsynced, and
-renamed. At two million entries the difference from JSON is hundreds of
-megabytes, and nothing outside the process reads the file.
+`<datadir>/<network>/addresses.bin`, postcard, written to a temp file,
+fsynced, and renamed. At two million entries the difference from JSON is
+hundreds of megabytes, and nothing outside the process reads the file.
 
 **`load` cannot fail.** Missing, unreadable, truncated or a different format
 version all log and return an empty book. This is the point of treating the
@@ -261,10 +261,10 @@ than relearning.
 
 ## Ban list
 
-`banlist-<network>.json`, separate from the snapshot and hand-editable. CIDR
-`nets` for the IP networks, exact `hosts` for Tor and I2P, which have no prefix
-to match. Checked on ingest and on pick; banning also purges what is already
-stored.
+`<datadir>/<network>/banlist.json`, separate from the snapshot and
+hand-editable. CIDR `nets` for the IP networks, exact `hosts` for Tor and
+I2P, which have no prefix to match. Checked on ingest and on pick; banning
+also purges what is already stored.
 
 A malformed ban list **is** fatal, unlike the snapshot. It is operator intent,
 and dialling addresses we were told never to dial is worse than not starting.

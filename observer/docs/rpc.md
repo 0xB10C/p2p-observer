@@ -72,8 +72,8 @@ IP networks and exact `hosts` for Tor and I2P, which have no prefix to match
 against. Banning also drops anything already stored that matches, reported as
 `purged`.
 
-The list lives in its own `banlist-<network>.json` rather than inside the
-address snapshot, because the snapshot is a disposable cache and a
+The list lives in its own `<datadir>/<network>/banlist.json` rather than
+inside the address snapshot, because the snapshot is a disposable cache and a
 hand-maintained ban list is not. The file is rewritten on each ban; if that
 write fails the ban is still in effect in memory and the reply carries a
 `save_error`, since it will not survive a restart.
