@@ -1,5 +1,4 @@
 use common::{tokio, tracing, tracing_subscriber};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 pub(crate) const TARGET_CONNECTION: &str = "connection";
@@ -41,10 +40,15 @@ async fn main() {
 
     cfg.log_settings();
 
-    let header_path = format!("headers-{}.bin", cfg.network);
+    // One directory per network, created up front. Every loader below reads a
+    // missing file as "no state yet" and starts empty, so the directory is the
+    // only thing that has to be there.
+    let datadir = cfg.network_dir();
+    std::fs::create_dir_all(&datadir).expect("failed to create the data directory");
+
+    let header_path = datadir.join("headers.bin");
     let header_tree = Arc::new(RwLock::new(
-        headertree::HeaderTree::load(Path::new(&header_path), params)
-            .expect("failed to load header tree"),
+        headertree::HeaderTree::load(&header_path, params).expect("failed to load header tree"),
     ));
 
     let nats = common::async_nats::connect(&cfg.nats_url)
@@ -54,7 +58,7 @@ async fn main() {
     tokio::spawn(publisher::run(nats.clone(), cfg.network.clone(), event_rx));
     tokio::spawn(headertree::persist_task(
         header_tree.clone(),
-        header_path.clone().into(),
+        header_path.clone(),
     ));
 
     // The handle has to exist before the dialer, which needs one for every
@@ -103,8 +107,8 @@ async fn main() {
             max_dialing: cfg.addrman.max_dialing,
             capacity: cfg.addrman.capacity,
             nets: enabled_nets(&cfg.networks),
-            snapshot_path: PathBuf::from(format!("addresses-{}.bin", cfg.network)),
-            banlist_path: PathBuf::from(format!("banlist-{}.json", cfg.network)),
+            snapshot_path: datadir.join("addresses.bin"),
+            banlist_path: datadir.join("banlist.json"),
         },
         dialer,
     )
@@ -130,7 +134,7 @@ async fn main() {
         tracing::warn!(target: TARGET_MAIN, "the address manager did not shut down cleanly: {e}");
     }
 
-    if let Err(e) = header_tree.write().unwrap().save(Path::new(&header_path)) {
+    if let Err(e) = header_tree.write().unwrap().save(&header_path) {
         tracing::warn!(target: TARGET_MAIN, "failed to persist the header tree on shutdown: {e}");
     }
 }
