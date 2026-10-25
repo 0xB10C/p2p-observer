@@ -4,12 +4,19 @@ use common::{
     p2p::Magic,
     serde::Deserialize,
 };
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 #[serde(crate = "common::serde")]
 pub struct Config {
     #[serde(default = "default_network")]
     pub network: String,
+
+    /// Where this instance keeps its state. The header tree, the address
+    /// snapshot and the ban list all live in `<datadir>/<network>/`, so one
+    /// network is a single directory to back up, retain or throw away.
+    #[serde(default = "default_datadir")]
+    pub datadir: PathBuf,
 
     #[serde(default)]
     pub log_levels: LogLevels,
@@ -225,6 +232,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             network: default_network(),
+            datadir: default_datadir(),
             log_levels: LogLevels::default(),
             connections_per_second: connections_per_second(),
             ping_interval_secs: default_ping_interval_secs(),
@@ -239,6 +247,10 @@ impl Default for Config {
 
 fn default_nats_url() -> String {
     "nats://localhost:4222".to_owned()
+}
+
+fn default_datadir() -> PathBuf {
+    PathBuf::from("./data")
 }
 
 fn default_tor_proxy() -> String {
@@ -272,6 +284,16 @@ impl Config {
         info!(target: crate::TARGET_MAIN, "config: {:?}", self);
     }
 
+    /// The directory holding this network's state. Callers join the bare
+    /// file names onto it -- `headers.bin`, `addresses.bin`, `banlist.json` --
+    /// which carry no network suffix because the directory already does.
+    ///
+    /// The network name reaches the path unescaped, which is safe only because
+    /// `magic` has already rejected everything outside the fixed set of names.
+    pub fn network_dir(&self) -> PathBuf {
+        self.datadir.join(&self.network)
+    }
+
     pub fn magic(&self) -> Result<Magic> {
         match self.network.as_str() {
             "mainnet" | "bitcoin" => Ok(Magic::BITCOIN),
@@ -302,6 +324,7 @@ mod tests {
     fn test_defaults() {
         let cfg = parse_str("");
         assert_eq!(cfg.network, "signet");
+        assert_eq!(cfg.datadir, PathBuf::from("./data"));
         assert_eq!(cfg.ping_interval_secs, 120);
         assert_eq!(cfg.connections_per_second, 10);
         assert_eq!(cfg.user_agent, crate::protocol::USER_AGENT);
@@ -348,6 +371,19 @@ mod tests {
         assert_eq!(cfg.ping_interval_secs, 30);
         assert_eq!(cfg.user_agent, crate::protocol::USER_AGENT); // default
         assert_eq!(cfg.log_levels.connection, "info"); // default
+    }
+
+    #[test]
+    fn test_datadir_defaults_and_joins_the_network() {
+        let cfg = parse_str("");
+        assert_eq!(cfg.network_dir(), PathBuf::from("./data/signet"));
+
+        let cfg = parse_str("datadir: /var/lib/p2p-observer\nnetwork: mainnet");
+        assert_eq!(cfg.datadir, PathBuf::from("/var/lib/p2p-observer"));
+        assert_eq!(
+            cfg.network_dir(),
+            PathBuf::from("/var/lib/p2p-observer/mainnet")
+        );
     }
 
     #[test]
