@@ -1,9 +1,11 @@
 //! Archiving and replaying observer events.
 
 pub(crate) const TARGET_ARCHIVER: &str = "archiver";
+pub(crate) const TARGET_REPLAYER: &str = "replayer";
 
 pub mod archiver;
 pub mod read;
+pub mod replayer;
 
 /// Sets up logging for the binaries in this crate, honouring `RUST_LOG` the way
 /// the rest of the workspace does and defaulting to info.
