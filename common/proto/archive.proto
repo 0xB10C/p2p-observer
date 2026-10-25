@@ -1,0 +1,38 @@
+syntax = "proto3";
+package p2p_observer.archive;
+
+// The first record in an archive file, so a reader knows what it is holding
+// before it decodes a single event.
+//
+// It exists because the events themselves are not self-describing: a PeerEvent
+// carries no network, which on the wire lives only in the NATS subject
+// `p2p-observer.<network>.<event>`. Archiving the payloads alone would lose
+// which chain they came from, so the network is recorded once here rather than
+// on every event.
+message ArchiveHeader {
+  // When the file was opened, in unix seconds. Rotation means this is the start
+  // of the file's coverage, not of the whole archive.
+  uint64 created = 1;
+  // The network the archived events were observed on, e.g. "signet". One
+  // archive covers exactly one network, matching how the observer runs.
+  string network = 2;
+  // The event kinds the archiver was recording, always written out in full.
+  // Spelling them out rather than leaving the list empty for "everything" is
+  // what lets a reader tell "no ping_rtt events happened" apart from "ping_rtt
+  // events were not being recorded", which is otherwise unknowable from a file
+  // that simply has none in it.
+  repeated EventKind events = 3;
+}
+
+// One variant of the PeerEvent `event` oneof.
+//
+// A separate enum rather than a reference to the oneof's field numbers,
+// because this names what a recording job was asked to collect, which is a
+// different thing from what any one event happens to be.
+enum EventKind {
+  EVENT_KIND_UNKNOWN = 0;
+  EVENT_KIND_PING_RTT = 1;
+  EVENT_KIND_BLOCK_ANNOUNCEMENT = 2;
+  EVENT_KIND_ADDRESS_ANNOUNCEMENT = 3;
+  EVENT_KIND_CONNECTION_RESULT = 4;
+}
