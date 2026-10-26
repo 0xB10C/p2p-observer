@@ -103,12 +103,6 @@ const MESSAGES_BY_COMMAND_CAP: usize = 64;
 
 /// Per-connection state and statistics accumulated during the session.
 struct ConnectionStats {
-    /// Last SendCmpct received from the peer.
-    #[allow(dead_code)]
-    send_cmpct: Option<SendCmpct>,
-    /// Minimum fee rate the peer will accept for relay (BIP133).
-    #[allow(dead_code)]
-    fee_filter: Option<common::bitcoin::FeeRate>,
     /// Rolling window of last 10 RTT samples in milliseconds.
     rtt_history: VecDeque<u32>,
     /// Most recently sampled OS-level TCP statistics.
@@ -126,8 +120,6 @@ struct ConnectionStats {
 impl ConnectionStats {
     fn new() -> Self {
         Self {
-            send_cmpct: None,
-            fee_filter: None,
             rtt_history: VecDeque::new(),
             tcp: None,
             outstanding_pings: VecDeque::new(),
@@ -881,12 +873,22 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             version = sc.version,
             "received sendcmpct"
         );
-        self.stats.send_cmpct = Some(sc);
+        self.emit_event(common::events::peer_event::Event::SendCmpct(
+            common::events::SendCmpct {
+                high_bandwidth: sc.send_compact,
+                version: sc.version,
+            },
+        ));
     }
 
     fn handle_fee_filter(&mut self, rate: common::bitcoin::FeeRate) {
-        tracing::debug!(target: TARGET, rate=rate.to_sat_per_vb_ceil(), "received feefilter");
-        self.stats.fee_filter = Some(rate);
+        tracing::debug!(target: TARGET, ?rate, "received feefilter");
+        self.emit_event(common::events::peer_event::Event::FeeFilter(
+            common::events::FeeFilter {
+                // The wire value is whole sat/kvB, so the floor is exact.
+                feerate_sat_per_kvb: rate.to_sat_per_kvb_floor(),
+            },
+        ));
     }
 
     async fn handle_get_headers(&mut self, msg: GetHeadersMessage) -> Result<()> {
@@ -1023,7 +1025,7 @@ mod tests {
     /// manager channels so the handle has somewhere to send.
     struct Harness {
         conn: Connection<NoReads, Captured>,
-        _events: mpsc::Receiver<common::events::PeerEvent>,
+        events: mpsc::Receiver<common::events::PeerEvent>,
         _manager: (
             mpsc::Receiver<Vec<Gossiped>>,
             mpsc::UnboundedReceiver<crate::addresses::Lifecycle>,
@@ -1062,7 +1064,7 @@ mod tests {
         };
         Harness {
             conn,
-            _events: events,
+            events,
             _manager: (g, l, c),
         }
     }
@@ -1301,5 +1303,32 @@ mod tests {
         version_handshake(&mut r, &mut w, USER_AGENT, 0)
             .await
             .expect("v2 version handshake failed");
+    }
+
+    /// What a peer says about itself after verack is published as it arrives,
+    /// not held in a field nobody reads.
+    #[tokio::test]
+    async fn test_feefilter_and_sendcmpct_are_published() {
+        use crate::headertree::testing::regtest_params;
+        use common::events::peer_event::Event;
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let mut h = harness(tree);
+
+        h.conn
+            .handle_fee_filter(common::bitcoin::FeeRate::from_sat_per_kvb(1_000));
+        h.conn.handle_send_cmpct(SendCmpct {
+            send_compact: true,
+            version: 2,
+        });
+
+        let Some(Event::FeeFilter(f)) = h.events.try_recv().unwrap().event else {
+            panic!("expected a fee filter event");
+        };
+        assert_eq!(f.feerate_sat_per_kvb, 1_000);
+        let Some(Event::SendCmpct(s)) = h.events.try_recv().unwrap().event else {
+            panic!("expected a sendcmpct event");
+        };
+        assert!(s.high_bandwidth);
+        assert_eq!(s.version, 2);
     }
 }

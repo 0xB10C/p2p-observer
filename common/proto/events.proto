@@ -33,6 +33,8 @@ message PeerEvent {
     ConnectionResult connection_result = 9;
     Handshake handshake = 11;
     CompactBlockProbe compact_block_probe = 12;
+    FeeFilter fee_filter = 13;
+    SendCmpct send_cmpct = 14;
   }
 }
 
@@ -356,4 +358,26 @@ enum ProbeStage {
   PROBE_STAGE_REQUESTED = 1;
   // The peer answered with BLOCKTXN.
   PROBE_STAGE_ANSWERED = 2;
+}
+
+// The peer's relay policy, as announced (BIP133): the lowest fee rate at
+// which it wants to hear about transactions.
+//
+// One event per message rather than a last-seen value, because a peer resends
+// feefilter as its mempool fills and drains, and that history is the
+// measurement.
+message FeeFilter {
+  // Satoshis per kilo-virtualbyte, exactly as sent.
+  uint64 feerate_sat_per_kvb = 1;
+}
+
+// How the peer asked to be sent compact blocks (BIP152): whether in
+// high-bandwidth mode, where a compact block goes out without an inv first,
+// and which compact block version it speaks.
+//
+// This is the peer's request of us, not ours of it. We ask every peer for
+// high-bandwidth mode; what it asks for in return is a property of the peer.
+message SendCmpct {
+  bool high_bandwidth = 1;
+  uint64 version = 2;
 }

@@ -86,6 +86,14 @@ pub struct Args {
     /// Archive compact block probe events.
     #[arg(long)]
     pub compact_block_probes: bool,
+
+    /// Archive fee filter events.
+    #[arg(long)]
+    pub fee_filters: bool,
+
+    /// Archive sendcmpct events.
+    #[arg(long)]
+    pub send_cmpcts: bool,
 }
 
 impl Args {
@@ -96,7 +104,9 @@ impl Args {
             || self.address_announcements
             || self.connection_results
             || self.handshakes
-            || self.compact_block_probes)
+            || self.compact_block_probes
+            || self.fee_filters
+            || self.send_cmpcts)
     }
 }
 
@@ -112,6 +122,8 @@ struct Filter {
     connection_result: bool,
     handshake: bool,
     compact_block_probe: bool,
+    fee_filter: bool,
+    send_cmpct: bool,
 }
 
 impl From<&Args> for Filter {
@@ -124,6 +136,8 @@ impl From<&Args> for Filter {
             connection_result: args.connection_results,
             handshake: args.handshakes,
             compact_block_probe: args.compact_block_probes,
+            fee_filter: args.fee_filters,
+            send_cmpct: args.send_cmpcts,
         }
     }
 }
@@ -145,6 +159,8 @@ impl Filter {
             Some(peer_event::Event::ConnectionResult(_)) => self.connection_result,
             Some(peer_event::Event::Handshake(_)) => self.handshake,
             Some(peer_event::Event::CompactBlockProbe(_)) => self.compact_block_probe,
+            Some(peer_event::Event::FeeFilter(_)) => self.fee_filter,
+            Some(peer_event::Event::SendCmpct(_)) => self.send_cmpct,
             None => false,
         }
     }
@@ -171,6 +187,8 @@ impl Filter {
                 self.all || self.compact_block_probe,
                 EventKind::CompactBlockProbe,
             ),
+            (self.all || self.fee_filter, EventKind::FeeFilter),
+            (self.all || self.send_cmpct, EventKind::SendCmpct),
         ]
         .into_iter()
         .filter(|(enabled, _)| *enabled)
@@ -578,8 +596,8 @@ mod tests {
         // An event this build cannot classify is still archived verbatim.
         assert!(filter.matches(&PeerEvent::default()));
         // Every kind this build knows: ping, block, address, result,
-        // handshake, probe.
-        assert_eq!(filter.kinds().len(), 6);
+        // handshake, probe, feefilter, sendcmpct.
+        assert_eq!(filter.kinds().len(), 8);
     }
 
     #[test]

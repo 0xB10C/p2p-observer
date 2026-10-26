@@ -136,6 +136,10 @@ Options:
           Archive version handshake events
       --compact-block-probes
           Archive compact block probe events
+      --fee-filters
+          Archive fee filter events
+      --send-cmpcts
+          Archive sendcmpct events
   -h, --help
           Print help
   -V, --version
@@ -161,7 +165,7 @@ $ cargo run --bin replayer -- archive/signet.20261025-120000-000.bin.zst
 ### Example output
 
 ```text
-INFO replayer: header: created=1761393600 network=signet events=[PingRtt, BlockAnnouncement, AddressAnnouncement, ConnectionResult, Handshake, CompactBlockProbe]
+INFO replayer: header: created=1761393600 network=signet events=[PingRtt, BlockAnnouncement, AddressAnnouncement, ConnectionResult, Handshake, CompactBlockProbe, FeeFilter, SendCmpct]
 INFO replayer: [1] conn=42 peer=1.2.3.4:38333 ua="/Satoshi:30.0.0/" transport=v2 version=70016 services=0x409 height=328019 relay=true skew=-1s addrv2=true wtxidrelay=true sees_us=0.0.0.0:0 ts=1761393601000
 INFO replayer: [2] conn=42 peer=1.2.3.4:38333 ua="/Satoshi:30.0.0/" transport=v2 rtt=37ms srtt=38000µs rttvar=4000µs retrans=0 cwnd=10 minrtt=37500µs lost=0 reorder=3 rate=120000B/s rx=4096B ts=1761393601123
 INFO replayer: [3] conn=42 peer=1.2.3.4:38333 message=Addrv2 addresses=1000 solicited=true tokens=10.0 ts=1761393602456
