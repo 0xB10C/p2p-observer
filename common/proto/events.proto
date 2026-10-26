@@ -375,6 +375,22 @@ message BlockAnnouncement {
   // known. With it, the announcements of one block from every peer become a
   // propagation timeline with a first.
   bool new_to_us = 7;
+  // For a compact block, the shape the peer sent it in. Absent for an inv
+  // or a HEADERS announcement, which carry no transactions at all.
+  optional CompactBlockShape compact_block = 8;
+}
+
+// How a peer built the compact block it sent us (BIP152).
+//
+// The two counts sum to the block's transaction count as that peer saw it,
+// and the split is the peer's own estimate of what we lacked: it prefills
+// what it judges we will not have, and sends a short id for the rest. Nothing
+// else in the stream says anything about a peer's view of our mempool.
+message CompactBlockShape {
+  // Transactions sent by short id, on the assumption we already have them.
+  uint32 short_ids = 1;
+  // Transactions sent in full. Always at least the coinbase.
+  uint32 prefilled_txs = 2;
 }
 
 enum AnnouncementType {

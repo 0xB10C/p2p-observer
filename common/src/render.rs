@@ -108,8 +108,13 @@ pub fn event_line(event: &PeerEvent) -> String {
                 .map(|h| format!(" height={h}"))
                 .unwrap_or_default();
             let new = if blk.new_to_us { " new" } else { "" };
+            let shape = blk
+                .compact_block
+                .as_ref()
+                .map(|c| format!(" shortids={} prefilled={}", c.short_ids, c.prefilled_txs))
+                .unwrap_or_default();
             format!(
-                "conn={} peer={} block={} type={:?}{height}{new}{batch}{} ts={}",
+                "conn={} peer={} block={} type={:?}{height}{new}{batch}{shape}{} ts={}",
                 event.connection_id,
                 event.peer_addr,
                 blk.block_hash,
