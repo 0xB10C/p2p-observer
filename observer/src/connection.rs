@@ -31,9 +31,9 @@ use crate::addresses::book::{Dial, TransportHint};
 use crate::addresses::peer_addr::{Net, PeerAddr};
 use crate::addresses::policy::{OurFault, Outcome, Reason};
 use crate::addresses::{Dialer, Handle};
-use crate::protocol::{Config, Session, run_session};
+use crate::protocol::{Config, Session, SessionEnd, run_session};
 use crate::transport::{
-    TransportV1Reader, TransportV1Writer, TransportV2Reader, TransportV2Writer,
+    Fault, TransportV1Reader, TransportV1Writer, TransportV2Reader, TransportV2Writer,
 };
 
 use crate::TARGET_CONNECTION as TARGET;
@@ -85,15 +85,22 @@ pub(crate) async fn attempt(dial: Dial, cfg: Config, addrman: Handle) {
         tracing::debug!(target: TARGET, transport = ?dial.transport, "attempting");
 
         let started = Instant::now();
+        let mut user_agent = String::new();
         let (outcome, transport_version, result) =
             match connect_and_run(id, &dial, &cfg, &addrman).await {
-                Ok((version, connected_at)) => {
-                    let uptime = connected_at.elapsed();
-                    tracing::debug!(target: TARGET, ?uptime, "session ended");
+                Ok((version, end)) => {
+                    let uptime = end.connected_at.elapsed();
+                    let reason = classify_session_end(end.error.as_ref());
+                    tracing::debug!(target: TARGET, ?uptime, ?reason, "session ended");
                     // Setup is everything before the handshake completed, the
                     // session is the rest. Reported separately so neither is
                     // hidden inside one "duration".
                     let setup = started.elapsed().saturating_sub(uptime);
+                    let result = disconnected_result(setup, uptime, reason);
+                    // The handshake completed, so this is known -- and the
+                    // result event is the only event a session that sent
+                    // nothing else produces.
+                    user_agent = end.user_agent;
                     (
                         Outcome::Disconnected {
                             uptime_secs: uptime.as_secs() as u32,
@@ -101,7 +108,7 @@ pub(crate) async fn attempt(dial: Dial, cfg: Config, addrman: Handle) {
                         // The session ran, so the transport is settled whatever
                         // the hint said going in.
                         Some(u32::from(version)),
-                        disconnected_result(setup, uptime),
+                        result,
                     )
                 }
                 Err(e) => {
@@ -125,7 +132,7 @@ pub(crate) async fn attempt(dial: Dial, cfg: Config, addrman: Handle) {
         // One event per attempt whether or not it reached a session, so the
         // archive shows reachability over time rather than only the contacts
         // that happened to work.
-        emit_result(&cfg, id, &dial, transport_version, result);
+        emit_result(&cfg, id, &dial, transport_version, &user_agent, result);
         guard.finish(outcome);
     }
     .instrument(span)
@@ -136,13 +143,53 @@ pub(crate) async fn attempt(dial: Dial, cfg: Config, addrman: Handle) {
 fn disconnected_result(
     setup: Duration,
     uptime: Duration,
+    reason: common::events::DisconnectReason,
 ) -> common::events::connection_result::Result {
     common::events::connection_result::Result::Disconnected(
         common::events::connection_result::Disconnected {
             setup_ms: setup.as_millis() as u64,
             uptime_ms: uptime.as_millis() as u64,
+            reason: reason.into(),
         },
     )
+}
+
+/// How a session that had started ended.
+///
+/// Reads the typed [`Fault`] the transport attached if there is one, and falls
+/// back to the error kind. Both live here rather than at the point of failure
+/// so that every error-to-event mapping is in one file, next to [`classify`].
+fn classify_session_end(err: Option<&anyhow::Error>) -> common::events::DisconnectReason {
+    use common::events::DisconnectReason as R;
+
+    let Some(err) = err else {
+        // The message loop has no path that returns without an error today, so
+        // this is reserved for one being added and not thought about here.
+        return R::Unknown;
+    };
+
+    if let Some(fault) = crate::transport::fault_of(err) {
+        return match fault {
+            Fault::PeerClosed => R::PeerClosed,
+            Fault::Truncated => R::Truncated,
+            Fault::Decode => R::DecodeError,
+            Fault::V2Decrypt => R::V2DecryptError,
+            Fault::Write => R::WriteError,
+        };
+    }
+
+    if has_kind(err, std::io::ErrorKind::ConnectionReset)
+        || has_kind(err, std::io::ErrorKind::BrokenPipe)
+        || has_kind(err, std::io::ErrorKind::ConnectionAborted)
+    {
+        return R::ConnectionReset;
+    }
+    // An EOF that reached here is one no transport tagged, so where in the
+    // stream it landed is unknown; that it ended is not.
+    if has_kind(err, std::io::ErrorKind::UnexpectedEof) {
+        return R::PeerClosed;
+    }
+    R::Other
 }
 
 /// An attempt that never reached a session, as the oneof variant for it.
@@ -196,6 +243,7 @@ fn emit_result(
     id: u64,
     dial: &Dial,
     transport_version: Option<u32>,
+    user_agent: &str,
     result: common::events::connection_result::Result,
 ) {
     crate::emit::send(
@@ -203,8 +251,10 @@ fn emit_result(
         common::events::PeerEvent {
             timestamp_ms: unix_ms(),
             peer_addr: dial.addr.to_string(),
-            // Unknown unless the handshake completed; the session event carries it.
-            user_agent: String::new(),
+            // Empty on an attempt that never handshook, which is the only case
+            // where it is genuinely unknown. A session that ran carries it,
+            // because a short session may emit no other event to join against.
+            user_agent: user_agent.to_owned(),
             transport_version,
             connection_id: id,
             event: Some(common::events::peer_event::Event::ConnectionResult(
@@ -244,7 +294,7 @@ pub(crate) async fn bootstrap_attempt(
     connect_and_run(id, &dial, cfg, addrman)
         .instrument(span)
         .await
-        .map(|(_, at)| at)
+        .map(|(_, end)| end.connected_at)
 }
 
 /// Connect with whichever transport the hint calls for, then run the session.
@@ -259,19 +309,19 @@ async fn connect_and_run(
     dial: &Dial,
     cfg: &Config,
     addrman: &Handle,
-) -> Result<(u8, Instant)> {
+) -> Result<(u8, SessionEnd)> {
     match dial.transport {
         // Known to speak v2. A failure is a failed attempt, never a reason to
         // fall back and conclude the peer lost the feature.
-        TransportHint::V2 => connect_v2(id, dial, cfg, addrman).await.map(|at| (2, at)),
+        TransportHint::V2 => connect_v2(id, dial, cfg, addrman).await.map(|end| (2, end)),
 
         // v2 did not work last time. Skip straight to v1 and save a round trip.
-        TransportHint::V1Only => connect_v1(id, dial, cfg, addrman).await.map(|at| (1, at)),
+        TransportHint::V1Only => connect_v1(id, dial, cfg, addrman).await.map(|end| (1, end)),
 
         // Detecting: we do not know yet what this peer speaks.
         TransportHint::Unknown => {
             match connect_v2(id, dial, cfg, addrman).await {
-                Ok(at) => Ok((2, at)),
+                Ok(end) => Ok((2, end)),
                 Err(e) => {
                     // A TCP-level failure says nothing about which transport
                     // the peer speaks, so there is nothing to learn and
@@ -284,7 +334,7 @@ async fn connect_and_run(
                     // even if v1 then fails for an unrelated reason.
                     tracing::trace!(target: TARGET, "v2 handshake failed, trying v1: {e:#}");
                     addrman.v1_only(dial.addr);
-                    connect_v1(id, dial, cfg, addrman).await.map(|at| (1, at))
+                    connect_v1(id, dial, cfg, addrman).await.map(|end| (1, end))
                 }
             }
         }
@@ -377,7 +427,7 @@ async fn tcp_connect(addr: &PeerAddr, cfg: &Config) -> Result<TcpStream> {
     }
 }
 
-async fn connect_v2(id: u64, dial: &Dial, cfg: &Config, addrman: &Handle) -> Result<Instant> {
+async fn connect_v2(id: u64, dial: &Dial, cfg: &Config, addrman: &Handle) -> Result<SessionEnd> {
     tracing::trace!(target: TARGET, "connecting (v2) ...");
     let stream = tcp_connect(&dial.addr, cfg).await?;
     let raw_fd = stream.as_raw_fd();
@@ -414,7 +464,7 @@ async fn connect_v2(id: u64, dial: &Dial, cfg: &Config, addrman: &Handle) -> Res
     .await
 }
 
-async fn connect_v1(id: u64, dial: &Dial, cfg: &Config, addrman: &Handle) -> Result<Instant> {
+async fn connect_v1(id: u64, dial: &Dial, cfg: &Config, addrman: &Handle) -> Result<SessionEnd> {
     tracing::trace!(target: TARGET, "connecting (v1) ...");
     let stream = tcp_connect(&dial.addr, cfg).await?;
     let raw_fd = stream.as_raw_fd();
@@ -887,6 +937,48 @@ mod tests {
 
         let other = anyhow::anyhow!("something else entirely");
         assert_eq!(classify(&other, Net::Ipv4), Outcome::Failed(Reason::Other));
+    }
+
+    /// Every fault the transport can tag maps to its own reason, so a clean
+    /// close and a message we could not read are never the same record.
+    #[test]
+    fn test_session_end_reads_the_tagged_fault() {
+        use common::events::DisconnectReason as R;
+
+        for (fault, expected) in [
+            (Fault::PeerClosed, R::PeerClosed),
+            (Fault::Truncated, R::Truncated),
+            (Fault::Decode, R::DecodeError),
+            (Fault::V2Decrypt, R::V2DecryptError),
+            (Fault::Write, R::WriteError),
+        ] {
+            // Wrapped the way the transport wraps it: an io error underneath,
+            // the fault as context, and a prose context on top of that.
+            let err = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+                .context(fault)
+                .context("v1 header read");
+            assert_eq!(classify_session_end(Some(&err)), expected, "{fault:?}");
+        }
+    }
+
+    #[test]
+    fn test_session_end_falls_back_to_the_error_kind() {
+        use common::events::DisconnectReason as R;
+
+        // Untagged, because it came from somewhere other than a transport read.
+        let reset = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert_eq!(classify_session_end(Some(&reset)), R::ConnectionReset);
+
+        // An EOF no transport tagged says the stream ended but not where.
+        let eof = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        assert_eq!(classify_session_end(Some(&eof)), R::PeerClosed);
+
+        let other = anyhow::anyhow!("something else entirely");
+        assert_eq!(classify_session_end(Some(&other)), R::Other);
+
+        // No error at all is not "closed cleanly": it is a path that does not
+        // exist yet, and saying PEER_CLOSED would invent an observation.
+        assert_eq!(classify_session_end(None), R::Unknown);
     }
 
     /// Recognised from the typed stage, not from the wording of a message —

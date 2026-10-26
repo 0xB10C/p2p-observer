@@ -138,6 +138,11 @@ message ConnectionResult {
     uint64 setup_ms = 1;
     // The session itself. setup_ms + uptime_ms is the whole attempt.
     uint64 uptime_ms = 2;
+    // How the session ended. Without it a peer that closed cleanly after three
+    // hours and one that sent a message we could not decode are the same
+    // record, which is the distinction FailureReason goes to trouble to make
+    // for attempts that never reached a session.
+    DisconnectReason reason = 3;
   }
 
   // Never reached a session.
@@ -159,6 +164,33 @@ message ConnectionResult {
     Failed failed = 2;
     OurFault our_fault = 3;
   }
+}
+
+// How a session that had started ended.
+//
+// The split is by what we observed, not by whose fault it was: a clean close
+// and a truncated one both come from the peer going away, but one did it at a
+// message boundary and the other mid-message, and only the second means
+// something went wrong.
+enum DisconnectReason {
+  DISCONNECT_REASON_UNKNOWN = 0;
+  // The peer closed at a message boundary. The ordinary way a session ends.
+  DISCONNECT_REASON_PEER_CLOSED = 1;
+  // End of stream part way through a message. Only observable on v1: the v2
+  // framing is inside the BIP324 layer, which reports the end of the stream
+  // without saying where in a packet it landed, so a truncated v2 session is
+  // reported as PEER_CLOSED.
+  DISCONNECT_REASON_TRUNCATED = 2;
+  // The connection was reset or the pipe broke under us.
+  DISCONNECT_REASON_CONNECTION_RESET = 3;
+  // A message arrived that we could not deserialize.
+  DISCONNECT_REASON_DECODE_ERROR = 4;
+  // A v2 packet failed to decrypt, which means the stream is out of sync and
+  // nothing further on it can be trusted.
+  DISCONNECT_REASON_V2_DECRYPT_ERROR = 5;
+  // Our own send failed.
+  DISCONNECT_REASON_WRITE_ERROR = 6;
+  DISCONNECT_REASON_OTHER = 7;
 }
 
 // Why an attempt never reached a session.
