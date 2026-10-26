@@ -269,7 +269,9 @@ enum OurFaultReason {
 
 message PingRtt {
   uint64 rtt_ms = 1;
-  // OS-level TCP statistics, sampled when the ping went out.
+  // OS-level TCP statistics, sampled as the pong arrived -- the same moment
+  // as the RTT it sits beside, and the same convention as every other
+  // TcpStats in the stream.
   optional TcpStats tcp_stats = 2;
 }
 
