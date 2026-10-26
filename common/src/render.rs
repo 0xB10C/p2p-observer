@@ -99,12 +99,21 @@ pub fn event_line(event: &PeerEvent) -> String {
             } else {
                 String::new()
             };
+            // Likewise: a rate-limited announcement is the interesting one.
+            let limited = if ann.rate_limited > 0 {
+                format!(" rate_limited={}", ann.rate_limited)
+            } else {
+                String::new()
+            };
             let message = AddrMessage::try_from(ann.message).unwrap_or(AddrMessage::Unknown);
             format!(
-                "conn={} peer={} message={message:?} addresses={}{unparsed} ts={}",
+                "conn={} peer={} message={message:?} addresses={} solicited={}{limited}{unparsed} \
+                 tokens={:.1} ts={}",
                 event.connection_id,
                 event.peer_addr,
                 ann.addresses.len(),
+                ann.solicited,
+                ann.rate_limit_tokens,
                 event.timestamp_ms,
             )
         }
