@@ -105,8 +105,6 @@ const MESSAGES_BY_COMMAND_CAP: usize = 64;
 struct ConnectionStats {
     /// Rolling window of last 10 RTT samples in milliseconds.
     rtt_history: VecDeque<u32>,
-    /// Most recently sampled OS-level TCP statistics.
-    tcp: Option<crate::tcp::TcpStats>,
     /// Nonces of pings sent and not yet answered, oldest first.
     outstanding_pings: VecDeque<u64>,
     /// Pongs carrying a nonce we never sent.
@@ -121,7 +119,6 @@ impl ConnectionStats {
     fn new() -> Self {
         Self {
             rtt_history: VecDeque::new(),
-            tcp: None,
             outstanding_pings: VecDeque::new(),
             unsolicited_pongs: 0,
             messages_by_command: BTreeMap::new(),
@@ -474,12 +471,8 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     }
 
     async fn send_ping(&mut self) -> Result<()> {
-        self.stats.tcp = crate::tcp::tcp_info(self.raw_fd);
         let nonce = unix_ms();
-        tracing::trace!(target: TARGET, ts_ms = nonce,
-            tcp_srtt_us = self.stats.tcp.as_ref().map(|t| t.srtt_us),
-            "sending ping"
-        );
+        tracing::trace!(target: TARGET, ts_ms = nonce, "sending ping");
         self.stats.record_ping(nonce);
         self.writer.send(NetworkMessage::Ping(nonce)).await
     }
@@ -733,7 +726,9 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         let rtt_ms = unix_ms().saturating_sub(nonce);
         tracing::debug!(target: TARGET, rtt_ms, "pong");
         self.stats.record_rtt(rtt_ms as u32);
-        let tcp_stats = self.stats.tcp.as_ref().map(tcp_stats_event);
+        // Sampled as the pong arrives, like every other TCP sample in the
+        // stream: the path as this event happened, not as the ping went out.
+        let tcp_stats = self.sample_tcp_stats();
         self.emit_event(common::events::peer_event::Event::PingRtt(
             common::events::PingRtt { rtt_ms, tcp_stats },
         ));
