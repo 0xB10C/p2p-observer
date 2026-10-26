@@ -483,8 +483,15 @@ impl std::fmt::Display for Stage {
 impl std::error::Error for Stage {}
 
 /// The stage a failure was tagged with, if any.
+///
+/// `downcast_ref` on the error rather than a walk over `chain()`: a context
+/// value does not appear in the chain as itself, only as its `Display` text, so
+/// a chain walk finds a `Stage` only when it happens to be the root error.
+/// That is how this was written, and it meant the stages attached with
+/// `.context(...)` -- the proxy and both handshakes -- were silently invisible
+/// here while the timeout stages, which are root errors, worked.
 fn stage_of(err: &anyhow::Error) -> Option<Stage> {
-    err.chain().find_map(|c| c.downcast_ref::<Stage>().copied())
+    err.downcast_ref::<Stage>().copied()
 }
 
 /// Turn a failure into the outcome the manager should record.
@@ -879,6 +886,34 @@ mod tests {
         assert!(
             !is_tcp_level(&err),
             "a handshake failure should allow a v1 fallback"
+        );
+
+        // The way the code actually attaches it: the stage is the context over
+        // an underlying io error, not the root. This stayed untested, and the
+        // chain walk stage_of used could not see it -- so every v2 handshake
+        // failure, version handshake failure and unreachable proxy was
+        // reported as something else.
+        let as_context =
+            anyhow::Error::new(std::io::Error::other("boom")).context(Stage::V2TransportHandshake);
+        assert_eq!(
+            classify(&as_context, Net::Ipv4),
+            Outcome::Failed(Reason::V2TransportHandshake)
+        );
+
+        let version = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+            .context(Stage::VersionHandshake);
+        assert_eq!(
+            classify(&version, Net::Ipv4),
+            Outcome::Failed(Reason::VersionHandshake),
+            "the stage outranks the EOF underneath it"
+        );
+
+        let proxy = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+            .context(Stage::ProxyUnreachable);
+        assert_eq!(
+            classify(&proxy, Net::TorV3),
+            Outcome::OurFault(OurFault::ProxyUnreachable),
+            "a refused proxy is ours, not the onion service's"
         );
     }
 
