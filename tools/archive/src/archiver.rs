@@ -556,6 +556,7 @@ mod tests {
                 batch_size: 1,
                 height: Some(100),
                 new_to_us: true,
+                compact_block: None,
             })),
             ..Default::default()
         }

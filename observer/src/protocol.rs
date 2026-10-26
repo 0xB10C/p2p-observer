@@ -520,6 +520,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                         common::events::AnnouncementType::Inv,
                         1,
                         !known,
+                        None,
                     );
                     // An inv carries no header, so a block we do not know is
                     // only reachable by asking for headers.
@@ -535,6 +536,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                         common::events::AnnouncementType::Inv,
                         1,
                         !known,
+                        None,
                     );
                     getdata.push(Inventory::CompactBlock(hash));
                     if !known {
@@ -587,6 +589,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                         common::events::AnnouncementType::Headers,
                         headers.len() as u32,
                         !known,
+                        None,
                     );
                 }
             }
@@ -665,12 +668,17 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         let hash = header.block_hash();
         tracing::info!(target: TARGET, %hash, "compact block");
         let known = self.header_tree.read().unwrap().contains(&hash);
+        let shape = common::events::CompactBlockShape {
+            short_ids: cmpct.compact_block.short_ids.len() as u32,
+            prefilled_txs: cmpct.compact_block.prefilled_txs.len() as u32,
+        };
         self.accept_headers(&[header]).await?;
         self.emit_block_announcement(
             hash,
             common::events::AnnouncementType::CompactBlock,
             1,
             !known,
+            Some(shape),
         );
         self.request_compact_block_coinbase(hash).await
     }
@@ -681,6 +689,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         announcement_type: common::events::AnnouncementType,
         batch_size: u32,
         new_to_us: bool,
+        compact_block: Option<common::events::CompactBlockShape>,
     ) {
         // Looked up after any insertion, so a header just accepted has one.
         let height = self.header_tree.read().unwrap().height_of(&hash);
@@ -696,6 +705,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                 batch_size,
                 height,
                 new_to_us,
+                compact_block,
             },
         ));
     }
@@ -1164,6 +1174,9 @@ mod tests {
         };
         assert_eq!(a.height, Some(1));
         assert!(a.new_to_us);
+        // The test block is empty, and says so; an inv would say nothing.
+        let shape = a.compact_block.expect("a compact block carries its shape");
+        assert_eq!((shape.short_ids, shape.prefilled_txs), (0, 0));
         // The same block from another peer: same height, no longer new.
         h.conn.handle_cmpct_block(compact_block(h1)).await.unwrap();
         let _probe = h.events.try_recv().unwrap();
@@ -1242,6 +1255,7 @@ mod tests {
             panic!("expected an announcement for the known block");
         };
         assert_eq!((a.height, a.new_to_us), (Some(0), false));
+        assert!(a.compact_block.is_none());
 
         h.conn
             .handle_inv(vec![Inventory::Block(unknown)])
