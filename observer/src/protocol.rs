@@ -651,12 +651,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         hash: common::bitcoin::BlockHash,
         announcement_type: common::events::AnnouncementType,
     ) {
-        let tcp_stats = self.stats.tcp.as_ref().map(|t| common::events::TcpStats {
-            srtt_us: u64::from(t.srtt_us),
-            rttvar_us: u64::from(t.rttvar_us),
-            total_retrans: u64::from(t.total_retrans),
-            snd_cwnd: u64::from(t.snd_cwnd),
-        });
+        let tcp_stats = self.stats.tcp.as_ref().map(tcp_stats_event);
         self.emit_event(common::events::peer_event::Event::BlockAnnouncement(
             common::events::BlockAnnouncement {
                 block_hash: hash.to_string(),
@@ -726,12 +721,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         let rtt_ms = unix_ms().saturating_sub(nonce);
         tracing::debug!(target: TARGET, rtt_ms, "pong");
         self.stats.record_rtt(rtt_ms as u32);
-        let tcp_stats = self.stats.tcp.as_ref().map(|t| common::events::TcpStats {
-            srtt_us: u64::from(t.srtt_us),
-            rttvar_us: u64::from(t.rttvar_us),
-            total_retrans: u64::from(t.total_retrans),
-            snd_cwnd: u64::from(t.snd_cwnd),
-        });
+        let tcp_stats = self.stats.tcp.as_ref().map(tcp_stats_event);
         self.emit_event(common::events::peer_event::Event::PingRtt(
             common::events::PingRtt { rtt_ms, tcp_stats },
         ));
@@ -948,6 +938,25 @@ fn unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Turn a sampled socket into the event form.
+///
+/// The optional fields stay optional: on a platform that does not report a
+/// minimum RTT or a loss estimate, absent is the truth and zero would be a
+/// claim of no loss and no distance.
+fn tcp_stats_event(t: &crate::tcp::TcpStats) -> common::events::TcpStats {
+    common::events::TcpStats {
+        srtt_us: t.srtt_us,
+        rttvar_us: t.rttvar_us,
+        total_retrans: t.total_retrans,
+        snd_cwnd: t.snd_cwnd,
+        min_rtt_us: t.min_rtt_us,
+        lost: t.lost,
+        reordering: t.reordering,
+        delivery_rate: t.delivery_rate,
+        bytes_received: t.bytes_received,
+    }
 }
 
 #[cfg(test)]

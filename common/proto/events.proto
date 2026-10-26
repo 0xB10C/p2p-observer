@@ -270,16 +270,39 @@ message PingRtt {
   optional TcpStats tcp_stats = 2;
 }
 
+// OS-level statistics for the connection's socket.
+//
+// Widths match what the kernel reports. Fields the platform does not provide
+// are absent rather than zero, because zero is a real value for most of them:
+// no loss, no reordering, a window of nothing.
 message TcpStats {
   // Smoothed RTT in microseconds (SRTT). Available on Linux and macOS.
-  uint64 srtt_us = 1;
+  uint32 srtt_us = 1;
   // RTT variance in microseconds. Reflects path jitter. Available on Linux and macOS.
-  uint64 rttvar_us = 2;
+  uint32 rttvar_us = 2;
   // Total retransmitted segments over the connection lifetime.
   // Increases indicate packet loss. Available on Linux and macOS.
-  uint64 total_retrans = 3;
+  uint32 total_retrans = 3;
   // Congestion window size in segments. Available on Linux and macOS.
-  uint64 snd_cwnd = 4;
+  uint32 snd_cwnd = 4;
+  // The lowest RTT seen over the connection's life, in microseconds.
+  //
+  // The best single number for how far away a peer is: SRTT moves with
+  // queueing and load, while the floor is close to the propagation delay.
+  // Linux only — macOS reports a current RTT instead of a minimum.
+  optional uint32 min_rtt_us = 5;
+  // Segments the stack currently believes lost, and its reordering estimate.
+  // Loss and reordering alongside total_retrans is what turns "this path is
+  // bad" into a characterisation of how. Linux only.
+  optional uint32 lost = 6;
+  optional uint32 reordering = 7;
+  // The stack's delivery rate estimate in bytes per second. Linux only.
+  optional uint64 delivery_rate = 8;
+  // Bytes received from the peer over the connection's life.
+  //
+  // TCP-level, so it counts protocol overhead and retransmissions that
+  // messages_by_command does not. Available on Linux and macOS.
+  optional uint64 bytes_received = 9;
 }
 
 message BlockAnnouncement {

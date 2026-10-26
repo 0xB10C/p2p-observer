@@ -24,13 +24,32 @@ fn transport(version: Option<u32>) -> String {
 /// Renders the OS-level TCP samples, which are absent on platforms that do not
 /// expose them. Leads with a space so it appends cleanly, and is empty when
 /// there is nothing to show.
+///
+/// The per-field options are absent on a platform that has no equivalent, so
+/// each is shown only when it was actually measured.
 fn tcp(stats: Option<&TcpStats>) -> String {
     stats
         .map(|t| {
-            format!(
+            let mut s = format!(
                 " srtt={}µs rttvar={}µs retrans={} cwnd={}",
                 t.srtt_us, t.rttvar_us, t.total_retrans, t.snd_cwnd
-            )
+            );
+            if let Some(v) = t.min_rtt_us {
+                s.push_str(&format!(" minrtt={v}µs"));
+            }
+            if let Some(v) = t.lost {
+                s.push_str(&format!(" lost={v}"));
+            }
+            if let Some(v) = t.reordering {
+                s.push_str(&format!(" reorder={v}"));
+            }
+            if let Some(v) = t.delivery_rate {
+                s.push_str(&format!(" rate={v}B/s"));
+            }
+            if let Some(v) = t.bytes_received {
+                s.push_str(&format!(" rx={v}B"));
+            }
+            s
         })
         .unwrap_or_default()
 }

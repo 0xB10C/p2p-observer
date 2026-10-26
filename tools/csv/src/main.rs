@@ -1,7 +1,7 @@
 use common::{
     anyhow::Result,
     async_nats,
-    events::{BlockAnnouncement, PeerEvent, PingRtt, peer_event},
+    events::{BlockAnnouncement, PeerEvent, PingRtt, TcpStats, peer_event},
     futures_util::StreamExt,
     prost::Message,
     tokio, tracing, tracing_subscriber,
@@ -18,7 +18,7 @@ const TARGET: &str = "csv";
 
 // CSV headers with common fields + event-specific fields + tcp_stats
 const COMMON_HEADER: &str = "connection_id,timestamp_ms,peer_addr,user_agent,transport_version";
-const TCP_STATS_HEADER: &str = "srtt_us,rttvar_us,total_retrans,snd_cwnd";
+const TCP_STATS_HEADER: &str = "srtt_us,rttvar_us,total_retrans,snd_cwnd,min_rtt_us,lost,reordering,delivery_rate,bytes_received";
 const BLOCK_SPECIFIC_HEADER: &str = "block_hash,announcement_type,rtt_ms";
 const PING_SPECIFIC_HEADER: &str = "rtt_ms";
 
@@ -84,21 +84,9 @@ impl CsvLogger {
         // Optional rtt_ms
         let rtt_ms = blk.rtt_ms.map(|r| r.to_string()).unwrap_or_default();
 
-        // Optional tcp_stats (flattened)
-        let (srtt_us, rttvar_us, total_retrans, snd_cwnd) = if let Some(tcp) = &blk.tcp_stats {
-            (
-                tcp.srtt_us.to_string(),
-                tcp.rttvar_us.to_string(),
-                tcp.total_retrans.to_string(),
-                tcp.snd_cwnd.to_string(),
-            )
-        } else {
-            (String::new(), String::new(), String::new(), String::new())
-        };
-
         writeln!(
             self.block_writer,
-            "{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{}",
             connection_id,
             timestamp_ms,
             peer_addr,
@@ -107,10 +95,7 @@ impl CsvLogger {
             block_hash,
             announcement_type,
             rtt_ms,
-            srtt_us,
-            rttvar_us,
-            total_retrans,
-            snd_cwnd
+            tcp_columns(blk.tcp_stats.as_ref()),
         )?;
 
         self.block_writer.flush()?;
@@ -130,36 +115,48 @@ impl CsvLogger {
             .unwrap_or_default();
         let rtt_ms = ping.rtt_ms;
 
-        // Optional tcp_stats (flattened)
-        let (srtt_us, rttvar_us, total_retrans, snd_cwnd) = if let Some(tcp) = &ping.tcp_stats {
-            (
-                tcp.srtt_us.to_string(),
-                tcp.rttvar_us.to_string(),
-                tcp.total_retrans.to_string(),
-                tcp.snd_cwnd.to_string(),
-            )
-        } else {
-            (String::new(), String::new(), String::new(), String::new())
-        };
-
         writeln!(
             self.ping_writer,
-            "{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{}",
             connection_id,
             timestamp_ms,
             peer_addr,
             user_agent,
             transport_version,
             rtt_ms,
-            srtt_us,
-            rttvar_us,
-            total_retrans,
-            snd_cwnd
+            tcp_columns(ping.tcp_stats.as_ref()),
         )?;
 
         self.ping_writer.flush()?;
         Ok(())
     }
+}
+
+/// The TCP sample as its columns, in TCP_STATS_HEADER order.
+///
+/// Every column is empty when the sample is absent, and the per-field options
+/// are empty individually on a platform or kernel that does not report them --
+/// an empty cell rather than a zero, which would read as "no loss" or "no
+/// distance" rather than "not measured".
+fn tcp_columns(stats: Option<&TcpStats>) -> String {
+    let Some(t) = stats else {
+        return ",".repeat(8);
+    };
+    fn opt<T: ToString>(v: Option<T>) -> String {
+        v.map(|v| v.to_string()).unwrap_or_default()
+    }
+    format!(
+        "{},{},{},{},{},{},{},{},{}",
+        t.srtt_us,
+        t.rttvar_us,
+        t.total_retrans,
+        t.snd_cwnd,
+        opt(t.min_rtt_us),
+        opt(t.lost),
+        opt(t.reordering),
+        opt(t.delivery_rate),
+        opt(t.bytes_received),
+    )
 }
 
 fn escape_csv(s: &str) -> String {
