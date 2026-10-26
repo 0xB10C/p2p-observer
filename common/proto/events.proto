@@ -31,7 +31,52 @@ message PeerEvent {
     BlockAnnouncement block_announcement = 7;
     AddressAnnouncement address_announcement = 8;
     ConnectionResult connection_result = 9;
+    Handshake handshake = 11;
   }
+}
+
+// What the peer said about itself in its version message.
+//
+// One per connection that got through the handshake, and the first event that
+// connection emits.
+//
+// Everything here is the peer's own claim, recorded as made. A peer can say
+// whatever it likes about its height, its services or the time; that it said
+// it is the observation.
+message Handshake {
+  // The peer's protocol version, e.g. 70016.
+  uint32 protocol_version = 1;
+  // Service flags as a raw bitfield, not split into named bits: the meaning of
+  // a bit is a property of the protocol at the time of reading, and a bit this
+  // build has no name for is exactly the one worth having kept.
+  uint64 services = 2;
+  // The peer's claimed chain height. Signed, as on the wire.
+  int32 start_height = 3;
+  // Whether the peer wants transaction relay (BIP37 fRelay).
+  bool relay = 4;
+  // The peer's clock in unix seconds, exactly as announced and unclamped.
+  //
+  // Our own receive time is on the enclosing PeerEvent, so the skew is a
+  // subtraction a reader can do. Storing the difference instead would bake in
+  // one interpretation of which clock was wrong.
+  int64 peer_timestamp = 5;
+  // The address the peer says it sees us at, rendered exactly as it was
+  // sent -- including "0.0.0.0:0", which is what a peer that did not bother
+  // to fill the field in looks like, and is itself the observation. Empty
+  // only when the bytes were not an address at all.
+  //
+  // Worth keeping because it is the only sight we get of ourselves from
+  // outside: it shows what the network believes this observer's address is,
+  // and a peer that reports something else is itself interesting.
+  string addr_recv = 6;
+  // Capabilities the peer offered during the handshake, each a message it sent
+  // before verack rather than anything it claimed in a flag: BIP155 addrv2
+  // support and BIP339 wtxid-based relay.
+  bool sendaddrv2 = 7;
+  bool wtxid_relay = 8;
+  // The peer's user agent, also on the enclosing PeerEvent. Duplicated so this
+  // message is a complete record of the version handshake on its own.
+  string user_agent = 9;
 }
 
 // Addresses a peer told us about.

@@ -36,6 +36,33 @@ fn tcp(stats: Option<&TcpStats>) -> String {
 /// Renders one event as a single unprefixed line.
 pub fn event_line(event: &PeerEvent) -> String {
     let line = match &event.event {
+        Some(peer_event::Event::Handshake(hs)) => {
+            // Services as hex: the bits are the unit of meaning, and a decimal
+            // bitfield has to be converted before it can be read.
+            let addr_recv = if hs.addr_recv.is_empty() {
+                String::new()
+            } else {
+                format!(" sees_us={}", hs.addr_recv)
+            };
+            format!(
+                "conn={} peer={} ua={:?} transport={} version={} services={:#x} height={} \
+                 relay={} skew={}s addrv2={} wtxidrelay={}{addr_recv} ts={}",
+                event.connection_id,
+                event.peer_addr,
+                hs.user_agent,
+                transport(event.transport_version),
+                hs.protocol_version,
+                hs.services,
+                hs.start_height,
+                hs.relay,
+                // The peer's clock against ours, which is what anyone reading
+                // the raw pair would work out first.
+                hs.peer_timestamp - (event.timestamp_ms / 1000) as i64,
+                hs.sendaddrv2,
+                hs.wtxid_relay,
+                event.timestamp_ms,
+            )
+        }
         Some(peer_event::Event::PingRtt(ping)) => format!(
             "conn={} peer={} ua={:?} transport={} rtt={}ms{} ts={}",
             event.connection_id,
