@@ -554,6 +554,8 @@ mod tests {
                 announcement_type: 1,
                 tcp_stats: None,
                 batch_size: 1,
+                height: Some(100),
+                new_to_us: true,
             })),
             ..Default::default()
         }

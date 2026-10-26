@@ -103,8 +103,13 @@ pub fn event_line(event: &PeerEvent) -> String {
             } else {
                 String::new()
             };
+            let height = blk
+                .height
+                .map(|h| format!(" height={h}"))
+                .unwrap_or_default();
+            let new = if blk.new_to_us { " new" } else { "" };
             format!(
-                "conn={} peer={} block={} type={:?}{batch}{} ts={}",
+                "conn={} peer={} block={} type={:?}{height}{new}{batch}{} ts={}",
                 event.connection_id,
                 event.peer_addr,
                 blk.block_hash,

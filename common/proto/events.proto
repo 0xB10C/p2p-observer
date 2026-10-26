@@ -364,6 +364,17 @@ message BlockAnnouncement {
   // produces no announcements at all. One such reply used to appear as a
   // thousand peers announcing a thousand new blocks.
   uint32 batch_size = 5;
+  // The block's height, when the tree can place it: always once a header has
+  // been accepted, never for a hash the tree has not seen -- an inv for an
+  // unknown block, or a header rejected as an orphan or for bad proof of work.
+  optional uint32 height = 6;
+  // Whether this announcement is the first this observer heard of the block.
+  //
+  // Not reconstructible offline: headers also arrive by sync, outside the
+  // announcement stream, so an archive alone cannot say what was already
+  // known. With it, the announcements of one block from every peer become a
+  // propagation timeline with a first.
+  bool new_to_us = 7;
 }
 
 enum AnnouncementType {
