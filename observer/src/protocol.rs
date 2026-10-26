@@ -125,6 +125,23 @@ pub(crate) struct HandshakeInfo {
     pub(crate) wtxid_relay: bool,
 }
 
+/// What a session that ran and then ended leaves for the attempt's result.
+///
+/// The error is carried out rather than logged and dropped, because it is the
+/// only thing that says *how* a session ended: without it a peer that closed
+/// cleanly after three hours and one that sent a message we could not decode
+/// produce the same record.
+#[derive(Debug)]
+pub(crate) struct SessionEnd {
+    /// When the handshake completed, so the caller can split setup from uptime.
+    pub(crate) connected_at: Instant,
+    /// What ended the session. `None` only if the message loop returned
+    /// without an error, which it has no path to do today.
+    pub(crate) error: Option<common::anyhow::Error>,
+    /// The peer's user agent, known because the handshake completed.
+    pub(crate) user_agent: String,
+}
+
 /// A live connection to a peer, created after a successful version handshake.
 struct Connection<R: TransportReader, W: TransportWriter> {
     reader: R,
@@ -175,7 +192,7 @@ pub(crate) async fn run_session(
     mut reader: impl TransportReader,
     mut writer: impl TransportWriter,
     session: Session<'_>,
-) -> Result<Instant> {
+) -> Result<SessionEnd> {
     let Session {
         transport_version,
         connection_id,
@@ -234,10 +251,22 @@ pub(crate) async fn run_session(
     // The session running out is not an error: the peer disconnected, which is
     // an ordinary outcome. The caller turns the elapsed time into
     // Outcome::Disconnected, and the manager decides when to try again.
-    if let Err(e) = conn.run().instrument(conn_span).await {
-        tracing::debug!(target: TARGET, "connection error: {e}");
-    }
-    Ok(connected_at)
+    //
+    // The error that ended it goes back to the caller all the same. It is what
+    // tells a clean close apart from a reset or a message we could not read,
+    // and it is only available here.
+    let error = match conn.run().instrument(conn_span).await {
+        Ok(()) => None,
+        Err(e) => {
+            tracing::debug!(target: TARGET, "connection error: {e}");
+            Some(e)
+        }
+    };
+    Ok(SessionEnd {
+        connected_at,
+        error,
+        user_agent: conn.handshake_info.version.user_agent.to_string(),
+    })
 }
 
 /// Publish what the peer said about itself in its version message.

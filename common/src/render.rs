@@ -8,7 +8,9 @@
 //! caller — a NATS subject when listening, a position in the file when
 //! replaying — so the caller supplies it.
 
-use crate::events::{AddrMessage, AnnouncementType, PeerEvent, TcpStats, peer_event};
+use crate::events::{
+    AddrMessage, AnnouncementType, DisconnectReason, PeerEvent, TcpStats, peer_event,
+};
 
 /// Renders the transport version. Absent means the attempt failed while still
 /// detecting, so no version was ever settled on.
@@ -113,10 +115,14 @@ pub fn event_line(event: &PeerEvent) -> String {
             // of the oneof: no duration that means two things, no failure
             // reason hanging off a success.
             let detail = match &res.result {
-                Some(R::Disconnected(d)) => format!(
-                    "result=disconnected setup={}ms uptime={}ms",
-                    d.setup_ms, d.uptime_ms
-                ),
+                Some(R::Disconnected(d)) => {
+                    let reason =
+                        DisconnectReason::try_from(d.reason).unwrap_or(DisconnectReason::Unknown);
+                    format!(
+                        "result=disconnected reason={reason:?} setup={}ms uptime={}ms",
+                        d.setup_ms, d.uptime_ms
+                    )
+                }
                 Some(R::Failed(f)) => {
                     let reason =
                         FailureReason::try_from(f.reason).unwrap_or(FailureReason::Unknown);
@@ -130,9 +136,10 @@ pub fn event_line(event: &PeerEvent) -> String {
                 None => "result=unset".to_owned(),
             };
             format!(
-                "conn={} peer={} {detail} transport={} ts={}",
+                "conn={} peer={} ua={:?} {detail} transport={} ts={}",
                 event.connection_id,
                 event.peer_addr,
+                event.user_agent,
                 transport(event.transport_version),
                 event.timestamp_ms,
             )
