@@ -59,6 +59,11 @@ a loss is most likely gossip, which peers re-announce, and least likely a
 handshake or a disconnect, which they do not. Losses cluster at observer
 startup, where every connection handshakes at once and each answers a GETADDR.
 
+Every event also carries `instance_id`, a random value chosen when the
+observer started. `connection_id` counts from zero per process, and the
+archiver is built to outlive the observer, so this is what keeps a join on
+`connection_id` from mixing two connections across a restart.
+
 ### Compression
 
 Files are compressed with streaming zstd and written as `.bin.zst` directly.

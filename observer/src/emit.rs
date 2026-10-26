@@ -4,6 +4,7 @@ use common::{
     events::{PeerEvent, peer_event::Event},
     tokio::sync::mpsc,
 };
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Depth of the event queue between the connection tasks and the publisher.
@@ -27,6 +28,22 @@ pub(crate) const GOSSIP_SHED_BELOW: usize = 1024;
 /// Events that could not be handed to the publisher since the process started.
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// This run of the observer, as every event names it.
+static INSTANCE: OnceLock<u64> = OnceLock::new();
+
+/// A value that differs between runs of the observer.
+///
+/// `RandomState` is seeded from the OS once per process, so hashing anything
+/// with it yields a per-process random number without taking a dependency on
+/// a random crate for one value at startup. It only has to differ between
+/// runs; nothing is secured by it.
+fn fresh_instance_id() -> u64 {
+    use std::hash::{BuildHasher, Hasher, RandomState};
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(u64::from(std::process::id()));
+    hasher.finish()
+}
+
 /// Queue one event, dropping it rather than blocking a connection task.
 ///
 /// Stamps the running drop count on the way out, which is the only way a
@@ -38,6 +55,7 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// and so there is one place where the decision to drop is made.
 pub(crate) fn send(tx: &mpsc::Sender<PeerEvent>, mut event: PeerEvent) {
     event.dropped_events = DROPPED.load(Ordering::Relaxed);
+    event.instance_id = *INSTANCE.get_or_init(fresh_instance_id);
     let is_gossip = matches!(event.event, Some(Event::AddressAnnouncement(_)));
     if (is_gossip && tx.capacity() <= GOSSIP_SHED_BELOW) || tx.try_send(event).is_err() {
         DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -89,6 +107,17 @@ mod tests {
         // The next one to get through reports the loss.
         send(&tx, ping());
         assert_eq!(rx.try_recv().unwrap().dropped_events, baseline + 1);
+    }
+
+    #[test]
+    fn test_every_event_names_the_same_run() {
+        let (tx, mut rx) = mpsc::channel(4);
+        send(&tx, ping());
+        send(&tx, ping());
+        let a = rx.try_recv().unwrap().instance_id;
+        let b = rx.try_recv().unwrap().instance_id;
+        assert_ne!(a, 0, "an id of zero would look like an old archive");
+        assert_eq!(a, b);
     }
 
     #[test]
