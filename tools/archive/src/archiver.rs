@@ -553,6 +553,7 @@ mod tests {
                 block_hash: "00".repeat(32),
                 announcement_type: 1,
                 tcp_stats: None,
+                batch_size: 1,
             })),
             ..Default::default()
         }

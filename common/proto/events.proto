@@ -356,6 +356,14 @@ message BlockAnnouncement {
   // OS-level TCP statistics, sampled as the announcement arrived rather than
   // at the last ping, so the path state is contemporaneous with the block.
   optional TcpStats tcp_stats = 4;
+  // How many headers the message carrying this announcement held: 1 for an
+  // inv or a compact block, up to 8 for a HEADERS message, where more than
+  // one means the peer was catching us up rather than announcing one block.
+  //
+  // A HEADERS message above that limit is a reply to our own getheaders and
+  // produces no announcements at all. One such reply used to appear as a
+  // thousand peers announcing a thousand new blocks.
+  uint32 batch_size = 5;
 }
 
 enum AnnouncementType {
