@@ -119,6 +119,14 @@ pub fn event_line(event: &PeerEvent) -> String {
                 event.timestamp_ms,
             )
         }
+        Some(peer_event::Event::FeeFilter(f)) => format!(
+            "conn={} peer={} feefilter={}sat/kvB ts={}",
+            event.connection_id, event.peer_addr, f.feerate_sat_per_kvb, event.timestamp_ms,
+        ),
+        Some(peer_event::Event::SendCmpct(s)) => format!(
+            "conn={} peer={} sendcmpct hb={} version={} ts={}",
+            event.connection_id, event.peer_addr, s.high_bandwidth, s.version, event.timestamp_ms,
+        ),
         Some(peer_event::Event::AddressAnnouncement(ann)) => {
             // Shown only when non-zero, which is almost never.
             let unparsed = if ann.unparsed > 0 {

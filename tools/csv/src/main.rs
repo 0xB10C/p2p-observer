@@ -207,7 +207,9 @@ async fn main() -> Result<()> {
                 Some(peer_event::Event::AddressAnnouncement(_))
                 | Some(peer_event::Event::ConnectionResult(_))
                 | Some(peer_event::Event::Handshake(_))
-                | Some(peer_event::Event::CompactBlockProbe(_)) => {}
+                | Some(peer_event::Event::CompactBlockProbe(_))
+                | Some(peer_event::Event::FeeFilter(_))
+                | Some(peer_event::Event::SendCmpct(_)) => {}
                 None => {}
             },
             Err(e) => {

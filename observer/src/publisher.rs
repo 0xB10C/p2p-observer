@@ -30,6 +30,8 @@ fn subject_for(event: &PeerEvent) -> &'static str {
         Some(peer_event::Event::ConnectionResult(_)) => "connection_result",
         Some(peer_event::Event::Handshake(_)) => "handshake",
         Some(peer_event::Event::CompactBlockProbe(_)) => "compact_block_probe",
+        Some(peer_event::Event::FeeFilter(_)) => "fee_filter",
+        Some(peer_event::Event::SendCmpct(_)) => "send_cmpct",
         None => "unknown",
     }
 }
