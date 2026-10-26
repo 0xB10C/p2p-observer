@@ -29,6 +29,7 @@ fn subject_for(event: &PeerEvent) -> &'static str {
         Some(peer_event::Event::AddressAnnouncement(_)) => "address_announcement",
         Some(peer_event::Event::ConnectionResult(_)) => "connection_result",
         Some(peer_event::Event::Handshake(_)) => "handshake",
+        Some(peer_event::Event::CompactBlockProbe(_)) => "compact_block_probe",
         None => "unknown",
     }
 }

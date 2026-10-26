@@ -201,11 +201,13 @@ async fn main() -> Result<()> {
                     }
                 }
                 // This tool logs block announcements and ping RTTs. The
-                // address and attempt events are for a separate archiver;
-                // ignoring them here keeps the two CSV schemas stable.
+                // address, handshake and attempt events are for a separate
+                // archiver; ignoring them here keeps the two CSV schemas
+                // stable.
                 Some(peer_event::Event::AddressAnnouncement(_))
                 | Some(peer_event::Event::ConnectionResult(_))
-                | Some(peer_event::Event::Handshake(_)) => {}
+                | Some(peer_event::Event::Handshake(_))
+                | Some(peer_event::Event::CompactBlockProbe(_)) => {}
                 None => {}
             },
             Err(e) => {

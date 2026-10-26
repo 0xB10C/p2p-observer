@@ -32,6 +32,7 @@ message PeerEvent {
     AddressAnnouncement address_announcement = 8;
     ConnectionResult connection_result = 9;
     Handshake handshake = 11;
+    CompactBlockProbe compact_block_probe = 12;
   }
 }
 
@@ -319,10 +320,40 @@ message BlockAnnouncement {
 }
 
 enum AnnouncementType {
-  UNKNOWN = 0;
-  INV = 1;
-  HEADERS = 2;
-  COMPACT_BLOCK = 3;
-  GETBLOCKTXN = 4;
-  BLOCKTXN = 5;
+  ANNOUNCEMENT_TYPE_UNKNOWN = 0;
+  ANNOUNCEMENT_TYPE_INV = 1;
+  ANNOUNCEMENT_TYPE_HEADERS = 2;
+  ANNOUNCEMENT_TYPE_COMPACT_BLOCK = 3;
+  // Were GETBLOCKTXN and BLOCKTXN. Neither is a peer announcing a block: one
+  // is our own request and the other its answer, and together they measure how
+  // long the peer took to produce a transaction from a block it had just
+  // announced. They are CompactBlockProbe now.
+  reserved 4, 5;
+}
+
+// One step of the compact-block timing probe.
+//
+// After a peer sends a compact block we ask it for the coinbase transaction
+// back. The turnaround is a lower bound on how long that peer took to have the
+// block in hand, which is the one thing a passive observer can measure about
+// another node's validation.
+//
+// Two events rather than one with a duration: the request is ours and the
+// answer is the peer's, each has its own timestamp on the enclosing PeerEvent,
+// and the elapsed time is their difference. Recording a duration instead would
+// put a derived number in the archive and hide which half was late.
+message CompactBlockProbe {
+  // The block whose coinbase was asked for.
+  string block_hash = 1;
+  ProbeStage stage = 2;
+  // OS-level TCP statistics, sampled as this step happened.
+  optional TcpStats tcp_stats = 3;
+}
+
+enum ProbeStage {
+  PROBE_STAGE_UNKNOWN = 0;
+  // We sent GETBLOCKTXN for the block's coinbase.
+  PROBE_STAGE_REQUESTED = 1;
+  // The peer answered with BLOCKTXN.
+  PROBE_STAGE_ANSWERED = 2;
 }

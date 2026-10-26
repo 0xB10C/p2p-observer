@@ -82,6 +82,10 @@ pub struct Args {
     /// Archive version handshake events.
     #[arg(long)]
     pub handshakes: bool,
+
+    /// Archive compact block probe events.
+    #[arg(long)]
+    pub compact_block_probes: bool,
 }
 
 impl Args {
@@ -91,7 +95,8 @@ impl Args {
             || self.block_announcements
             || self.address_announcements
             || self.connection_results
-            || self.handshakes)
+            || self.handshakes
+            || self.compact_block_probes)
     }
 }
 
@@ -106,6 +111,7 @@ struct Filter {
     address_announcement: bool,
     connection_result: bool,
     handshake: bool,
+    compact_block_probe: bool,
 }
 
 impl From<&Args> for Filter {
@@ -117,6 +123,7 @@ impl From<&Args> for Filter {
             address_announcement: args.address_announcements,
             connection_result: args.connection_results,
             handshake: args.handshakes,
+            compact_block_probe: args.compact_block_probes,
         }
     }
 }
@@ -137,6 +144,7 @@ impl Filter {
             Some(peer_event::Event::AddressAnnouncement(_)) => self.address_announcement,
             Some(peer_event::Event::ConnectionResult(_)) => self.connection_result,
             Some(peer_event::Event::Handshake(_)) => self.handshake,
+            Some(peer_event::Event::CompactBlockProbe(_)) => self.compact_block_probe,
             None => false,
         }
     }
@@ -159,6 +167,10 @@ impl Filter {
                 EventKind::ConnectionResult,
             ),
             (self.all || self.handshake, EventKind::Handshake),
+            (
+                self.all || self.compact_block_probe,
+                EventKind::CompactBlockProbe,
+            ),
         ]
         .into_iter()
         .filter(|(enabled, _)| *enabled)
@@ -565,8 +577,9 @@ mod tests {
         assert!(filter.matches(&block()));
         // An event this build cannot classify is still archived verbatim.
         assert!(filter.matches(&PeerEvent::default()));
-        // Every kind this build knows: ping, block, address, result, handshake.
-        assert_eq!(filter.kinds().len(), 5);
+        // Every kind this build knows: ping, block, address, result,
+        // handshake, probe.
+        assert_eq!(filter.kinds().len(), 6);
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! replaying — so the caller supplies it.
 
 use crate::events::{
-    AddrMessage, AnnouncementType, DisconnectReason, PeerEvent, TcpStats, peer_event,
+    AddrMessage, AnnouncementType, DisconnectReason, PeerEvent, ProbeStage, TcpStats, peer_event,
 };
 
 /// Renders the transport version. Absent means the attempt failed while still
@@ -104,6 +104,18 @@ pub fn event_line(event: &PeerEvent) -> String {
                 blk.block_hash,
                 atype,
                 tcp(blk.tcp_stats.as_ref()),
+                event.timestamp_ms,
+            )
+        }
+        Some(peer_event::Event::CompactBlockProbe(probe)) => {
+            let stage = ProbeStage::try_from(probe.stage).unwrap_or(ProbeStage::Unknown);
+            format!(
+                "conn={} peer={} block={} probe={:?}{} ts={}",
+                event.connection_id,
+                event.peer_addr,
+                probe.block_hash,
+                stage,
+                tcp(probe.tcp_stats.as_ref()),
                 event.timestamp_ms,
             )
         }
