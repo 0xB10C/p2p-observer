@@ -97,8 +97,14 @@ pub fn event_line(event: &PeerEvent) -> String {
         Some(peer_event::Event::BlockAnnouncement(blk)) => {
             let atype = AnnouncementType::try_from(blk.announcement_type)
                 .unwrap_or(AnnouncementType::Unknown);
+            // Shown only when it says something: a batch of one is the norm.
+            let batch = if blk.batch_size > 1 {
+                format!(" batch={}", blk.batch_size)
+            } else {
+                String::new()
+            };
             format!(
-                "conn={} peer={} block={} type={:?}{} ts={}",
+                "conn={} peer={} block={} type={:?}{batch}{} ts={}",
                 event.connection_id,
                 event.peer_addr,
                 blk.block_hash,

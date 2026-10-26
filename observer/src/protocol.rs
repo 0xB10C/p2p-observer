@@ -85,6 +85,15 @@ fn cap_user_agent(ua: &str) -> String {
     ua.chars().take(MAX_USER_AGENT_CHARS).collect()
 }
 
+/// The most headers a HEADERS message can carry and still be an announcement.
+///
+/// Core announces at most this many at once (its MAX_BLOCKS_TO_ANNOUNCE); a
+/// reply to getheaders carries up to two thousand. Above the limit the message
+/// is a sync response -- our request being answered, not the peer telling us
+/// about a block -- and emitting one announcement per header turned a single
+/// reply into a thousand events that read as a thousand new blocks.
+const MAX_HEADERS_ANNOUNCED: usize = 8;
+
 /// How many unanswered pings to remember.
 ///
 /// A pong's nonce is the millisecond the ping was sent, which is what makes an
@@ -505,7 +514,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             match item {
                 Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
                     tracing::info!(target: TARGET, %hash, "inv: block");
-                    self.emit_block_announcement(hash, common::events::AnnouncementType::Inv);
+                    self.emit_block_announcement(hash, common::events::AnnouncementType::Inv, 1);
                     // An inv carries no header, so a block we do not know is
                     // only reachable by asking for headers.
                     if !self.header_tree.read().unwrap().contains(&hash) {
@@ -514,7 +523,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                 }
                 Inventory::CompactBlock(hash) => {
                     tracing::info!(target: TARGET, %hash, "inv: compact block");
-                    self.emit_block_announcement(hash, common::events::AnnouncementType::Inv);
+                    self.emit_block_announcement(hash, common::events::AnnouncementType::Inv, 1);
                     getdata.push(Inventory::CompactBlock(hash));
                     if !self.header_tree.read().unwrap().contains(&hash) {
                         self.recover_headers(hash, false).await?;
@@ -548,9 +557,16 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         let accepted = self.accept_headers(&headers).await?;
 
         if !self.sync_headers {
-            for header in &headers {
-                let hash = header.block_hash();
-                self.emit_block_announcement(hash, common::events::AnnouncementType::Headers);
+            if headers.len() > MAX_HEADERS_ANNOUNCED {
+                tracing::debug!(target: TARGET, count = headers.len(), "headers are a sync response, not an announcement");
+            } else {
+                for header in &headers {
+                    self.emit_block_announcement(
+                        header.block_hash(),
+                        common::events::AnnouncementType::Headers,
+                        headers.len() as u32,
+                    );
+                }
             }
         }
 
@@ -625,7 +641,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     ) -> Result<()> {
         let header = cmpct.compact_block.header;
         let hash = header.block_hash();
-        self.emit_block_announcement(hash, common::events::AnnouncementType::CompactBlock);
+        self.emit_block_announcement(hash, common::events::AnnouncementType::CompactBlock, 1);
         tracing::info!(target: TARGET, %hash, "compact block");
         self.accept_headers(&[header]).await?;
         self.request_compact_block_coinbase(hash).await
@@ -635,6 +651,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         &self,
         hash: common::bitcoin::BlockHash,
         announcement_type: common::events::AnnouncementType,
+        batch_size: u32,
     ) {
         self.emit_event(common::events::peer_event::Event::BlockAnnouncement(
             common::events::BlockAnnouncement {
@@ -645,6 +662,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                 // path at the moment the block arrived, and the last ping can
                 // be a whole ping interval ago.
                 tcp_stats: self.sample_tcp_stats(),
+                batch_size,
             },
         ));
     }
@@ -1325,5 +1343,38 @@ mod tests {
         };
         assert!(s.high_bandwidth);
         assert_eq!(s.version, 2);
+    }
+
+    /// A reply to our own getheaders is not the peer announcing blocks, however
+    /// many headers it holds; a short HEADERS message is, and says how many.
+    #[tokio::test]
+    async fn test_bulk_headers_are_not_announcements() {
+        use crate::headertree::testing::{mine_header, regtest_params};
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let (mut prev, _) = tree.read().unwrap().tip();
+        let mut chain = Vec::new();
+        for i in 0..(MAX_HEADERS_ANNOUNCED as u8 + 1) {
+            let h = mine_header(prev, 1_700_000_000 + u32::from(i) * 60, i + 1);
+            prev = h.block_hash();
+            chain.push(h);
+        }
+        let mut h = harness(tree.clone());
+
+        // One over the limit: a sync response. Inserted, nothing announced.
+        h.conn.handle_headers(chain.clone()).await.unwrap();
+        assert_eq!(tree.read().unwrap().tip().1, chain.len() as u32);
+        assert!(h.events.try_recv().is_err());
+
+        // Two headers: an announcement each, and each says it came with one
+        // other -- the mark of a peer catching us up rather than announcing.
+        h.conn.handle_headers(chain[..2].to_vec()).await.unwrap();
+        for _ in 0..2 {
+            let ev = h.events.try_recv().unwrap();
+            let Some(common::events::peer_event::Event::BlockAnnouncement(b)) = ev.event else {
+                panic!("expected a block announcement, got {:?}", ev.event);
+            };
+            assert_eq!(b.batch_size, 2);
+        }
+        assert!(h.events.try_recv().is_err());
     }
 }

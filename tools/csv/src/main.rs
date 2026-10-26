@@ -22,7 +22,7 @@ const TCP_STATS_HEADER: &str = "srtt_us,rttvar_us,total_retrans,snd_cwnd,min_rtt
 // No rtt_ms: a block announcement used to carry the last ping RTT, which could
 // be a whole ping interval old. The TCP columns are now sampled as the
 // announcement arrives, and carry a minimum RTT of their own.
-const BLOCK_SPECIFIC_HEADER: &str = "block_hash,announcement_type";
+const BLOCK_SPECIFIC_HEADER: &str = "block_hash,announcement_type,batch_size";
 const PING_SPECIFIC_HEADER: &str = "rtt_ms";
 
 struct CsvLogger {
@@ -86,7 +86,7 @@ impl CsvLogger {
 
         writeln!(
             self.block_writer,
-            "{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{}",
             connection_id,
             timestamp_ms,
             peer_addr,
@@ -94,6 +94,7 @@ impl CsvLogger {
             transport_version,
             block_hash,
             announcement_type,
+            blk.batch_size,
             tcp_columns(blk.tcp_stats.as_ref()),
         )?;
 
