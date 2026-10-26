@@ -17,7 +17,7 @@ use common::{
     tracing,
     tracing::Instrument,
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::RawFd;
 use std::sync::{Arc, RwLock};
@@ -85,6 +85,22 @@ fn cap_user_agent(ua: &str) -> String {
     ua.chars().take(MAX_USER_AGENT_CHARS).collect()
 }
 
+/// How many unanswered pings to remember.
+///
+/// A pong's nonce is the millisecond the ping was sent, which is what makes an
+/// RTT out of it -- so a nonce we have no record of sending yields a number in
+/// the trillions rather than a latency. At the default ping interval ten
+/// outstanding pings is twenty minutes of patience with a slow peer, past
+/// which an answer is treated as one we never asked for.
+const OUTSTANDING_PINGS: usize = 10;
+
+/// Distinct commands counted per session.
+///
+/// The command string comes off the wire, so the key space belongs to the
+/// peer. Past the cap everything lands in one bucket rather than growing a map
+/// a peer controls the size of.
+const MESSAGES_BY_COMMAND_CAP: usize = 64;
+
 /// Per-connection state and statistics accumulated during the session.
 struct ConnectionStats {
     /// Last SendCmpct received from the peer.
@@ -97,6 +113,14 @@ struct ConnectionStats {
     rtt_history: VecDeque<u32>,
     /// Most recently sampled OS-level TCP statistics.
     tcp: Option<crate::tcp::TcpStats>,
+    /// Nonces of pings sent and not yet answered, oldest first.
+    outstanding_pings: VecDeque<u64>,
+    /// Pongs carrying a nonce we never sent.
+    unsolicited_pongs: u32,
+    /// Messages received from the peer, by command.
+    messages_by_command: BTreeMap<String, u32>,
+    /// Messages received whose command did not fit the cap.
+    messages_other: u32,
 }
 
 impl ConnectionStats {
@@ -106,6 +130,48 @@ impl ConnectionStats {
             fee_filter: None,
             rtt_history: VecDeque::new(),
             tcp: None,
+            outstanding_pings: VecDeque::new(),
+            unsolicited_pongs: 0,
+            messages_by_command: BTreeMap::new(),
+            messages_other: 0,
+        }
+    }
+
+    /// Remember a ping we just sent, forgetting the oldest if we are now
+    /// tracking more than we care to.
+    fn record_ping(&mut self, nonce: u64) {
+        self.outstanding_pings.push_back(nonce);
+        if self.outstanding_pings.len() > OUTSTANDING_PINGS {
+            self.outstanding_pings.pop_front();
+        }
+    }
+
+    /// Whether this pong answers a ping we sent, consuming it if so.
+    ///
+    /// Older pings are left alone rather than discarded: a peer that answers
+    /// out of order is answering all the same, and dropping them here would
+    /// turn its next reply into an unsolicited one.
+    fn claim_pong(&mut self, nonce: u64) -> bool {
+        match self.outstanding_pings.iter().position(|n| *n == nonce) {
+            Some(i) => {
+                self.outstanding_pings.remove(i);
+                true
+            }
+            None => {
+                self.unsolicited_pongs = self.unsolicited_pongs.saturating_add(1);
+                false
+            }
+        }
+    }
+
+    /// Count one received message against its command.
+    fn record_message(&mut self, command: &str) {
+        if let Some(count) = self.messages_by_command.get_mut(command) {
+            *count = count.saturating_add(1);
+        } else if self.messages_by_command.len() < MESSAGES_BY_COMMAND_CAP {
+            self.messages_by_command.insert(command.to_owned(), 1);
+        } else {
+            self.messages_other = self.messages_other.saturating_add(1);
         }
     }
 
@@ -140,6 +206,9 @@ pub(crate) struct SessionEnd {
     pub(crate) error: Option<common::anyhow::Error>,
     /// The peer's user agent, known because the handshake completed.
     pub(crate) user_agent: String,
+    pub(crate) messages_by_command: BTreeMap<String, u32>,
+    pub(crate) messages_other: u32,
+    pub(crate) unsolicited_pongs: u32,
 }
 
 /// A live connection to a peer, created after a successful version handshake.
@@ -266,6 +335,9 @@ pub(crate) async fn run_session(
         connected_at,
         error,
         user_agent: conn.handshake_info.version.user_agent.to_string(),
+        messages_by_command: conn.stats.messages_by_command,
+        messages_other: conn.stats.messages_other,
+        unsolicited_pongs: conn.stats.unsolicited_pongs,
     })
 }
 
@@ -416,10 +488,12 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             tcp_srtt_us = self.stats.tcp.as_ref().map(|t| t.srtt_us),
             "sending ping"
         );
+        self.stats.record_ping(nonce);
         self.writer.send(NetworkMessage::Ping(nonce)).await
     }
 
     async fn handle_message(&mut self, msg: NetworkMessage) -> Result<()> {
+        self.stats.record_message(msg.command().as_ref());
         match msg {
             NetworkMessage::Ping(nonce) => self.handle_ping(nonce).await?,
             NetworkMessage::Pong(nonce) => self.handle_pong(nonce),
@@ -641,6 +715,14 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     }
 
     fn handle_pong(&mut self, nonce: u64) {
+        // The nonce is the millisecond the ping went out, so one we have no
+        // record of sending is not a late RTT -- it is unix time, and would
+        // land a sample in the trillions. Count the peer's behaviour and
+        // publish nothing.
+        if !self.stats.claim_pong(nonce) {
+            tracing::debug!(target: TARGET, nonce, "pong for a ping we never sent");
+            return;
+        }
         let rtt_ms = unix_ms().saturating_sub(nonce);
         tracing::debug!(target: TARGET, rtt_ms, "pong");
         self.stats.record_rtt(rtt_ms as u32);
@@ -1060,6 +1142,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(getheaders_sent(&other.conn.writer), 0);
+    }
+
+    #[test]
+    fn test_a_pong_claims_the_ping_it_answers() {
+        let mut stats = ConnectionStats::new();
+        stats.record_ping(1_000);
+        stats.record_ping(2_000);
+
+        // Out of order is still an answer, and the other ping stays claimable.
+        assert!(stats.claim_pong(2_000));
+        assert!(stats.claim_pong(1_000));
+        assert_eq!(stats.unsolicited_pongs, 0);
+
+        // The same nonce twice is one answer and one invention.
+        assert!(!stats.claim_pong(1_000));
+        assert_eq!(stats.unsolicited_pongs, 1);
+    }
+
+    #[test]
+    fn test_a_pong_we_never_asked_for_is_counted_not_timed() {
+        let mut stats = ConnectionStats::new();
+        // The shape of the bug this prevents: nonce 0 would have produced an
+        // rtt_ms of the current unix time in milliseconds.
+        assert!(!stats.claim_pong(0));
+        assert_eq!(stats.unsolicited_pongs, 1);
+        assert!(stats.rtt_history.is_empty());
+    }
+
+    #[test]
+    fn test_only_the_last_few_pings_stay_claimable() {
+        let mut stats = ConnectionStats::new();
+        for nonce in 0..(OUTSTANDING_PINGS as u64 + 2) {
+            stats.record_ping(nonce + 1);
+        }
+        // The two oldest fell out, so answering them now reads as unsolicited.
+        assert!(!stats.claim_pong(1));
+        assert!(!stats.claim_pong(2));
+        assert!(stats.claim_pong(3));
+        assert_eq!(stats.unsolicited_pongs, 2);
+    }
+
+    #[test]
+    fn test_message_counts_are_capped_by_command() {
+        let mut stats = ConnectionStats::new();
+        stats.record_message("inv");
+        stats.record_message("inv");
+        stats.record_message("addrv2");
+        assert_eq!(stats.messages_by_command.get("inv"), Some(&2));
+        assert_eq!(stats.messages_by_command.get("addrv2"), Some(&1));
+        assert_eq!(stats.messages_other, 0);
+
+        // A peer naming a new command every time cannot grow the map past the
+        // cap; the overflow is counted instead.
+        for i in 0..MESSAGES_BY_COMMAND_CAP {
+            stats.record_message(&format!("cmd{i}"));
+        }
+        assert_eq!(stats.messages_by_command.len(), MESSAGES_BY_COMMAND_CAP);
+        assert!(stats.messages_other > 0);
+        // Commands already counted keep counting after the cap is reached.
+        stats.record_message("inv");
+        assert_eq!(stats.messages_by_command.get("inv"), Some(&3));
     }
 
     /// Test v1 handshake against a real bitcoind.

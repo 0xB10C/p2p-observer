@@ -143,6 +143,21 @@ message ConnectionResult {
     // record, which is the distinction FailureReason goes to trouble to make
     // for attempts that never reached a session.
     DisconnectReason reason = 3;
+    // Messages received from the peer over the session, by command. Says
+    // whether a long session was doing anything, and surfaces commands worth
+    // noticing at all.
+    //
+    // Counts what arrived, not what we sent: our own side is a property of
+    // this build, not an observation. Capped at MESSAGES_BY_COMMAND_CAP
+    // distinct commands because the command string comes from the peer;
+    // anything past the cap is counted in messages_other.
+    map<string, uint32> messages_by_command = 4;
+    uint32 messages_other = 5;
+    // Pongs carrying a nonce we never sent. No RTT is recorded for these --
+    // the nonce is the send time, so an unknown one yields a meaningless
+    // number -- but a peer answering pings it was not sent is behaviour worth
+    // counting.
+    uint32 unsolicited_pongs = 6;
   }
 
   // Never reached a session.

@@ -118,9 +118,25 @@ pub fn event_line(event: &PeerEvent) -> String {
                 Some(R::Disconnected(d)) => {
                     let reason =
                         DisconnectReason::try_from(d.reason).unwrap_or(DisconnectReason::Unknown);
+                    // Ordered by count so the line opens with what the session
+                    // was mostly doing; the full map is in the archive.
+                    let mut by_command: Vec<_> = d.messages_by_command.iter().collect();
+                    by_command.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                    let messages: Vec<String> = by_command
+                        .iter()
+                        .take(5)
+                        .map(|(cmd, n)| format!("{cmd}={n}"))
+                        .collect();
+                    let unsolicited = if d.unsolicited_pongs > 0 {
+                        format!(" unsolicited_pongs={}", d.unsolicited_pongs)
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        "result=disconnected reason={reason:?} setup={}ms uptime={}ms",
-                        d.setup_ms, d.uptime_ms
+                        "result=disconnected reason={reason:?} setup={}ms uptime={}ms{unsolicited} msgs=[{}]",
+                        d.setup_ms,
+                        d.uptime_ms,
+                        messages.join(" "),
                     )
                 }
                 Some(R::Failed(f)) => {
