@@ -664,6 +664,16 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         ));
     }
 
+    fn emit_compact_block_probe(&self, hash: BlockHash, stage: common::events::ProbeStage) {
+        self.emit_event(common::events::peer_event::Event::CompactBlockProbe(
+            common::events::CompactBlockProbe {
+                block_hash: hash.to_string(),
+                stage: stage.into(),
+                tcp_stats: self.sample_tcp_stats(),
+            },
+        ));
+    }
+
     /// Read the socket's current statistics, for an event that wants the path
     /// as it is now rather than as it was at the last ping.
     fn sample_tcp_stats(&self) -> Option<common::events::TcpStats> {
@@ -688,14 +698,14 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                 },
             }))
             .await?;
-        self.emit_block_announcement(hash, common::events::AnnouncementType::Getblocktxn);
+        self.emit_compact_block_probe(hash, common::events::ProbeStage::Requested);
         Ok(())
     }
 
     async fn handle_blocktxn(&mut self, blocktxn: BlockTxn) {
         let hash = blocktxn.transactions.block_hash;
         tracing::trace!(target: TARGET, %hash, txns=blocktxn.transactions.transactions.len(), "received blocktxn for cmptblock");
-        self.emit_block_announcement(hash, common::events::AnnouncementType::Blocktxn);
+        self.emit_compact_block_probe(hash, common::events::ProbeStage::Answered);
     }
 
     async fn handle_ping(&mut self, nonce: u64) -> Result<()> {
