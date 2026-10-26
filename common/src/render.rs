@@ -97,12 +97,8 @@ pub fn event_line(event: &PeerEvent) -> String {
         Some(peer_event::Event::BlockAnnouncement(blk)) => {
             let atype = AnnouncementType::try_from(blk.announcement_type)
                 .unwrap_or(AnnouncementType::Unknown);
-            let rtt = blk
-                .rtt_ms
-                .map(|r| format!(" rtt={r}ms"))
-                .unwrap_or_default();
             format!(
-                "conn={} peer={} block={} type={:?}{rtt}{} ts={}",
+                "conn={} peer={} block={} type={:?}{} ts={}",
                 event.connection_id,
                 event.peer_addr,
                 blk.block_hash,
