@@ -295,10 +295,27 @@ pub(crate) async fn bootstrap_attempt(
         addr,
         transport: TransportHint::Unknown,
     };
-    connect_and_run(id, &dial, cfg, addrman)
-        .instrument(span)
-        .await
-        .map(|(_, end)| end.connected_at)
+    async move {
+        // The manager is not dialling yet, but the session still reports
+        // itself connected, and only an Ended releases that. Without one the
+        // seed stayed "connected" for the life of the process and was never
+        // dialled again once it had served the sync.
+        let guard = addrman.end_guard(addr);
+        match connect_and_run(id, &dial, cfg, addrman).await {
+            Ok((_, end)) => {
+                guard.finish(Outcome::Disconnected {
+                    uptime_secs: end.connected_at.elapsed().as_secs() as u32,
+                });
+                Ok(end.connected_at)
+            }
+            Err(e) => {
+                guard.finish(classify(&e, addr.net()));
+                Err(e)
+            }
+        }
+    }
+    .instrument(span)
+    .await
 }
 
 /// Connect with whichever transport the hint calls for, then run the session.
@@ -635,6 +652,7 @@ fn has_kind(err: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::addresses::Lifecycle;
     use crate::headertree::HeaderTree;
     use crate::protocol::build_version;
     use crate::transport::{TransportReader, TransportWriter};
@@ -829,6 +847,68 @@ mod tests {
     /// A peer that accepts the connection and then never speaks must not hold
     /// the task open. TCP_USER_TIMEOUT does not help: it only aborts
     /// connections with unacknowledged data, and this peer acknowledges ours.
+    /// The seed serves the sync and must then be dialled like any other
+    /// address, which takes an Ended reaching the manager. There was none.
+    #[tokio::test]
+    async fn test_bootstrap_releases_the_seed() {
+        setup();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        // Bootstrap dials with the transport unknown, so v2 goes first and
+        // the v1 retry is the session. A v2 opener is a random key that by
+        // design never begins with the v1 magic: hang up on it at once rather
+        // than leave the client waiting out its transport timeout.
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use common::tokio::io::AsyncReadExt as _;
+                    let (mut reader, writer) = stream.into_split();
+                    let mut magic = [0u8; 4];
+                    if reader.read_exact(&mut magic).await.is_err() || magic != MAGIC.to_bytes() {
+                        return;
+                    }
+                    let reader = std::io::Cursor::new(magic.to_vec()).chain(reader);
+                    let mut r = TransportV1Reader::new(BufReader::new(reader));
+                    let mut w = TransportV1Writer {
+                        magic: MAGIC,
+                        writer,
+                    };
+                    server_handshake(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        let (event_tx, _events) = mpsc::channel(16);
+        let cfg = test_config(event_tx);
+        let (handle, _g, mut life_rx, _c) = crate::addresses::channels();
+        let addr = PeerAddr::Ipv4([127, 0, 0, 1], listen_addr.port());
+
+        let result = common::tokio::time::timeout(
+            Duration::from_secs(5),
+            bootstrap_attempt(addr, &cfg, &handle),
+        )
+        .await
+        .expect("bootstrap timed out");
+        assert!(result.is_ok(), "bootstrap failed: {result:?}");
+
+        // What the session told the manager: Connected, and then the Ended
+        // that releases it -- the message that used to be missing.
+        let mut connected = false;
+        let mut ended = false;
+        while let Ok(msg) = life_rx.try_recv() {
+            match msg {
+                Lifecycle::Connected { addr: a, .. } if a == addr => connected = true,
+                Lifecycle::Ended {
+                    addr: a,
+                    outcome: Outcome::Disconnected { .. },
+                } if a == addr => ended = true,
+                _ => {}
+            }
+        }
+        assert!(connected, "the sync session should have reported connected");
+        assert!(ended, "the seed was never released");
+    }
+
     #[tokio::test]
     async fn test_silent_peer_aborts_handshake() {
         setup();
