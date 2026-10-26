@@ -40,6 +40,23 @@ full. That is what lets a reader tell "no address announcements happened" apart
 from "address announcements were not being recorded", which is otherwise
 unknowable from a file that simply has none in them.
 
+### What the archive cannot tell you, and what it can
+
+Events reach the archiver over NATS, and the observer hands them to its
+publisher with a `try_send` that drops rather than block a connection task. So
+the stream is lossy by design, and an archive is a sample rather than a
+complete record.
+
+Every `PeerEvent` therefore carries `dropped_events`: how many the observer
+failed to queue since it started. A reader diffs it between consecutive events
+to see where the gaps are, and a decrease means the observer restarted. It is a
+running count rather than a sequence number precisely so that it survives
+filtering — an archive written with `--ping-rtt` alone would show sequence gaps
+everywhere, with no way to tell a filtered-out event from a lost one.
+
+In practice the losses cluster at observer startup, where a few dozen is
+normal: every connection handshakes at once and each answers a GETADDR.
+
 ### Compression
 
 Files are compressed with streaming zstd and written as `.bin.zst` directly.
@@ -115,6 +132,10 @@ Options:
           Archive address announcement events
       --connection-results
           Archive connection result events
+      --handshakes
+          Archive version handshake events
+      --compact-block-probes
+          Archive compact block probe events
   -h, --help
           Print help
   -V, --version
@@ -140,10 +161,11 @@ $ cargo run --bin replayer -- archive/signet.20261025-120000-000.bin.zst
 ### Example output
 
 ```text
-INFO replayer: header: created=1761393600 network=signet events=[PingRtt, BlockAnnouncement, AddressAnnouncement, ConnectionResult]
-INFO replayer: [1] conn=42 peer=1.2.3.4:38333 ua="/Satoshi:30.0.0/" transport=v2 rtt=37ms ts=1761393601123
-INFO replayer: [2] conn=42 peer=1.2.3.4:38333 message=Addrv2 addresses=1000 ts=1761393602456
-INFO replayer: total: 2 events
+INFO replayer: header: created=1761393600 network=signet events=[PingRtt, BlockAnnouncement, AddressAnnouncement, ConnectionResult, Handshake, CompactBlockProbe]
+INFO replayer: [1] conn=42 peer=1.2.3.4:38333 ua="/Satoshi:30.0.0/" transport=v2 version=70016 services=0x409 height=328019 relay=true skew=-1s addrv2=true wtxidrelay=true sees_us=0.0.0.0:0 ts=1761393601000
+INFO replayer: [2] conn=42 peer=1.2.3.4:38333 ua="/Satoshi:30.0.0/" transport=v2 rtt=37ms srtt=38000µs rttvar=4000µs retrans=0 cwnd=10 minrtt=37500µs lost=0 reorder=3 rate=120000B/s rx=4096B ts=1761393601123
+INFO replayer: [3] conn=42 peer=1.2.3.4:38333 message=Addrv2 addresses=1000 solicited=true tokens=10.0 ts=1761393602456
+INFO replayer: total: 3 events
 ```
 
 ### Usage
