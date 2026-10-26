@@ -266,7 +266,7 @@ enum OurFaultReason {
 
 message PingRtt {
   uint64 rtt_ms = 1;
-  // OS-level TCP statistics sampled at the ping interval.
+  // OS-level TCP statistics, sampled when the ping went out.
   optional TcpStats tcp_stats = 2;
 }
 
@@ -308,9 +308,13 @@ message TcpStats {
 message BlockAnnouncement {
   string block_hash = 1;
   AnnouncementType announcement_type = 2;
-  // Application-level RTT from the most recent ping/pong exchange, in milliseconds.
-  optional uint64 rtt_ms = 3;
-  // OS-level TCP statistics sampled at the last ping interval.
+  // Was rtt_ms: the most recent ping's application-level RTT, which could be a
+  // whole ping interval old with nothing on the event saying so. The TCP
+  // sample below is taken at announcement time and carries both a smoothed and
+  // a minimum RTT, so nothing is lost by dropping a stale copy.
+  reserved 3;
+  // OS-level TCP statistics, sampled as the announcement arrived rather than
+  // at the last ping, so the path state is contemporaneous with the block.
   optional TcpStats tcp_stats = 4;
 }
 

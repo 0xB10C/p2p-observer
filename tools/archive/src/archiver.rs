@@ -522,7 +522,6 @@ mod tests {
             event: Some(peer_event::Event::BlockAnnouncement(BlockAnnouncement {
                 block_hash: "00".repeat(32),
                 announcement_type: 1,
-                rtt_ms: None,
                 tcp_stats: None,
             })),
             ..Default::default()

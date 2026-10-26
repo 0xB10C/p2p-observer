@@ -651,15 +651,25 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         hash: common::bitcoin::BlockHash,
         announcement_type: common::events::AnnouncementType,
     ) {
-        let tcp_stats = self.stats.tcp.as_ref().map(tcp_stats_event);
         self.emit_event(common::events::peer_event::Event::BlockAnnouncement(
             common::events::BlockAnnouncement {
                 block_hash: hash.to_string(),
                 announcement_type: announcement_type.into(),
-                rtt_ms: self.stats.rtt_history.back().copied().map(u64::from),
-                tcp_stats,
+                // Sampled here rather than taken from the last ping: the point
+                // of the stats on a block announcement is the state of the
+                // path at the moment the block arrived, and the last ping can
+                // be a whole ping interval ago.
+                tcp_stats: self.sample_tcp_stats(),
             },
         ));
+    }
+
+    /// Read the socket's current statistics, for an event that wants the path
+    /// as it is now rather than as it was at the last ping.
+    fn sample_tcp_stats(&self) -> Option<common::events::TcpStats> {
+        crate::tcp::tcp_info(self.raw_fd)
+            .as_ref()
+            .map(tcp_stats_event)
     }
 
     // Requesting a coinbase for a compact block (which we already know through the)

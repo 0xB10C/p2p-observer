@@ -19,7 +19,10 @@ const TARGET: &str = "csv";
 // CSV headers with common fields + event-specific fields + tcp_stats
 const COMMON_HEADER: &str = "connection_id,timestamp_ms,peer_addr,user_agent,transport_version";
 const TCP_STATS_HEADER: &str = "srtt_us,rttvar_us,total_retrans,snd_cwnd,min_rtt_us,lost,reordering,delivery_rate,bytes_received";
-const BLOCK_SPECIFIC_HEADER: &str = "block_hash,announcement_type,rtt_ms";
+// No rtt_ms: a block announcement used to carry the last ping RTT, which could
+// be a whole ping interval old. The TCP columns are now sampled as the
+// announcement arrives, and carry a minimum RTT of their own.
+const BLOCK_SPECIFIC_HEADER: &str = "block_hash,announcement_type";
 const PING_SPECIFIC_HEADER: &str = "rtt_ms";
 
 struct CsvLogger {
@@ -81,12 +84,9 @@ impl CsvLogger {
         let block_hash = &blk.block_hash;
         let announcement_type = blk.announcement_type;
 
-        // Optional rtt_ms
-        let rtt_ms = blk.rtt_ms.map(|r| r.to_string()).unwrap_or_default();
-
         writeln!(
             self.block_writer,
-            "{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{}",
             connection_id,
             timestamp_ms,
             peer_addr,
@@ -94,7 +94,6 @@ impl CsvLogger {
             transport_version,
             block_hash,
             announcement_type,
-            rtt_ms,
             tcp_columns(blk.tcp_stats.as_ref()),
         )?;
 
