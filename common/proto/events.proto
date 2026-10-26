@@ -39,6 +39,12 @@ message PeerEvent {
   // unique, and a reader sees a restart as the id changing.
   uint64 instance_id = 15;
 
+  // The same losses as dropped_events, by the kind of event lost. Absent
+  // while nothing has been dropped; otherwise every kind with a non-zero
+  // running count. The one event kind it cannot name is an event with no
+  // kind at all, which counts towards the total only.
+  optional DroppedEvents dropped_by_kind = 16;
+
   oneof event {
     PingRtt ping_rtt = 6;
     BlockAnnouncement block_announcement = 7;
@@ -49,6 +55,22 @@ message PeerEvent {
     FeeFilter fee_filter = 13;
     SendCmpct send_cmpct = 14;
   }
+}
+
+// Running counts of events lost before the publisher, by kind.
+//
+// Gossip is shed first when the queue runs short, so address announcements
+// are the expected entry here. Any other kind with a non-zero count is a
+// loss the drop policy did not intend, and worth knowing about.
+message DroppedEvents {
+  uint64 ping_rtt = 1;
+  uint64 block_announcement = 2;
+  uint64 address_announcement = 3;
+  uint64 connection_result = 4;
+  uint64 handshake = 5;
+  uint64 compact_block_probe = 6;
+  uint64 fee_filter = 7;
+  uint64 send_cmpct = 8;
 }
 
 // What the peer said about itself in its version message.

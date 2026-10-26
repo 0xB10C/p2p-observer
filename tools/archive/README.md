@@ -59,6 +59,10 @@ a loss is most likely gossip, which peers re-announce, and least likely a
 handshake or a disconnect, which they do not. Losses cluster at observer
 startup, where every connection handshakes at once and each answers a GETADDR.
 
+The same losses are broken down by kind in `dropped_by_kind`, present only
+once something has been lost. Gossip is the expected entry; any other kind
+there is a loss the drop policy did not intend.
+
 Every event also carries `instance_id`, a random value chosen when the
 observer started. `connection_id` counts from zero per process, and the
 archiver is built to outlive the observer, so this is what keeps a join on
