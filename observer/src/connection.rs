@@ -198,21 +198,23 @@ fn emit_result(
     transport_version: Option<u32>,
     result: common::events::connection_result::Result,
 ) {
-    // try_send: dropping an event under pressure is better than stalling a
-    // connection task on the publisher.
-    let _ = cfg.event_tx.try_send(common::events::PeerEvent {
-        timestamp_ms: unix_ms(),
-        peer_addr: dial.addr.to_string(),
-        // Unknown unless the handshake completed; the session event carries it.
-        user_agent: String::new(),
-        transport_version,
-        connection_id: id,
-        event: Some(common::events::peer_event::Event::ConnectionResult(
-            common::events::ConnectionResult {
-                result: Some(result),
-            },
-        )),
-    });
+    crate::emit::send(
+        &cfg.event_tx,
+        common::events::PeerEvent {
+            timestamp_ms: unix_ms(),
+            peer_addr: dial.addr.to_string(),
+            // Unknown unless the handshake completed; the session event carries it.
+            user_agent: String::new(),
+            transport_version,
+            connection_id: id,
+            event: Some(common::events::peer_event::Event::ConnectionResult(
+                common::events::ConnectionResult {
+                    result: Some(result),
+                },
+            )),
+            ..Default::default()
+        },
+    );
 }
 
 fn unix_ms() -> u64 {

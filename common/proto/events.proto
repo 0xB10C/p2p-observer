@@ -12,6 +12,20 @@ message PeerEvent {
   // not exist into the data.
   optional uint32 transport_version = 5;
 
+  // Events this observer could not hand to the publisher before this one,
+  // counted since the process started.
+  //
+  // Emitting is a try_send that drops rather than blocking a connection task,
+  // so the stream is lossy by design. Without this an archive cannot tell a
+  // quiet hour from a lossy one -- the same distinction ArchiveHeader.events
+  // exists to preserve for a whole event kind. A consumer diffs consecutive
+  // values; a decrease means the observer restarted.
+  //
+  // Deliberately a count rather than a sequence number: a sequence number
+  // would show gaps in every archive written with an event-kind filter, where
+  // a gap and a loss are indistinguishable.
+  uint64 dropped_events = 10;
+
   oneof event {
     PingRtt ping_rtt = 6;
     BlockAnnouncement block_announcement = 7;

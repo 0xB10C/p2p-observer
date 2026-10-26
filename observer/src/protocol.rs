@@ -536,15 +536,19 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     }
 
     fn emit_event(&self, event: common::events::peer_event::Event) {
-        let _ = self.event_tx.try_send(common::events::PeerEvent {
-            timestamp_ms: unix_ms(),
-            peer_addr: self.addr.to_string(),
-            user_agent: self.handshake_info.version.user_agent.to_string(),
-            // Always known here: nothing is emitted before the handshake.
-            transport_version: Some(self.transport_version as u32),
-            connection_id: self.connection_id,
-            event: Some(event),
-        });
+        crate::emit::send(
+            &self.event_tx,
+            common::events::PeerEvent {
+                timestamp_ms: unix_ms(),
+                peer_addr: self.addr.to_string(),
+                user_agent: self.handshake_info.version.user_agent.to_string(),
+                // Always known here: nothing is emitted before the handshake.
+                transport_version: Some(self.transport_version as u32),
+                connection_id: self.connection_id,
+                event: Some(event),
+                ..Default::default()
+            },
+        );
     }
 
     fn handle_pong(&mut self, nonce: u64) {
