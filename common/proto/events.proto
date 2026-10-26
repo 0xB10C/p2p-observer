@@ -24,6 +24,10 @@ message PeerEvent {
   // Deliberately a count rather than a sequence number: a sequence number
   // would show gaps in every archive written with an event-kind filter, where
   // a gap and a loss are indistinguishable.
+  //
+  // When the queue runs short it is address announcements that are shed
+  // first, so a loss is most likely gossip -- which is re-announced -- and
+  // least likely a handshake or a disconnect, which are not.
   uint64 dropped_events = 10;
 
   oneof event {

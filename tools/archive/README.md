@@ -54,8 +54,10 @@ running count rather than a sequence number precisely so that it survives
 filtering — an archive written with `--ping-rtt` alone would show sequence gaps
 everywhere, with no way to tell a filtered-out event from a lost one.
 
-In practice the losses cluster at observer startup, where a few dozen is
-normal: every connection handshakes at once and each answers a GETADDR.
+When the queue runs short the observer sheds address announcements first, so
+a loss is most likely gossip, which peers re-announce, and least likely a
+handshake or a disconnect, which they do not. Losses cluster at observer
+startup, where every connection handshakes at once and each answers a GETADDR.
 
 ### Compression
 
