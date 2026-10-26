@@ -74,6 +74,17 @@ pub(crate) struct Config {
 /// to validate the block.
 const HIGH_BANDWIDTH_COMPACT_BLOCKS: bool = true;
 
+/// Longest user agent kept from a version message, in characters. Bitcoin
+/// Core cuts at the same length (MAX_SUBVERSION_LENGTH); the string ends up
+/// in every event and log line of the connection, so a peer does not get to
+/// pick its size.
+const MAX_USER_AGENT_CHARS: usize = 256;
+
+/// The user agent as the peer sent it, cut to [`MAX_USER_AGENT_CHARS`].
+fn cap_user_agent(ua: &str) -> String {
+    ua.chars().take(MAX_USER_AGENT_CHARS).collect()
+}
+
 /// Per-connection state and statistics accumulated during the session.
 struct ConnectionStats {
     /// Last SendCmpct received from the peer.
@@ -109,10 +120,8 @@ impl ConnectionStats {
 /// Information collected from the peer during the version handshake.
 pub(crate) struct HandshakeInfo {
     pub(crate) version: message_network::VersionMessage,
-    #[allow(dead_code)]
     pub(crate) send_addr_v2: bool,
     /// Peer announced BIP339 wtxid-based transaction relay support.
-    #[allow(dead_code)]
     pub(crate) wtxid_relay: bool,
 }
 
@@ -197,6 +206,12 @@ pub(crate) async fn run_session(
     addrman.connected(addr, info.version.services.to_u64(), transport_version);
     tracing::trace!(target: TARGET, "connection established");
 
+    // Before anything else this connection emits, so a reader learns what the
+    // connection_id refers to when the connection opens rather than when it
+    // closes -- which may be hours later, or never, if the archiver stops
+    // first.
+    emit_handshake(cfg, connection_id, addr, transport_version, &info);
+
     let mut conn = Connection {
         reader,
         writer,
@@ -225,6 +240,49 @@ pub(crate) async fn run_session(
     Ok(connected_at)
 }
 
+/// Publish what the peer said about itself in its version message.
+fn emit_handshake(
+    cfg: &Config,
+    connection_id: u64,
+    addr: PeerAddr,
+    transport_version: u8,
+    info: &HandshakeInfo,
+) {
+    let version = &info.version;
+    crate::emit::send(
+        &cfg.event_tx,
+        common::events::PeerEvent {
+            timestamp_ms: unix_ms(),
+            peer_addr: addr.to_string(),
+            user_agent: version.user_agent.to_string(),
+            transport_version: Some(u32::from(transport_version)),
+            connection_id,
+            event: Some(common::events::peer_event::Event::Handshake(
+                common::events::Handshake {
+                    protocol_version: u32::from(version.version),
+                    services: version.services.to_u64(),
+                    start_height: version.start_height,
+                    relay: version.relay,
+                    peer_timestamp: version.timestamp,
+                    // As sent, zeros included: peers routinely leave this
+                    // field blank, and "0.0.0.0:0" is the observation rather
+                    // than a value to clean up. Empty only if the bytes were
+                    // not an address at all.
+                    addr_recv: version
+                        .receiver
+                        .socket_addr()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                    sendaddrv2: info.send_addr_v2,
+                    wtxid_relay: info.wtxid_relay,
+                    user_agent: version.user_agent.to_string(),
+                },
+            )),
+            ..Default::default()
+        },
+    );
+}
+
 pub(crate) async fn version_handshake(
     reader: &mut impl TransportReader,
     writer: &mut impl TransportWriter,
@@ -240,7 +298,9 @@ pub(crate) async fn version_handshake(
 
     while !(peer_version.is_some() && got_verack) {
         match reader.recv().await? {
-            NetworkMessage::Version(v) => {
+            NetworkMessage::Version(mut v) => {
+                v.user_agent =
+                    UserAgent::from_nonstandard(cap_user_agent(&v.user_agent.to_string()));
                 tracing::debug!(target: TARGET,
                     version = u32::from(v.version),
                     ua = v.user_agent.to_string(),
@@ -869,6 +929,14 @@ mod tests {
         w.0.iter()
             .filter(|m| matches!(m, NetworkMessage::GetHeaders(_)))
             .count()
+    }
+
+    #[test]
+    fn test_user_agent_is_capped() {
+        let short = "/Satoshi:29.0.0/";
+        assert_eq!(cap_user_agent(short), short);
+        let long = "x".repeat(MAX_USER_AGENT_CHARS + 50);
+        assert_eq!(cap_user_agent(&long).chars().count(), MAX_USER_AGENT_CHARS);
     }
 
     /// A compact block carries a header, and the tree takes it the same way as

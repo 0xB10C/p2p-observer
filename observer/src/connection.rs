@@ -743,11 +743,24 @@ mod tests {
         };
         tokio::spawn(attempt(dial, cfg, handle));
 
-        let event = common::tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
-            .await
-            .expect("timed out waiting for a ping_rtt event")
-            .expect("event channel closed");
+        let mut next = async || {
+            common::tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .expect("timed out waiting for an event")
+                .expect("event channel closed")
+        };
 
+        // The handshake event comes first, before anything the session goes on
+        // to emit. That ordering is the point of it: it is what tells a reader
+        // what this connection_id refers to.
+        let event = next().await;
+        let Some(common::events::peer_event::Event::Handshake(hs)) = event.event else {
+            panic!("expected Handshake first, got: {:?}", event.event);
+        };
+        assert_eq!(hs.user_agent, crate::protocol::USER_AGENT);
+        assert_eq!(hs.protocol_version, 70016);
+
+        let event = next().await;
         assert!(
             matches!(
                 event.event,

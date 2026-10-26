@@ -78,6 +78,10 @@ pub struct Args {
     /// Archive connection result events.
     #[arg(long)]
     pub connection_results: bool,
+
+    /// Archive version handshake events.
+    #[arg(long)]
+    pub handshakes: bool,
 }
 
 impl Args {
@@ -86,7 +90,8 @@ impl Args {
         !(self.ping_rtt
             || self.block_announcements
             || self.address_announcements
-            || self.connection_results)
+            || self.connection_results
+            || self.handshakes)
     }
 }
 
@@ -100,6 +105,7 @@ struct Filter {
     block_announcement: bool,
     address_announcement: bool,
     connection_result: bool,
+    handshake: bool,
 }
 
 impl From<&Args> for Filter {
@@ -110,6 +116,7 @@ impl From<&Args> for Filter {
             block_announcement: args.block_announcements,
             address_announcement: args.address_announcements,
             connection_result: args.connection_results,
+            handshake: args.handshakes,
         }
     }
 }
@@ -129,6 +136,7 @@ impl Filter {
             Some(peer_event::Event::BlockAnnouncement(_)) => self.block_announcement,
             Some(peer_event::Event::AddressAnnouncement(_)) => self.address_announcement,
             Some(peer_event::Event::ConnectionResult(_)) => self.connection_result,
+            Some(peer_event::Event::Handshake(_)) => self.handshake,
             None => false,
         }
     }
@@ -150,6 +158,7 @@ impl Filter {
                 self.all || self.connection_result,
                 EventKind::ConnectionResult,
             ),
+            (self.all || self.handshake, EventKind::Handshake),
         ]
         .into_iter()
         .filter(|(enabled, _)| *enabled)
@@ -474,7 +483,7 @@ fn format_utc_timestamp(epoch_ms: u64) -> String {
 mod tests {
     use super::*;
     use crate::read::ArchiveReader;
-    use common::events::{BlockAnnouncement, PingRtt};
+    use common::events::{BlockAnnouncement, Handshake, PingRtt};
 
     fn args(flags: &[&str]) -> Args {
         let mut argv = vec![
@@ -520,6 +529,28 @@ mod tests {
         }
     }
 
+    fn handshake() -> PeerEvent {
+        PeerEvent {
+            connection_id: 9,
+            timestamp_ms: 1_700_000_000_500,
+            peer_addr: "1.2.3.4:38333".to_owned(),
+            user_agent: "/Satoshi:30.0.0/".to_owned(),
+            transport_version: Some(2),
+            event: Some(peer_event::Event::Handshake(Handshake {
+                protocol_version: 70016,
+                services: 1033,
+                start_height: 225_000,
+                relay: true,
+                peer_timestamp: 1_700_000_000,
+                addr_recv: "0.0.0.0:0".to_owned(),
+                sendaddrv2: true,
+                wtxid_relay: true,
+                user_agent: "/Satoshi:30.0.0/".to_owned(),
+            })),
+            ..Default::default()
+        }
+    }
+
     fn tmp_dir(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("p2p-observer-archive-{tag}-{}", std::process::id()));
@@ -535,7 +566,8 @@ mod tests {
         assert!(filter.matches(&block()));
         // An event this build cannot classify is still archived verbatim.
         assert!(filter.matches(&PeerEvent::default()));
-        assert_eq!(filter.kinds().len(), 4);
+        // Every kind this build knows: ping, block, address, result, handshake.
+        assert_eq!(filter.kinds().len(), 5);
     }
 
     #[test]
@@ -546,6 +578,24 @@ mod tests {
         assert!(!filter.matches(&block()));
         assert!(!filter.matches(&PeerEvent::default()));
         assert_eq!(filter.kinds(), vec![EventKind::PingRtt as i32]);
+    }
+
+    #[test]
+    fn test_the_newer_kinds_can_be_asked_for_alone() {
+        // A reachability study wants who connected and how it ended, and none
+        // of the per-session traffic.
+        let filter = Filter::from(&args(&["--handshakes", "--connection-results"]));
+        assert!(!filter.all);
+        assert!(filter.matches(&handshake()));
+        assert!(!filter.matches(&ping(1)));
+        assert!(!filter.matches(&block()));
+        assert_eq!(
+            filter.kinds(),
+            vec![
+                EventKind::ConnectionResult as i32,
+                EventKind::Handshake as i32
+            ]
+        );
     }
 
     #[test]
