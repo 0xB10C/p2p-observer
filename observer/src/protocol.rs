@@ -788,13 +788,18 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     ) {
         let solicited = std::mem::take(&mut self.getaddr_outstanding);
 
+        // Refilled whether or not this message will be charged, so the level
+        // reported below means the same thing on both paths. Harmless to the
+        // limiter: the refill is capped and monotonic in elapsed time, so
+        // doing it in two steps lands where one step would have.
+        let elapsed = self.addr_tokens_updated.elapsed().as_secs_f64();
+        self.addr_tokens_updated = Instant::now();
+        self.addr_tokens =
+            (self.addr_tokens + elapsed * policy::ADDR_RATE_PER_SEC).min(policy::ADDR_BURST);
+        let tokens = self.addr_tokens;
+
         let mut rate_limited = 0;
         if !solicited {
-            let elapsed = self.addr_tokens_updated.elapsed().as_secs_f64();
-            self.addr_tokens_updated = Instant::now();
-            self.addr_tokens =
-                (self.addr_tokens + elapsed * policy::ADDR_RATE_PER_SEC).min(policy::ADDR_BURST);
-
             let allowed = self.addr_tokens.floor().max(0.0) as usize;
             if parsed.len() > allowed {
                 rate_limited = parsed.len() - allowed;
@@ -826,6 +831,16 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                         ntime: g.ntime,
                     })
                     .collect(),
+                // Nothing else in the stream records that we asked, so without
+                // this the limiter's behaviour cannot be reconstructed from an
+                // archive: a solicited announcement is not charged at all.
+                solicited,
+                // What the limiter discarded, and the bucket it discarded it
+                // against. Both are observer policy, and both are here because
+                // the alternative is a reader re-deriving them from constants
+                // that live in the binary.
+                rate_limited: rate_limited as u32,
+                rate_limit_tokens: tokens,
             },
         ));
 

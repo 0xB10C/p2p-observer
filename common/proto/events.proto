@@ -88,11 +88,12 @@ message Handshake {
 // is on the enclosing PeerEvent, so the share of the table attributable to any
 // one peer or network can be measured offline.
 //
-// Deliberately carries no observer-side policy. How much the rate limit
-// dropped is not here, because the full list is, and the bucket can be
-// replayed from the archive. Nor is any claim about whether this answered a
-// GETADDR: the protocol has no request/response correlation, so that can only
-// be guessed at, and a guess in a permanent archive is worse than nothing.
+// Carries no claim about whether this answered a GETADDR: the protocol has no
+// request/response correlation, so that can only be guessed at, and a guess in
+// a permanent archive is worse than nothing. What it does carry is whether a
+// request of ours was outstanding, which is a fact about this observer rather
+// than an inference about the peer.
+//
 // A self-announcement is identifiable offline — a single entry matching the
 // peer on the enclosing PeerEvent — with better information than we have here.
 message AddressAnnouncement {
@@ -105,6 +106,23 @@ message AddressAnnouncement {
   uint32 unparsed = 2;
   // Every entry we could parse, before the rate limit was applied.
   repeated GossipedAddress addresses = 3;
+
+  // Whether a GETADDR of ours was still outstanding when this arrived.
+  //
+  // Not a claim that this is the answer to it — see above — but the observer
+  // treats it as one: a solicited announcement is not charged against the rate
+  // limit at all. Without this the limiter's behaviour cannot be reconstructed
+  // from the stream, because nothing else in it records that we asked.
+  bool solicited = 4;
+  // How many of the entries above the rate limit discarded, so the gap between
+  // what was announced and what the address book was offered is explicit
+  // rather than something a reader has to re-derive from policy constants that
+  // live in the binary and appear nowhere in the archive.
+  uint32 rate_limited = 5;
+  // The token bucket's level when this message was processed, after refilling
+  // for elapsed time and before anything was spent on these entries. Zero
+  // tokens with a non-zero rate_limited is the limiter saturated.
+  double rate_limit_tokens = 6;
 }
 
 // The P2P message that carried an address announcement.
