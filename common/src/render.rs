@@ -214,7 +214,31 @@ pub fn event_line(event: &PeerEvent) -> String {
     // -- but shown on every kind of event, because the loss it reports is not
     // confined to the kind that happens to be carrying the count.
     if event.dropped_events > 0 {
-        format!("{line} dropped={}", event.dropped_events)
+        // By kind too, naming only the kinds that lost anything.
+        let by_kind = event
+            .dropped_by_kind
+            .as_ref()
+            .map(|d| {
+                [
+                    ("ping_rtt", d.ping_rtt),
+                    ("block_announcement", d.block_announcement),
+                    ("address_announcement", d.address_announcement),
+                    ("connection_result", d.connection_result),
+                    ("handshake", d.handshake),
+                    ("compact_block_probe", d.compact_block_probe),
+                    ("fee_filter", d.fee_filter),
+                    ("send_cmpct", d.send_cmpct),
+                ]
+                .into_iter()
+                .filter(|(_, n)| *n > 0)
+                .map(|(k, n)| format!("{k}={n}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+            })
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" [{s}]"))
+            .unwrap_or_default();
+        format!("{line} dropped={}{by_kind}", event.dropped_events)
     } else {
         line
     }
