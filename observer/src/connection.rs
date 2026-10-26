@@ -96,7 +96,7 @@ pub(crate) async fn attempt(dial: Dial, cfg: Config, addrman: Handle) {
                     // session is the rest. Reported separately so neither is
                     // hidden inside one "duration".
                     let setup = started.elapsed().saturating_sub(uptime);
-                    let result = disconnected_result(setup, uptime, reason);
+                    let result = disconnected_result(setup, uptime, reason, &end);
                     // The handshake completed, so this is known -- and the
                     // result event is the only event a session that sent
                     // nothing else produces.
@@ -144,12 +144,16 @@ fn disconnected_result(
     setup: Duration,
     uptime: Duration,
     reason: common::events::DisconnectReason,
+    end: &crate::protocol::SessionEnd,
 ) -> common::events::connection_result::Result {
     common::events::connection_result::Result::Disconnected(
         common::events::connection_result::Disconnected {
             setup_ms: setup.as_millis() as u64,
             uptime_ms: uptime.as_millis() as u64,
             reason: reason.into(),
+            messages_by_command: end.messages_by_command.clone().into_iter().collect(),
+            messages_other: end.messages_other,
+            unsolicited_pongs: end.unsolicited_pongs,
         },
     )
 }
