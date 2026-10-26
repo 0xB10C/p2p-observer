@@ -24,7 +24,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::addresses::{Handle, book::Gossiped, peer_addr::PeerAddr, policy};
-use crate::headertree::HeaderTree;
+use crate::headertree::{HeaderError, HeaderTree};
 use crate::transport::{TransportReader, TransportWriter};
 
 use crate::TARGET_PROTOCOL as TARGET;
@@ -139,6 +139,10 @@ struct Connection<R: TransportReader, W: TransportWriter> {
     event_tx: mpsc::Sender<common::events::PeerEvent>,
     header_tree: Arc<RwLock<HeaderTree>>,
     sync_headers: bool,
+    /// The missing block this connection last asked its peer about, so the
+    /// same peer announcing the same block twice is not asked twice. How many
+    /// peers ask is the tree's decision.
+    asked_for: Option<BlockHash>,
 }
 
 /// Everything a session needs besides the transport itself.
@@ -210,6 +214,7 @@ pub(crate) async fn run_session(
         event_tx: cfg.event_tx.clone(),
         header_tree: cfg.header_tree.clone(),
         sync_headers: cfg.sync_headers,
+        asked_for: None,
     };
     // The session running out is not an error: the peer disconnected, which is
     // an ordinary outcome. The caller turns the elapsed time into
@@ -353,11 +358,19 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                 Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
                     tracing::info!(target: TARGET, %hash, "inv: block");
                     self.emit_block_announcement(hash, common::events::AnnouncementType::Inv);
+                    // An inv carries no header, so a block we do not know is
+                    // only reachable by asking for headers.
+                    if !self.header_tree.read().unwrap().contains(&hash) {
+                        self.recover_headers(hash, false).await?;
+                    }
                 }
                 Inventory::CompactBlock(hash) => {
                     tracing::info!(target: TARGET, %hash, "inv: compact block");
                     self.emit_block_announcement(hash, common::events::AnnouncementType::Inv);
                     getdata.push(Inventory::CompactBlock(hash));
+                    if !self.header_tree.read().unwrap().contains(&hash) {
+                        self.recover_headers(hash, false).await?;
+                    }
                 }
                 _ => {}
             }
@@ -400,7 +413,8 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         Ok(())
     }
 
-    /// Offer headers to the tree. Returns how many were new.
+    /// Offer headers to the tree, and ask this peer for more if they show the
+    /// tree to be behind. Returns how many were new.
     async fn accept_headers(
         &mut self,
         headers: &[common::bitcoin::block::Header],
@@ -411,10 +425,50 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         if accepted > 0 {
             tracing::info!(target: TARGET, accepted, height, %tip, "headers inserted");
         }
-        if let Some(e) = &err {
-            tracing::warn!(target: TARGET, "header insert error: {e}");
+        match err {
+            // The parent is missing: the tree is behind, and only a getheaders
+            // catches it up. During the initial sync that cannot happen, since
+            // headers arrive in order from our own request.
+            Some(HeaderError::OrphanHeader) if !self.sync_headers => {
+                tracing::debug!(target: TARGET, height, "orphan header: the tree is behind");
+                // The newest header is the block the peer is announcing, and
+                // having sent the header it provably has it.
+                if let Some(newest) = headers.last() {
+                    self.recover_headers(newest.block_hash(), true).await?;
+                }
+            }
+            Some(e) => tracing::warn!(target: TARGET, "header insert error: {e}"),
+            None => {}
         }
         Ok(accepted)
+    }
+
+    /// Ask this peer for headers because an announcement has just shown the
+    /// tree to be behind.
+    ///
+    /// Nothing else re-synchronises the tree once the initial sync is done, and
+    /// a missed block used to leave it permanently behind: every later
+    /// single-header announcement was an orphan, and only a new connection's
+    /// start-of-session getheaders could catch it up -- which on a quiet
+    /// network is hours. Throttled through the tree, because a new block
+    /// reaches us from every connection at once and a few requests are enough.
+    /// `missing` is the announced block the tree lacks; `proven` whether the
+    /// announcement carried its header.
+    async fn recover_headers(&mut self, missing: BlockHash, proven: bool) -> Result<()> {
+        if self.asked_for == Some(missing) {
+            return Ok(());
+        }
+        if !self
+            .header_tree
+            .write()
+            .unwrap()
+            .recovery_due(missing, proven, Instant::now())
+        {
+            return Ok(());
+        }
+        self.asked_for = Some(missing);
+        tracing::info!(target: TARGET, %missing, "header tree is behind, requesting headers");
+        self.send_getheaders().await
     }
 
     async fn handle_cmpct_block(
@@ -785,6 +839,7 @@ mod tests {
             event_tx,
             header_tree: tree,
             sync_headers: false,
+            asked_for: None,
         };
         Harness {
             conn,
@@ -836,6 +891,74 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, NetworkMessage::GetBlockTxn(_)))
         );
+    }
+
+    /// An announcement whose parent we do not have means the tree is behind,
+    /// and the only way back is to ask -- a few peers, however many announce,
+    /// and each of them once.
+    #[tokio::test]
+    async fn test_orphan_announcement_asks_a_few_peers_once_each() {
+        use crate::headertree::testing::{mine_header, regtest_params};
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let (genesis, _) = tree.read().unwrap().tip();
+        let h1 = mine_header(genesis, 1_700_000_000, 1);
+        let h2 = mine_header(h1.block_hash(), 1_700_000_060, 2);
+
+        // Four connections sharing the tree, as every connection does.
+        let mut conns: Vec<_> = (0..4).map(|_| harness(tree.clone())).collect();
+        conns[0]
+            .conn
+            .handle_cmpct_block(compact_block(h2))
+            .await
+            .unwrap();
+        // The same peer announcing the same block again is not asked again.
+        conns[0].conn.handle_headers(vec![h2]).await.unwrap();
+        for c in &mut conns[1..] {
+            c.conn.handle_headers(vec![h2]).await.unwrap();
+        }
+
+        assert!(
+            !tree.read().unwrap().contains(&h2.block_hash()),
+            "orphan stays out"
+        );
+        let sent: Vec<usize> = conns
+            .iter()
+            .map(|c| getheaders_sent(&c.conn.writer))
+            .collect();
+        assert_eq!(sent, vec![1, 1, 1, 0], "three peers asked, once each");
+    }
+
+    /// An inv carries only a hash. A hash we do not know is the same signal.
+    #[tokio::test]
+    async fn test_inv_for_an_unknown_block_asks_for_headers() {
+        use crate::headertree::testing::{mine_header, regtest_params};
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let (genesis, _) = tree.read().unwrap().tip();
+        let unknown = mine_header(genesis, 1_700_000_000, 1).block_hash();
+
+        let mut h = harness(tree.clone());
+        // A block we already have is not a reason to ask.
+        h.conn
+            .handle_inv(vec![Inventory::Block(genesis)])
+            .await
+            .unwrap();
+        assert_eq!(getheaders_sent(&h.conn.writer), 0);
+
+        h.conn
+            .handle_inv(vec![Inventory::Block(unknown)])
+            .await
+            .unwrap();
+        assert_eq!(getheaders_sent(&h.conn.writer), 1);
+
+        // An inv says nothing about whether the peer has validated the block,
+        // so while a request is out another inv for it waits.
+        let mut other = harness(tree.clone());
+        other
+            .conn
+            .handle_inv(vec![Inventory::Block(unknown)])
+            .await
+            .unwrap();
+        assert_eq!(getheaders_sent(&other.conn.writer), 0);
     }
 
     /// Test v1 handshake against a real bitcoind.

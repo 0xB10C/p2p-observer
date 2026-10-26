@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use common::{
     anyhow::{Context, Result},
@@ -14,6 +15,29 @@ use common::{
 };
 
 use crate::TARGET_HEADERTREE as TARGET;
+
+/// Minimum gap between two rounds of requests for the same missing block.
+///
+/// A new block reaches us from every connection within a second or two, and
+/// when the tree is behind every one of those announcements is an orphan. A
+/// few getheaders are enough to catch up; one per connection would be a
+/// hundred replies of up to two thousand headers each, all saying the same
+/// thing.
+const RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Connections asked about the same missing block within one interval.
+///
+/// One is not enough: the peer that announced first may never answer, or
+/// answer with headers of another chain, and waiting out the interval on it
+/// would cost a block interval of being behind. Three is what Bitcoin Core
+/// settled on for block downloads, for the same reason.
+const RECOVERY_PEERS: u8 = 3;
+
+/// The requests out for one block the tree does not have.
+struct Recovery {
+    started: Instant,
+    requests: u8,
+}
 
 const HEADER_SIZE: usize = 80;
 
@@ -32,6 +56,11 @@ pub(crate) struct HeaderTree {
     tip_work: Work,
     params: common::bitcoin::network::Params,
     dirty: bool,
+    /// Blocks announced but absent from the tree, with the requests sent for
+    /// each. Per block, so a peer that never answers for one block does not
+    /// hold up the next; shared across connections, which is what makes it a
+    /// throttle rather than a per-peer courtesy.
+    recovery: HashMap<BlockHash, Recovery>,
 }
 
 #[derive(Debug)]
@@ -93,6 +122,7 @@ impl HeaderTree {
             tip_work: work,
             params,
             dirty: false,
+            recovery: HashMap::new(),
         }
     }
 
@@ -125,6 +155,8 @@ impl HeaderTree {
                 chain_work,
             },
         );
+        // Whatever was asked for this block has been answered.
+        self.recovery.remove(&hash);
 
         if chain_work > self.tip_work {
             let old_tip = self.tip;
@@ -245,9 +277,41 @@ impl HeaderTree {
         (self.tip, self.tip_height)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn contains(&self, hash: &BlockHash) -> bool {
         self.headers.contains_key(hash)
+    }
+
+    /// Whether a connection that has just found `missing` absent from the tree
+    /// should ask its peer for headers now, or leave it to the requests out.
+    ///
+    /// Up to [`RECOVERY_PEERS`] connections ask within one interval. `proven`
+    /// says the announcement carried the header, so the peer has the block. A
+    /// bare inv proves nothing -- the peer may not have validated the block
+    /// yet, which is how a download stalls -- so an inv is acted on only when
+    /// no request for the block is out at all.
+    ///
+    /// Takes the time rather than reading the clock so the throttle can be
+    /// tested without waiting it out.
+    pub(crate) fn recovery_due(&mut self, missing: BlockHash, proven: bool, now: Instant) -> bool {
+        self.recovery
+            .retain(|_, r| now.duration_since(r.started) < RECOVERY_INTERVAL);
+        match self.recovery.get_mut(&missing) {
+            None => {
+                self.recovery.insert(
+                    missing,
+                    Recovery {
+                        started: now,
+                        requests: 1,
+                    },
+                );
+                true
+            }
+            Some(r) if proven && r.requests < RECOVERY_PEERS => {
+                r.requests += 1;
+                true
+            }
+            Some(_) => false,
+        }
     }
 
     #[allow(dead_code)]
@@ -555,6 +619,43 @@ mod tests {
         header.prev_blockhash = BlockHash::from_byte_array([0xab; 32]);
         let (_, err) = tree.insert_batch(&[header]);
         assert!(matches!(err, Some(HeaderError::OrphanHeader)));
+    }
+
+    #[test]
+    fn test_recovery_requests_are_per_block_and_capped() {
+        let mut tree = regtest_tree();
+        let t0 = Instant::now();
+        let a = BlockHash::from_byte_array([1; 32]);
+        let b = BlockHash::from_byte_array([2; 32]);
+        let c = BlockHash::from_byte_array([3; 32]);
+        // Three connections that saw the header ask; the next hundred, within
+        // the same second or two, do not.
+        assert!(tree.recovery_due(a, true, t0));
+        assert!(tree.recovery_due(a, true, t0));
+        assert!(tree.recovery_due(a, true, t0));
+        assert!(!tree.recovery_due(a, true, t0 + RECOVERY_INTERVAL / 2));
+        // Another missing block is its own matter, however the first is going.
+        assert!(tree.recovery_due(b, true, t0));
+        // An inv proves nothing about the peer: it asks only when nobody has.
+        assert!(!tree.recovery_due(a, false, t0));
+        assert!(tree.recovery_due(c, false, t0));
+        assert!(!tree.recovery_due(c, false, t0));
+        // Once the interval has passed the block may still be missing -- a reply
+        // carries at most two thousand headers -- so a new round is right.
+        assert!(tree.recovery_due(a, true, t0 + RECOVERY_INTERVAL));
+        assert!(!tree.recovery_due(a, false, t0 + RECOVERY_INTERVAL));
+    }
+
+    #[test]
+    fn test_an_accepted_header_ends_its_recovery() {
+        let mut tree = regtest_tree();
+        let h1 = mine_header(tree.tip().0, 1296688602, 0);
+        let t0 = Instant::now();
+        assert!(tree.recovery_due(h1.block_hash(), false, t0));
+        assert!(!tree.recovery_due(h1.block_hash(), false, t0));
+        tree.insert_batch(&[h1]);
+        // The block arrived, so nothing is out for it any more.
+        assert!(!tree.recovery.contains_key(&h1.block_hash()));
     }
 
     #[test]
