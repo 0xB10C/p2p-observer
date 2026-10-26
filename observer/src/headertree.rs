@@ -466,10 +466,45 @@ pub(crate) async fn persist_task(
 }
 
 #[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    use common::bitcoin::{Network, network::Params};
+
+    pub(crate) fn regtest_params() -> Params {
+        Params::new(Network::Regtest)
+    }
+
+    /// Mine a valid regtest header. Regtest uses bits=0x207fffff which gives a
+    /// target so easy that nonce=0 always satisfies PoW. A unique `seed` byte in
+    /// the merkle root lets callers produce different blocks at the same height.
+    pub(crate) fn mine_header(prev_hash: BlockHash, time: u32, seed: u8) -> Header {
+        use common::bitcoin::{
+            CompactTarget, TxMerkleNode, blockdata::block::Version, time::BlockTime,
+        };
+        let bits = CompactTarget::from_consensus(0x207fffff);
+        let merkle_root = TxMerkleNode::from_byte_array([seed; 32]);
+        for nonce in 0..=u32::MAX {
+            let h = Header {
+                version: Version::ONE,
+                prev_blockhash: prev_hash,
+                merkle_root,
+                time: BlockTime::from(time),
+                bits,
+                nonce,
+            };
+            if h.validate_pow(h.bits.into()).is_ok() {
+                return h;
+            }
+        }
+        panic!("failed to mine regtest header — this should never happen");
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::testing::{mine_header, regtest_params};
     use super::*;
     use bitcoind::client::bitcoin::Address;
-    use common::bitcoin::{Network, network::Params};
 
     // A random regtest address we can mine to.
     fn regtest_address() -> Address {
@@ -478,10 +513,6 @@ mod tests {
             .parse::<bitcoind::client::bitcoin::Address<_>>()
             .unwrap()
             .assume_checked()
-    }
-
-    fn regtest_params() -> Params {
-        Params::new(Network::Regtest)
     }
 
     fn regtest_tree() -> HeaderTree {
@@ -722,28 +753,6 @@ mod tests {
     /// Mine a valid regtest header. Regtest uses bits=0x207fffff which gives a
     /// target so easy that nonce=0 always satisfies PoW. A unique `seed` byte in
     /// the merkle root lets callers produce different blocks at the same height.
-    fn mine_header(prev_hash: BlockHash, time: u32, seed: u8) -> Header {
-        use common::bitcoin::{
-            CompactTarget, TxMerkleNode, blockdata::block::Version, time::BlockTime,
-        };
-        let bits = CompactTarget::from_consensus(0x207fffff);
-        let merkle_root = TxMerkleNode::from_byte_array([seed; 32]);
-        for nonce in 0..=u32::MAX {
-            let h = Header {
-                version: Version::ONE,
-                prev_blockhash: prev_hash,
-                merkle_root,
-                time: BlockTime::from(time),
-                bits,
-                nonce,
-            };
-            if h.validate_pow(h.bits.into()).is_ok() {
-                return h;
-            }
-        }
-        panic!("failed to mine regtest header — this should never happen");
-    }
-
     /// Simulate a reorg by self-mining two diverging chains without bitcoind.
     /// Chain A has 10 blocks; chain B diverges at height 1 and has 12 blocks.
     /// The tree should follow chain B after both are inserted.

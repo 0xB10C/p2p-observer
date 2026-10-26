@@ -384,15 +384,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             return Ok(());
         }
 
-        let (accepted, err) = self.header_tree.write().unwrap().insert_batch(&headers);
-        let (tip, height) = self.header_tree.read().unwrap().tip();
-
-        if accepted > 0 {
-            tracing::info!(target: TARGET, accepted, height, %tip, "headers inserted");
-        }
-        if let Some(e) = &err {
-            tracing::warn!(target: TARGET, "header insert error: {e}");
-        }
+        let accepted = self.accept_headers(&headers).await?;
 
         if !self.sync_headers {
             for header in &headers {
@@ -408,13 +400,32 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         Ok(())
     }
 
+    /// Offer headers to the tree. Returns how many were new.
+    async fn accept_headers(
+        &mut self,
+        headers: &[common::bitcoin::block::Header],
+    ) -> Result<usize> {
+        let (accepted, err) = self.header_tree.write().unwrap().insert_batch(headers);
+        let (tip, height) = self.header_tree.read().unwrap().tip();
+
+        if accepted > 0 {
+            tracing::info!(target: TARGET, accepted, height, %tip, "headers inserted");
+        }
+        if let Some(e) = &err {
+            tracing::warn!(target: TARGET, "header insert error: {e}");
+        }
+        Ok(accepted)
+    }
+
     async fn handle_cmpct_block(
         &mut self,
         cmpct: common::p2p::message_compact_blocks::CmpctBlock,
     ) -> Result<()> {
-        let hash = cmpct.compact_block.header.block_hash();
+        let header = cmpct.compact_block.header;
+        let hash = header.block_hash();
         self.emit_block_announcement(hash, common::events::AnnouncementType::CompactBlock);
         tracing::info!(target: TARGET, %hash, "compact block");
+        self.accept_headers(&[header]).await?;
         self.request_compact_block_coinbase(hash).await
     }
 
@@ -712,6 +723,119 @@ mod tests {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .try_init();
+    }
+
+    // ── A connection with no peer behind it ──────────────────────────────────
+    //
+    // The handlers never read, so the reader can refuse; the writer keeps what
+    // was sent so a test can see what a handler asked the peer for.
+
+    struct NoReads;
+    impl TransportReader for NoReads {
+        async fn recv(&mut self) -> Result<NetworkMessage> {
+            Err(common::anyhow::anyhow!("this test does not read"))
+        }
+    }
+
+    struct Captured(Vec<NetworkMessage>);
+    impl TransportWriter for Captured {
+        async fn send(&mut self, msg: NetworkMessage) -> Result<()> {
+            self.0.push(msg);
+            Ok(())
+        }
+    }
+
+    /// Everything a Connection needs besides the transport, kept alive for as
+    /// long as the test holds it: the event receiver so emits do not fail, the
+    /// manager channels so the handle has somewhere to send.
+    struct Harness {
+        conn: Connection<NoReads, Captured>,
+        _events: mpsc::Receiver<common::events::PeerEvent>,
+        _manager: (
+            mpsc::Receiver<Vec<Gossiped>>,
+            mpsc::UnboundedReceiver<crate::addresses::Lifecycle>,
+            mpsc::Receiver<crate::addresses::Command>,
+        ),
+    }
+
+    fn harness(tree: Arc<RwLock<HeaderTree>>) -> Harness {
+        let (event_tx, events) = mpsc::channel(64);
+        let (addrman, g, l, c) = crate::addresses::channels();
+        let NetworkMessage::Version(version) = build_version(USER_AGENT, 0) else {
+            unreachable!()
+        };
+        let conn = Connection {
+            reader: NoReads,
+            writer: Captured(Vec::new()),
+            addrman,
+            addr_tokens: policy::ADDR_BURST,
+            addr_tokens_updated: Instant::now(),
+            getaddr_outstanding: false,
+            handshake_info: HandshakeInfo {
+                version,
+                send_addr_v2: false,
+                wtxid_relay: false,
+            },
+            stats: ConnectionStats::new(),
+            raw_fd: -1,
+            ping_interval: Duration::from_secs(120),
+            addr: PeerAddr::Ipv4([127, 0, 0, 1], 18444),
+            transport_version: 1,
+            connection_id: 7,
+            event_tx,
+            header_tree: tree,
+            sync_headers: false,
+        };
+        Harness {
+            conn,
+            _events: events,
+            _manager: (g, l, c),
+        }
+    }
+
+    fn compact_block(
+        header: common::bitcoin::block::Header,
+    ) -> common::p2p::message_compact_blocks::CmpctBlock {
+        common::p2p::message_compact_blocks::CmpctBlock {
+            compact_block: bip152::HeaderAndShortIds {
+                header,
+                nonce: 0,
+                short_ids: Vec::new(),
+                prefilled_txs: Vec::new(),
+            },
+        }
+    }
+
+    fn getheaders_sent(w: &Captured) -> usize {
+        w.0.iter()
+            .filter(|m| matches!(m, NetworkMessage::GetHeaders(_)))
+            .count()
+    }
+
+    /// A compact block carries a header, and the tree takes it the same way as
+    /// one from a HEADERS message.
+    #[tokio::test]
+    async fn test_compact_block_header_joins_the_tree() {
+        use crate::headertree::testing::{mine_header, regtest_params};
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let (genesis, _) = tree.read().unwrap().tip();
+        let h1 = mine_header(genesis, 1_700_000_000, 1);
+
+        let mut h = harness(tree.clone());
+        h.conn.handle_cmpct_block(compact_block(h1)).await.unwrap();
+
+        assert!(tree.read().unwrap().contains(&h1.block_hash()));
+        assert_eq!(tree.read().unwrap().tip().1, 1);
+        // Connected straight on, so nothing to recover; the only request is
+        // the probe for the coinbase.
+        assert_eq!(getheaders_sent(&h.conn.writer), 0);
+        assert!(
+            h.conn
+                .writer
+                .0
+                .iter()
+                .any(|m| matches!(m, NetworkMessage::GetBlockTxn(_)))
+        );
     }
 
     /// Test v1 handshake against a real bitcoind.
