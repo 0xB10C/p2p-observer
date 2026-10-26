@@ -6,6 +6,14 @@ Every address method is answered by the address manager over its command
 channel, so an RPC never blocks dialling. If the manager has shut down, the
 reply is `{"error":"address manager unavailable"}`.
 
+The examples below use the `nats` CLI. The `rpc` tool in [`tools/rpc`](../../tools/rpc)
+wraps the same methods as subcommands, so the subject and the JSON payload
+need not be typed:
+
+```bash
+$ rpc --network signet addresses inspect 1.2.3.4:38333
+```
+
 ## `addresses.info`
 
 Counts per class, plus how many attempts are in flight.
