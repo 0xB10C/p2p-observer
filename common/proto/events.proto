@@ -30,6 +30,15 @@ message PeerEvent {
   // least likely a handshake or a disconnect, which are not.
   uint64 dropped_events = 10;
 
+  // Which run of the observer produced this event: a random value chosen when
+  // the process started, the same on every event it emits.
+  //
+  // connection_id is a counter from zero per process, and the archiver is
+  // built to outlive the observer, so without this one archive can hold two
+  // different connections both called conn=0. (instance_id, connection_id) is
+  // unique, and a reader sees a restart as the id changing.
+  uint64 instance_id = 15;
+
   oneof event {
     PingRtt ping_rtt = 6;
     BlockAnnouncement block_announcement = 7;
