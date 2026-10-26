@@ -460,6 +460,11 @@ impl HeaderTree {
         self.headers.contains_key(hash)
     }
 
+    /// The height of a header the tree holds.
+    pub(crate) fn height_of(&self, hash: &BlockHash) -> Option<u32> {
+        self.headers.get(hash).map(|e| e.height)
+    }
+
     /// Whether a connection that has just found `missing` absent from the tree
     /// should ask its peer for headers now, or leave it to the requests out.
     ///

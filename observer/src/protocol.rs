@@ -514,18 +514,30 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             match item {
                 Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
                     tracing::info!(target: TARGET, %hash, "inv: block");
-                    self.emit_block_announcement(hash, common::events::AnnouncementType::Inv, 1);
+                    let known = self.header_tree.read().unwrap().contains(&hash);
+                    self.emit_block_announcement(
+                        hash,
+                        common::events::AnnouncementType::Inv,
+                        1,
+                        !known,
+                    );
                     // An inv carries no header, so a block we do not know is
                     // only reachable by asking for headers.
-                    if !self.header_tree.read().unwrap().contains(&hash) {
+                    if !known {
                         self.recover_headers(hash, false).await?;
                     }
                 }
                 Inventory::CompactBlock(hash) => {
                     tracing::info!(target: TARGET, %hash, "inv: compact block");
-                    self.emit_block_announcement(hash, common::events::AnnouncementType::Inv, 1);
+                    let known = self.header_tree.read().unwrap().contains(&hash);
+                    self.emit_block_announcement(
+                        hash,
+                        common::events::AnnouncementType::Inv,
+                        1,
+                        !known,
+                    );
                     getdata.push(Inventory::CompactBlock(hash));
-                    if !self.header_tree.read().unwrap().contains(&hash) {
+                    if !known {
                         self.recover_headers(hash, false).await?;
                     }
                 }
@@ -554,17 +566,27 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             return Ok(());
         }
 
+        // Taken before the insertion below, which is what makes "new to us"
+        // mean anything.
+        let known_before: Vec<bool> = {
+            let tree = self.header_tree.read().unwrap();
+            headers
+                .iter()
+                .map(|h| tree.contains(&h.block_hash()))
+                .collect()
+        };
         let accepted = self.accept_headers(&headers).await?;
 
         if !self.sync_headers {
             if headers.len() > MAX_HEADERS_ANNOUNCED {
                 tracing::debug!(target: TARGET, count = headers.len(), "headers are a sync response, not an announcement");
             } else {
-                for header in &headers {
+                for (header, known) in headers.iter().zip(known_before) {
                     self.emit_block_announcement(
                         header.block_hash(),
                         common::events::AnnouncementType::Headers,
                         headers.len() as u32,
+                        !known,
                     );
                 }
             }
@@ -641,9 +663,15 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     ) -> Result<()> {
         let header = cmpct.compact_block.header;
         let hash = header.block_hash();
-        self.emit_block_announcement(hash, common::events::AnnouncementType::CompactBlock, 1);
         tracing::info!(target: TARGET, %hash, "compact block");
+        let known = self.header_tree.read().unwrap().contains(&hash);
         self.accept_headers(&[header]).await?;
+        self.emit_block_announcement(
+            hash,
+            common::events::AnnouncementType::CompactBlock,
+            1,
+            !known,
+        );
         self.request_compact_block_coinbase(hash).await
     }
 
@@ -652,7 +680,10 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         hash: common::bitcoin::BlockHash,
         announcement_type: common::events::AnnouncementType,
         batch_size: u32,
+        new_to_us: bool,
     ) {
+        // Looked up after any insertion, so a header just accepted has one.
+        let height = self.header_tree.read().unwrap().height_of(&hash);
         self.emit_event(common::events::peer_event::Event::BlockAnnouncement(
             common::events::BlockAnnouncement {
                 block_hash: hash.to_string(),
@@ -663,6 +694,8 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                 // be a whole ping interval ago.
                 tcp_stats: self.sample_tcp_stats(),
                 batch_size,
+                height,
+                new_to_us,
             },
         ));
     }
@@ -1123,6 +1156,24 @@ mod tests {
 
         assert!(tree.read().unwrap().contains(&h1.block_hash()));
         assert_eq!(tree.read().unwrap().tip().1, 1);
+        // Announced with its height, and as the first time we saw it.
+        let Some(common::events::peer_event::Event::BlockAnnouncement(a)) =
+            h.events.try_recv().unwrap().event
+        else {
+            panic!("expected a block announcement first");
+        };
+        assert_eq!(a.height, Some(1));
+        assert!(a.new_to_us);
+        // The same block from another peer: same height, no longer new.
+        h.conn.handle_cmpct_block(compact_block(h1)).await.unwrap();
+        let _probe = h.events.try_recv().unwrap();
+        let Some(common::events::peer_event::Event::BlockAnnouncement(b)) =
+            h.events.try_recv().unwrap().event
+        else {
+            panic!("expected a block announcement for the repeat");
+        };
+        assert_eq!(b.height, Some(1));
+        assert!(!b.new_to_us);
         // Connected straight on, so nothing to recover; the only request is
         // the probe for the coinbase.
         assert_eq!(getheaders_sent(&h.conn.writer), 0);
@@ -1185,12 +1236,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(getheaders_sent(&h.conn.writer), 0);
+        let Some(common::events::peer_event::Event::BlockAnnouncement(a)) =
+            h.events.try_recv().unwrap().event
+        else {
+            panic!("expected an announcement for the known block");
+        };
+        assert_eq!((a.height, a.new_to_us), (Some(0), false));
 
         h.conn
             .handle_inv(vec![Inventory::Block(unknown)])
             .await
             .unwrap();
         assert_eq!(getheaders_sent(&h.conn.writer), 1);
+        let Some(common::events::peer_event::Event::BlockAnnouncement(a)) =
+            h.events.try_recv().unwrap().event
+        else {
+            panic!("expected an announcement for the unknown block");
+        };
+        assert_eq!((a.height, a.new_to_us), (None, true));
 
         // An inv says nothing about whether the peer has validated the block,
         // so while a request is out another inv for it waits.
