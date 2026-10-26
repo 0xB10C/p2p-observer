@@ -135,10 +135,10 @@ async fn main() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let manager_task = tokio::spawn(manager.run(gossip_rx, life_rx, cmd_rx, shutdown_rx));
 
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => tracing::info!(target: TARGET_MAIN, "shutting down"),
-        Err(e) => tracing::warn!(target: TARGET_MAIN, "could not listen for ctrl-c: {e}"),
-    }
+    // SIGINT or SIGTERM: either way the address book and the header tree get
+    // written before the process goes.
+    common::shutdown::signal().await;
+    tracing::info!(target: TARGET_MAIN, "shutting down");
 
     // Let the manager write its snapshot before the process goes away.
     let _ = shutdown_tx.send(());

@@ -77,7 +77,8 @@ so set it to the size you want and expect the first block past it.
 
 ### Shutting down
 
-On Ctrl+C the archiver unsubscribes, writes out the events already in flight,
+On Ctrl+C or SIGTERM the archiver unsubscribes, writes out the events already
+in flight,
 and closes the file properly, giving up after 10 seconds. Without that wait the
 tail of the stream and zstd's final frame would both be lost, which is the
 difference between a readable archive and a truncated one.

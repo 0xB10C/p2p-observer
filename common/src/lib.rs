@@ -23,3 +23,4 @@ pub mod archive {
 }
 
 pub mod render;
+pub mod shutdown;
