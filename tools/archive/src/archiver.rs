@@ -499,6 +499,7 @@ mod tests {
                 rtt_ms: 42,
                 tcp_stats: None,
             })),
+            ..Default::default()
         }
     }
 
@@ -515,6 +516,7 @@ mod tests {
                 rtt_ms: None,
                 tcp_stats: None,
             })),
+            ..Default::default()
         }
     }
 

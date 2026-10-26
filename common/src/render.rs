@@ -35,7 +35,7 @@ fn tcp(stats: Option<&TcpStats>) -> String {
 
 /// Renders one event as a single unprefixed line.
 pub fn event_line(event: &PeerEvent) -> String {
-    match &event.event {
+    let line = match &event.event {
         Some(peer_event::Event::PingRtt(ping)) => format!(
             "conn={} peer={} ua={:?} transport={} rtt={}ms{} ts={}",
             event.connection_id,
@@ -114,5 +114,14 @@ pub fn event_line(event: &PeerEvent) -> String {
         // does not know about. Either way there is nothing to render but the
         // envelope.
         None => format!("unknown event from {}", event.peer_addr),
+    };
+
+    // Shown only when something has been lost, so the usual line is unchanged
+    // -- but shown on every kind of event, because the loss it reports is not
+    // confined to the kind that happens to be carrying the count.
+    if event.dropped_events > 0 {
+        format!("{line} dropped={}", event.dropped_events)
+    } else {
+        line
     }
 }

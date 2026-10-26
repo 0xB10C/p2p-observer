@@ -11,6 +11,7 @@ pub(crate) const TARGET_ADDRMAN: &str = "addrman";
 
 mod addresses;
 mod connection;
+mod emit;
 mod headertree;
 mod logging;
 mod protocol;
