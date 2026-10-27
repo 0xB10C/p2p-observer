@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -41,6 +41,49 @@ struct Recovery {
 
 const HEADER_SIZE: usize = 80;
 
+/// A block hash the chain must have at a height.
+///
+/// One per network is built in, at a recent height, and the config can add
+/// more. A header at that height with another hash is rejected, and once the
+/// tree holds a checkpoint block nothing new is accepted below it: the tree is
+/// contiguous, so a new header down there can only be a fork. That keeps out
+/// what proof of work alone cannot: a branch off the early chain, where
+/// difficulty 1 is valid and two thousand headers cost nothing to make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Checkpoint {
+    pub(crate) height: u32,
+    pub(crate) hash: BlockHash,
+}
+
+/// The built-in checkpoint of a network: one recent block, verified against
+/// two sources when it was added. Networks without one get none.
+pub(crate) fn builtin_checkpoints(network: common::bitcoin::Network) -> Vec<Checkpoint> {
+    use common::bitcoin::{Network, network::TestnetVersion};
+    let (height, hash) = match network {
+        Network::Bitcoin => (
+            970_000,
+            "000000000000000000014e6a9bad5f954f266cfb3e8f63f8c2fb7967f29b5a07",
+        ),
+        Network::Signet => (
+            320_000,
+            "0000000740ae66b284da84387dcfa14d7b1385b0bad482005ba4e770ea6c4b95",
+        ),
+        Network::Testnet(TestnetVersion::V4) => (
+            150_000,
+            "0000000000d9877342754dea8ec1eb24631517d38e3443c370465ee53a8b7434",
+        ),
+        Network::Testnet(TestnetVersion::V3) => (
+            5_200_000,
+            "0000000000e79b4cd86775e9455066e392952f35cf16b702e07312cd33424dd2",
+        ),
+        _ => return Vec::new(),
+    };
+    vec![Checkpoint {
+        height,
+        hash: hash.parse().expect("built-in checkpoint hash"),
+    }]
+}
+
 struct HeaderEntry {
     header: Header,
     height: u32,
@@ -56,6 +99,13 @@ pub(crate) struct HeaderTree {
     tip_work: Work,
     params: common::bitcoin::network::Params,
     dirty: bool,
+    /// Sorted by height.
+    checkpoints: Vec<Checkpoint>,
+    /// Height of the highest checkpoint whose block the tree holds. Nothing
+    /// new is accepted at or below it.
+    reached_checkpoint: Option<u32>,
+    /// Headers removed below a reached checkpoint since the tree was made.
+    pruned: usize,
     /// Blocks announced but absent from the tree, with the requests sent for
     /// each. Per block, so a peer that never answers for one block does not
     /// hold up the next; shared across connections, which is what makes it a
@@ -68,6 +118,10 @@ pub(crate) enum HeaderError {
     OrphanHeader,
     InvalidPow,
     TargetTooEasy,
+    /// A header at a checkpoint height with another hash.
+    CheckpointMismatch,
+    /// A header at or below a checkpoint the tree has reached.
+    ForkBelowCheckpoint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +148,8 @@ impl std::fmt::Display for HeaderError {
             HeaderError::OrphanHeader => write!(f, "parent header not in tree"),
             HeaderError::InvalidPow => write!(f, "invalid proof of work"),
             HeaderError::TargetTooEasy => write!(f, "target exceeds maximum"),
+            HeaderError::CheckpointMismatch => write!(f, "hash differs from the checkpoint"),
+            HeaderError::ForkBelowCheckpoint => write!(f, "fork below a reached checkpoint"),
         }
     }
 }
@@ -122,8 +178,101 @@ impl HeaderTree {
             tip_work: work,
             params,
             dirty: false,
+            checkpoints: Vec::new(),
+            reached_checkpoint: None,
+            pruned: 0,
             recovery: HashMap::new(),
         }
+    }
+
+    /// A tree that enforces `checkpoints` (see [`Checkpoint`]).
+    pub(crate) fn with_checkpoints(
+        params: common::bitcoin::network::Params,
+        mut checkpoints: Vec<Checkpoint>,
+    ) -> Self {
+        checkpoints.sort_by_key(|c| c.height);
+        let mut tree = Self::new(params);
+        tree.checkpoints = checkpoints;
+        tree.note_checkpoint(tree.tip, 0);
+        tree
+    }
+
+    pub(crate) fn reached_checkpoint(&self) -> Option<u32> {
+        self.reached_checkpoint
+    }
+
+    /// Records that the block at `height` is a checkpoint, if it is one, and
+    /// drops whatever the tree holds below it that is not on its chain.
+    fn note_checkpoint(&mut self, hash: BlockHash, height: u32) {
+        let is_checkpoint = self
+            .checkpoints
+            .iter()
+            .any(|c| c.height == height && c.hash == hash);
+        if !is_checkpoint || self.reached_checkpoint.is_some_and(|r| height <= r) {
+            return;
+        }
+        self.reached_checkpoint = Some(height);
+        let pruned = self.prune_below_checkpoint();
+        tracing::info!(target: TARGET, height, pruned, "checkpoint reached");
+    }
+
+    /// Removes every header at or below the reached checkpoint that is not
+    /// an ancestor of it, and whatever was built on those. Returns how many.
+    ///
+    /// Needed on top of the insert-time rule because a load inserts headers
+    /// in height order: a branch off the early chain is in before the
+    /// checkpoint block is, and nothing stops it until then.
+    fn prune_below_checkpoint(&mut self) -> usize {
+        let Some(reached) = self.reached_checkpoint else {
+            return 0;
+        };
+        let Some(checkpoint) = self.checkpoints.iter().find(|c| c.height == reached) else {
+            return 0;
+        };
+        let mut keep = HashSet::new();
+        let mut hash = checkpoint.hash;
+        while let Some(entry) = self.headers.get(&hash) {
+            keep.insert(hash);
+            if entry.height == 0 {
+                break;
+            }
+            hash = entry.header.prev_blockhash;
+        }
+        let before = self.headers.len();
+        self.headers
+            .retain(|hash, entry| entry.height > reached || keep.contains(hash));
+        // What was built on a pruned header is now an orphan; in height order
+        // so a parent is settled before its children.
+        let mut above: Vec<(u32, BlockHash)> = self
+            .headers
+            .iter()
+            .filter(|(_, e)| e.height > reached)
+            .map(|(h, e)| (e.height, *h))
+            .collect();
+        above.sort_unstable();
+        for (_, hash) in above {
+            let parent = self.headers[&hash].header.prev_blockhash;
+            if !self.headers.contains_key(&parent) {
+                self.headers.remove(&hash);
+            }
+        }
+        let pruned = before - self.headers.len();
+        if pruned > 0 {
+            self.pruned += pruned;
+            self.dirty = true;
+            if !self.headers.contains_key(&self.tip) {
+                let (hash, entry) = self
+                    .headers
+                    .iter()
+                    .max_by_key(|(_, e)| e.chain_work)
+                    .expect("the checkpoint chain remains");
+                self.tip = *hash;
+                self.tip_height = entry.height;
+                self.tip_work = entry.chain_work;
+            }
+            self.rebuild_best_chain();
+        }
+        pruned
     }
 
     // Insert a single header. Returns `Ok(true)` if new, `Ok(false)` if already known.
@@ -157,6 +306,7 @@ impl HeaderTree {
         );
         // Whatever was asked for this block has been answered.
         self.recovery.remove(&hash);
+        self.note_checkpoint(hash, height);
 
         if chain_work > self.tip_work {
             let old_tip = self.tip;
@@ -218,6 +368,20 @@ impl HeaderTree {
     ) -> std::result::Result<(), HeaderError> {
         if header.target() > self.params.max_attainable_target {
             return Err(HeaderError::TargetTooEasy);
+        }
+
+        if let Some(checkpoint) = self.checkpoints.iter().find(|c| c.height == height)
+            && checkpoint.hash != header.block_hash()
+        {
+            return Err(HeaderError::CheckpointMismatch);
+        }
+        // The checkpoint block and all its ancestors are already in the
+        // tree, so a new header at or below it can only be a fork.
+        if self
+            .reached_checkpoint
+            .is_some_and(|reached| height <= reached)
+        {
+            return Err(HeaderError::ForkBelowCheckpoint);
         }
 
         let expected_bits = if height.is_multiple_of(2016) && height > 0 {
@@ -469,8 +633,12 @@ impl HeaderTree {
         Ok(())
     }
 
-    pub(crate) fn load(path: &Path, params: common::bitcoin::network::Params) -> Result<Self> {
-        let mut tree = Self::new(params.clone());
+    pub(crate) fn load(
+        path: &Path,
+        params: common::bitcoin::network::Params,
+        checkpoints: Vec<Checkpoint>,
+    ) -> Result<Self> {
+        let mut tree = Self::with_checkpoints(params.clone(), checkpoints);
 
         tracing::info!(target: TARGET, path=format!("{:?}", path), "loading header tree");
 
@@ -483,24 +651,30 @@ impl HeaderTree {
                     );
                 }
                 let count = data.len() / HEADER_SIZE;
+                // One line per reason rather than one per header: a pruned
+                // branch is thousands of them.
+                let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
                 for i in 0..count {
                     let offset = i * HEADER_SIZE;
                     let header: Header = deserialize(&data[offset..offset + HEADER_SIZE])
                         .context("deserialize header")?;
-                    match tree.insert_inner(header, true) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(target: TARGET, "skipping header during load: {e}");
-                        }
+                    if let Err(e) = tree.insert_inner(header, true) {
+                        *skipped.entry(e.to_string()).or_default() += 1;
                     }
+                }
+                for (reason, n) in &skipped {
+                    tracing::warn!(target: TARGET, count = n, "skipped headers during load: {reason}");
                 }
                 tree.rebuild_best_chain();
                 tracing::info!(target: TARGET,
                     headers = tree.headers.len(),
                     tip_height = tree.tip_height,
+                    pruned = tree.pruned,
                     "header tree loaded"
                 );
-                tree.dirty = false;
+                // Pruned anything: the file still has it, so the next save
+                // must write.
+                tree.dirty = tree.pruned > 0;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::info!(target: TARGET, "no header file found, starting fresh");
@@ -696,7 +870,7 @@ mod tests {
         tips_before.sort_by_key(|t| t.hash);
         tree.save(&path).unwrap();
 
-        let loaded = HeaderTree::load(&path, regtest_params()).unwrap();
+        let loaded = HeaderTree::load(&path, regtest_params(), Vec::new()).unwrap();
         let mut tips_after = loaded.chain_tips();
         tips_after.sort_by_key(|t| t.hash);
 
@@ -730,6 +904,7 @@ mod tests {
         let tree = HeaderTree::load(
             Path::new("/tmp/nonexistent-headertree-test-6336395673c0dceda7e525edb3ffbb6607e4.bin"),
             regtest_params(),
+            Vec::new(),
         )
         .unwrap();
 
@@ -820,7 +995,7 @@ mod tests {
         tree.dirty = true;
         tree.save(&path).unwrap();
 
-        let loaded = HeaderTree::load(&path, regtest_params()).unwrap();
+        let loaded = HeaderTree::load(&path, regtest_params(), Vec::new()).unwrap();
         assert_eq!(loaded.tip(), tree.tip());
         assert_eq!(loaded.len(), tree.len());
         assert_eq!(loaded.build_locator(), tree.build_locator());
@@ -1135,5 +1310,153 @@ mod tests {
             "both nodes should have the same tip hash"
         );
         println!("both nodes at height {} tip {}", tip_b.height, tip_b.hash);
+    }
+
+    /// `n` headers on `prev`, each passing regtest proof of work.
+    fn mine_chain(prev: BlockHash, n: u32, seed: u8) -> Vec<Header> {
+        let mut chain = Vec::new();
+        let mut prev = prev;
+        for i in 0..n {
+            let h = mine_header(prev, 1296688602 + i, seed);
+            chain.push(h);
+            prev = h.block_hash();
+        }
+        chain
+    }
+
+    fn checkpoint_at(chain: &[Header], height: u32) -> Checkpoint {
+        Checkpoint {
+            height,
+            hash: chain[height as usize - 1].block_hash(),
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_mismatch_rejected() {
+        let genesis = regtest_tree().tip().0;
+        let chain_a = mine_chain(genesis, 4, 0);
+        let chain_b = mine_chain(genesis, 4, 1);
+        let mut tree =
+            HeaderTree::with_checkpoints(regtest_params(), vec![checkpoint_at(&chain_a, 3)]);
+
+        // Chain B is fine up to the checkpoint height, where its hash differs.
+        let (accepted, err) = tree.insert_batch(&chain_b);
+        assert_eq!(accepted, 2);
+        assert!(
+            matches!(err, Some(HeaderError::CheckpointMismatch)),
+            "{err:?}"
+        );
+        assert_eq!(tree.reached_checkpoint(), None);
+
+        let (accepted, err) = tree.insert_batch(&chain_a);
+        assert_eq!(accepted, 4);
+        assert!(err.is_none());
+        assert_eq!(tree.reached_checkpoint(), Some(3));
+        assert_eq!(tree.tip().1, 4);
+        // Reaching the checkpoint pruned B's two headers below it.
+        assert_eq!(tree.len(), 5);
+        assert!(!tree.contains(&chain_b[0].block_hash()));
+    }
+
+    #[test]
+    fn test_forks_only_above_a_reached_checkpoint() {
+        let genesis = regtest_tree().tip().0;
+        let chain_a = mine_chain(genesis, 5, 0);
+        let mut tree =
+            HeaderTree::with_checkpoints(regtest_params(), vec![checkpoint_at(&chain_a, 3)]);
+        tree.insert_batch(&chain_a);
+
+        // A fork off height 1 lands at height 2, below the checkpoint: rejected.
+        let low = mine_header(chain_a[0].block_hash(), 1296688700, 7);
+        let (_, err) = tree.insert_batch(&[low]);
+        assert!(
+            matches!(err, Some(HeaderError::ForkBelowCheckpoint)),
+            "{err:?}"
+        );
+        // A fork off the checkpoint block itself lands at height 4: allowed.
+        let high = mine_header(chain_a[2].block_hash(), 1296688700, 8);
+        let (accepted, err) = tree.insert_batch(&[high]);
+        assert_eq!((accepted, err.is_none()), (1, true));
+        assert_eq!(tree.chain_tips().len(), 2);
+    }
+
+    #[test]
+    fn test_forks_allowed_before_the_checkpoint_is_reached() {
+        let genesis = regtest_tree().tip().0;
+        let chain_a = mine_chain(genesis, 5, 0);
+        let chain_b = mine_chain(genesis, 2, 1);
+        let mut tree =
+            HeaderTree::with_checkpoints(regtest_params(), vec![checkpoint_at(&chain_a, 3)]);
+        // Nothing has reached the checkpoint, so a low fork is as good as any
+        // chain: a bad bootstrap peer must not be able to wedge the tree.
+        let (accepted, err) = tree.insert_batch(&chain_b);
+        assert_eq!((accepted, err.is_none()), (2, true));
+        tree.insert_batch(&chain_a);
+        // Reaching it cleans up.
+        assert_eq!(tree.len(), 6);
+        assert!(!tree.contains(&chain_b[1].block_hash()));
+        assert_eq!(tree.tip().1, 5);
+    }
+
+    #[test]
+    fn test_load_prunes_below_the_checkpoint() {
+        // A tree saved without checkpoints, holding a stray branch off
+        // genesis next to the real chain, like the mainnet tree did.
+        let mut tree = regtest_tree();
+        let genesis = tree.tip().0;
+        let real = mine_chain(genesis, 6, 0);
+        let stray = mine_chain(genesis, 4, 1);
+        tree.insert_batch(&stray);
+        tree.insert_batch(&real);
+        assert_eq!(tree.len(), 11);
+        let dir = std::env::temp_dir().join("headertree-test-checkpoint-load");
+        let path = dir.join("headers.bin");
+        let _ = std::fs::create_dir_all(&dir);
+        tree.save(&path).unwrap();
+
+        let loaded =
+            HeaderTree::load(&path, regtest_params(), vec![checkpoint_at(&real, 5)]).unwrap();
+        assert_eq!(loaded.reached_checkpoint(), Some(5));
+        assert_eq!(loaded.len(), 7);
+        assert_eq!(loaded.tip().0, real[5].block_hash());
+        assert_eq!(loaded.chain_tips().len(), 1);
+        for h in &stray {
+            assert!(!loaded.contains(&h.block_hash()));
+        }
+        // The load is dirty: the next save writes the pruned tree.
+        assert!(loaded.dirty);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_pruning_moves_the_tip_off_a_pruned_branch() {
+        // The tip is on the stray branch when the checkpoint block arrives:
+        // the real chain has not overtaken it yet at that moment, since the
+        // checkpoint is noted before the tip is updated.
+        let genesis = regtest_tree().tip().0;
+        let real = mine_chain(genesis, 3, 0);
+        let stray = mine_chain(genesis, 2, 1);
+        let mut tree =
+            HeaderTree::with_checkpoints(regtest_params(), vec![checkpoint_at(&real, 3)]);
+        tree.insert_batch(&stray);
+        assert_eq!(tree.tip().0, stray[1].block_hash());
+        tree.insert_batch(&real);
+        assert_eq!(tree.tip().0, real[2].block_hash());
+        assert_eq!(tree.len(), 4);
+        assert_eq!(tree.chain_tips().len(), 1);
+    }
+
+    #[test]
+    fn test_builtin_checkpoints() {
+        use common::bitcoin::{Network, network::TestnetVersion};
+        for network in [
+            Network::Bitcoin,
+            Network::Signet,
+            Network::Testnet(TestnetVersion::V4),
+            Network::Testnet(TestnetVersion::V3),
+        ] {
+            assert_eq!(builtin_checkpoints(network).len(), 1, "{network}");
+        }
+        assert!(builtin_checkpoints(Network::Regtest).is_empty());
     }
 }

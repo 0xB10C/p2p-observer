@@ -27,9 +27,10 @@ use addresses::peer_addr::PeerAddr;
 async fn main() {
     let cfg = settings::Config::load().expect("failed to load config");
     let magic = cfg.magic().expect("invalid network in config");
-    let params = common::bitcoin::network::Params::new(
-        common::bitcoin::Network::try_from(magic).expect("invalid magic for network params"),
-    );
+    let network =
+        common::bitcoin::Network::try_from(magic).expect("invalid magic for network params");
+    let params = common::bitcoin::network::Params::new(network);
+    let checkpoints = headertree::builtin_checkpoints(network);
 
     let filter = tracing_subscriber::EnvFilter::new(cfg.log_levels.to_filter_string());
     tracing_subscriber::fmt()
@@ -47,9 +48,16 @@ async fn main() {
     std::fs::create_dir_all(&datadir).expect("failed to create the data directory");
 
     let header_path = datadir.join("headers.bin");
+    let checkpoint_heights: Vec<u32> = checkpoints.iter().map(|c| c.height).collect();
     let header_tree = Arc::new(RwLock::new(
-        headertree::HeaderTree::load(&header_path, params).expect("failed to load header tree"),
+        headertree::HeaderTree::load(&header_path, params, checkpoints)
+            .expect("failed to load header tree"),
     ));
+    tracing::info!(target: TARGET_MAIN,
+        checkpoints = ?checkpoint_heights,
+        reached = ?header_tree.read().unwrap().reached_checkpoint(),
+        "checkpoints"
+    );
 
     let nats = common::async_nats::connect(&cfg.nats_url)
         .await
