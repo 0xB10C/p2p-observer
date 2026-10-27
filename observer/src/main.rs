@@ -30,7 +30,10 @@ async fn main() {
     let network =
         common::bitcoin::Network::try_from(magic).expect("invalid magic for network params");
     let params = common::bitcoin::network::Params::new(network);
-    let checkpoints = headertree::builtin_checkpoints(network);
+    let checkpoints = headertree::merge_checkpoints(
+        headertree::builtin_checkpoints(network),
+        cfg.checkpoints().expect("invalid checkpoint in config"),
+    );
 
     let filter = tracing_subscriber::EnvFilter::new(cfg.log_levels.to_filter_string());
     tracing_subscriber::fmt()

@@ -41,6 +41,16 @@ bootstrap_addrs:
   - "1.2.3.4:38333"
   - "5.6.7.8:38333"
 
+# Block hashes the chain must have at a height, on top of the one built in
+# for each network (mainnet 970000, signet 320000, testnet4 150000, testnet3
+# 5200000). A header at a listed height with another hash is rejected, and
+# once the tree holds a checkpoint block nothing new is accepted below it,
+# which keeps cheap early-difficulty forks out of the header tree. An entry
+# at a built-in height replaces the built-in one.
+# checkpoints:
+#   - height: 980000
+#     hash: "00000000000000000000..."
+
 # NATS server URL for publishing events.
 nats_url: "nats://localhost:4222"
 

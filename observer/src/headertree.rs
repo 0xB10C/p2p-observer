@@ -84,6 +84,21 @@ pub(crate) fn builtin_checkpoints(network: common::bitcoin::Network) -> Vec<Chec
     }]
 }
 
+/// Built-in and configured checkpoints together, sorted by height. A
+/// configured one replaces a built-in one at the same height, so the config
+/// can correct as well as extend.
+pub(crate) fn merge_checkpoints(
+    builtin: Vec<Checkpoint>,
+    configured: Vec<Checkpoint>,
+) -> Vec<Checkpoint> {
+    let mut by_height: BTreeMap<u32, Checkpoint> =
+        builtin.into_iter().map(|c| (c.height, c)).collect();
+    for c in configured {
+        by_height.insert(c.height, c);
+    }
+    by_height.into_values().collect()
+}
+
 struct HeaderEntry {
     header: Header,
     height: u32,
@@ -1458,5 +1473,28 @@ mod tests {
             assert_eq!(builtin_checkpoints(network).len(), 1, "{network}");
         }
         assert!(builtin_checkpoints(Network::Regtest).is_empty());
+
+        let built_in = builtin_checkpoints(Network::Bitcoin);
+        let other: BlockHash = "0000000000000000000172bed57d59e3e4b79d44296a17a298e378d9f6040395"
+            .parse()
+            .unwrap();
+        let merged = merge_checkpoints(
+            built_in.clone(),
+            vec![
+                Checkpoint {
+                    height: 973_364,
+                    hash: other,
+                },
+                Checkpoint {
+                    height: 970_000,
+                    hash: other,
+                },
+            ],
+        );
+        // Sorted, and the configured entry at 970000 replaced the built-in one.
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].height, 970_000);
+        assert_eq!(merged[0].hash, other);
+        assert_eq!(merged[1].height, 973_364);
     }
 }

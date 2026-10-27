@@ -42,6 +42,18 @@ pub struct Config {
 
     #[serde(default)]
     pub addrman: AddrmanConfig,
+
+    /// Block hashes the chain must have at a height, on top of the one built
+    /// in for the network. See `headertree::Checkpoint`.
+    #[serde(default)]
+    pub checkpoints: Vec<CheckpointConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(crate = "common::serde")]
+pub struct CheckpointConfig {
+    pub height: u32,
+    pub hash: String,
 }
 
 /// Bounds on the address manager. Both are about resource use rather than
@@ -241,6 +253,7 @@ impl Default for Config {
             nats_url: default_nats_url(),
             networks: NetworksConfig::default(),
             addrman: AddrmanConfig::default(),
+            checkpoints: Vec::new(),
         }
     }
 }
@@ -292,6 +305,22 @@ impl Config {
     /// `magic` has already rejected everything outside the fixed set of names.
     pub fn network_dir(&self) -> PathBuf {
         self.datadir.join(&self.network)
+    }
+
+    /// The configured checkpoints, parsed.
+    pub fn checkpoints(&self) -> Result<Vec<crate::headertree::Checkpoint>> {
+        self.checkpoints
+            .iter()
+            .map(|c| {
+                let hash = c.hash.parse().with_context(|| {
+                    format!("checkpoint at height {}: bad hash {:?}", c.height, c.hash)
+                })?;
+                Ok(crate::headertree::Checkpoint {
+                    height: c.height,
+                    hash,
+                })
+            })
+            .collect()
     }
 
     pub fn magic(&self) -> Result<Magic> {
@@ -407,6 +436,36 @@ mod tests {
         let cfg = parse_str(include_str!("../../config-example.yaml"));
         assert!(cfg.magic().is_ok());
         assert!(!cfg.bootstrap_addrs.is_empty());
+    }
+
+    #[test]
+    fn test_checkpoints() {
+        let cfg = parse_str(
+            r#"
+                network: mainnet
+                checkpoints:
+                - height: 973364
+                  hash: "0000000000000000000172bed57d59e3e4b79d44296a17a298e378d9f6040395"
+            "#,
+        );
+        let checkpoints = cfg.checkpoints().unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].height, 973364);
+        assert_eq!(
+            checkpoints[0].hash.to_string(),
+            "0000000000000000000172bed57d59e3e4b79d44296a17a298e378d9f6040395"
+        );
+        // None by default.
+        assert!(
+            parse_str("network: mainnet")
+                .checkpoints()
+                .unwrap()
+                .is_empty()
+        );
+        // A bad hash is a config error, not a silently ignored checkpoint.
+        let bad = parse_str("checkpoints:\n- height: 1\n  hash: nonsense\n");
+        let err = bad.checkpoints().unwrap_err().to_string();
+        assert!(err.contains("height 1"), "{err}");
     }
 
     #[test]
