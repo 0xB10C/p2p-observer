@@ -24,6 +24,12 @@ pub struct Config {
     #[serde(default = "default_ping_interval_secs")]
     pub ping_interval_secs: u64,
 
+    /// Ask every peer for the coinbase of each compact block it sends, to time
+    /// how long after announcing a block the peer can serve part of it. One
+    /// request per peer per block, so off unless that is being studied.
+    #[serde(default)]
+    pub probe_compact_blocks: bool,
+
     #[serde(default = "default_user_agent")]
     pub user_agent: String,
 
@@ -245,6 +251,7 @@ impl Default for Config {
             log_levels: LogLevels::default(),
             connections_per_second: connections_per_second(),
             ping_interval_secs: default_ping_interval_secs(),
+            probe_compact_blocks: false,
             user_agent: default_user_agent(),
             bootstrap_addrs: Vec::new(),
             nats_url: default_nats_url(),
@@ -354,6 +361,7 @@ mod tests {
         assert_eq!(cfg.network, "signet");
         assert_eq!(cfg.datadir, PathBuf::from(DEFAULT_DATADIR));
         assert_eq!(cfg.ping_interval_secs, 120);
+        assert!(!cfg.probe_compact_blocks);
         assert_eq!(cfg.connections_per_second, 10);
         assert_eq!(cfg.user_agent, crate::protocol::USER_AGENT);
         assert!(cfg.bootstrap_addrs.is_empty());
@@ -370,6 +378,7 @@ mod tests {
                 network: mainnet
                 connections_per_second: 20
                 ping_interval_secs: 60
+                probe_compact_blocks: true
                 user_agent: "/test:1.0/"
                 bootstrap_addrs:
                 - "1.2.3.4:8333"
@@ -384,6 +393,7 @@ mod tests {
         assert_eq!(cfg.network, "mainnet");
         assert_eq!(cfg.connections_per_second, 20);
         assert_eq!(cfg.ping_interval_secs, 60);
+        assert!(cfg.probe_compact_blocks);
         assert_eq!(cfg.user_agent, "/test:1.0/");
         assert_eq!(cfg.bootstrap_addrs, vec!["1.2.3.4:8333", "5.6.7.8:8333"]);
         assert_eq!(cfg.log_levels.main, "warn");
