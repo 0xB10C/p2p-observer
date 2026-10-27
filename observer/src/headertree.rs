@@ -1263,6 +1263,7 @@ mod tests {
             event_tx: event_tx.clone(),
             header_tree: header_tree.clone(),
             sync_headers,
+            probe_compact_blocks: false,
             networks: crate::settings::NetworksConfig::default(),
         };
 

@@ -682,6 +682,7 @@ mod tests {
                 common::bitcoin::Network::Regtest,
             )))),
             sync_headers: false,
+            probe_compact_blocks: false,
             networks: crate::settings::NetworksConfig::default(),
         }
     }

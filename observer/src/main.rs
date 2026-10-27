@@ -102,6 +102,7 @@ async fn main() {
     let proto_cfg = protocol::Config {
         magic,
         ping_interval: common::tokio::time::Duration::from_secs(cfg.ping_interval_secs),
+        probe_compact_blocks: cfg.probe_compact_blocks,
         user_agent: cfg.user_agent.clone(),
         event_tx,
         header_tree: header_tree.clone(),
@@ -178,6 +179,7 @@ async fn bootstrap_sync(
     let sync_cfg = protocol::Config {
         magic,
         ping_interval: common::tokio::time::Duration::from_secs(cfg.ping_interval_secs),
+        probe_compact_blocks: cfg.probe_compact_blocks,
         user_agent: cfg.user_agent.clone(),
         event_tx: event_tx.clone(),
         header_tree: header_tree.clone(),

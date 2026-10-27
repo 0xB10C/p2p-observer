@@ -15,6 +15,14 @@ ping_interval_secs: 120
 # How many new connection attempts to start per second.
 connections_per_second: 1
 
+# Ask every peer for the coinbase of each compact block it sends (via
+# getblocktxn) and publish both halves as compact block probe events. The
+# round trip shows how long after announcing a block a peer can serve part
+# of it, which is what a study of validation times needs, see
+# https://bnoc.xyz/t/block-propagation-and-validation-duration-during-slow-to-validate-blocks-on-signet/117
+# It costs one request per peer per block, so it is off by default.
+probe_compact_blocks: false
+
 # Bounds on the address manager.
 addrman:
   # Hard ceiling on stored addresses. Inventing addresses costs a peer

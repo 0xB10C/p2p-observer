@@ -65,13 +65,17 @@ pub(crate) struct Config {
     pub(crate) event_tx: mpsc::Sender<common::events::PeerEvent>,
     pub(crate) header_tree: Arc<RwLock<HeaderTree>>,
     pub(crate) sync_headers: bool,
+    /// Ask for the coinbase of every compact block, see `probe_compact_blocks`
+    /// in the settings.
+    pub(crate) probe_compact_blocks: bool,
     pub(crate) networks: crate::settings::NetworksConfig,
 }
 
-/// We want get high-bandwidth compact block relay (BIP152).
-/// In high-bandwidth mode the peer sends compact blocks directly without an INV first.
-/// We can then ask for a transaction via getblocktxn to learn how long it took the peer
-/// to validate the block.
+/// We want high-bandwidth compact block relay (BIP152): the peer sends a new
+/// block as a compact block straight away, without an INV first, which is the
+/// earliest a passive observer hears of it. With `probe_compact_blocks` on we
+/// then ask for a transaction via getblocktxn to learn how long it took the
+/// peer to have the block in hand.
 const HIGH_BANDWIDTH_COMPACT_BLOCKS: bool = true;
 
 /// Longest user agent kept from a version message, in characters. Bitcoin
@@ -236,6 +240,7 @@ struct Connection<R: TransportReader, W: TransportWriter> {
     /// same peer announcing the same block twice is not asked twice. How many
     /// peers ask is the tree's decision.
     asked_for: Option<BlockHash>,
+    probe_compact_blocks: bool,
 }
 
 /// Everything a session needs besides the transport itself.
@@ -314,6 +319,7 @@ pub(crate) async fn run_session(
         header_tree: cfg.header_tree.clone(),
         sync_headers: cfg.sync_headers,
         asked_for: None,
+        probe_compact_blocks: cfg.probe_compact_blocks,
     };
     // The session running out is not an error: the peer disconnected, which is
     // an ordinary outcome. The caller turns the elapsed time into
@@ -680,7 +686,10 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             !known,
             Some(shape),
         );
-        self.request_compact_block_coinbase(hash).await
+        if self.probe_compact_blocks {
+            self.request_compact_block_coinbase(hash).await?;
+        }
+        Ok(())
     }
 
     fn emit_block_announcement(
@@ -1117,6 +1126,7 @@ mod tests {
             header_tree: tree,
             sync_headers: false,
             asked_for: None,
+            probe_compact_blocks: false,
         };
         Harness {
             conn,
@@ -1179,7 +1189,6 @@ mod tests {
         assert_eq!((shape.short_ids, shape.prefilled_txs), (0, 0));
         // The same block from another peer: same height, no longer new.
         h.conn.handle_cmpct_block(compact_block(h1)).await.unwrap();
-        let _probe = h.events.try_recv().unwrap();
         let Some(common::events::peer_event::Event::BlockAnnouncement(b)) =
             h.events.try_recv().unwrap().event
         else {
@@ -1187,9 +1196,35 @@ mod tests {
         };
         assert_eq!(b.height, Some(1));
         assert!(!b.new_to_us);
-        // Connected straight on, so nothing to recover; the only request is
-        // the probe for the coinbase.
+        // Connected straight on, so nothing to recover, and the coinbase probe
+        // is off unless asked for: no request of any kind went out.
         assert_eq!(getheaders_sent(&h.conn.writer), 0);
+        assert!(h.conn.writer.0.is_empty());
+        assert!(h.events.try_recv().is_err());
+    }
+
+    /// The coinbase probe is opt-in: one getblocktxn per peer per block is a
+    /// cost only a validation-time study wants to pay. Switched on, the request
+    /// and the answer each publish their half of the probe.
+    #[tokio::test]
+    async fn test_compact_block_probe_is_opt_in() {
+        use crate::headertree::testing::{mine_header, regtest_params};
+        use common::events::{ProbeStage, peer_event::Event};
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let (genesis, _) = tree.read().unwrap().tip();
+        let h1 = mine_header(genesis, 1_700_000_000, 1);
+        let mut h = harness(tree);
+        h.conn.probe_compact_blocks = true;
+
+        h.conn.handle_cmpct_block(compact_block(h1)).await.unwrap();
+        let Some(Event::BlockAnnouncement(_)) = h.events.try_recv().unwrap().event else {
+            panic!("expected the announcement first");
+        };
+        let Some(Event::CompactBlockProbe(p)) = h.events.try_recv().unwrap().event else {
+            panic!("expected the probe request");
+        };
+        assert_eq!(p.stage, ProbeStage::Requested as i32);
+        assert_eq!(p.block_hash, h1.block_hash().to_string());
         assert!(
             h.conn
                 .writer
@@ -1197,6 +1232,19 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, NetworkMessage::GetBlockTxn(_)))
         );
+
+        h.conn
+            .handle_blocktxn(BlockTxn {
+                transactions: bip152::BlockTransactions {
+                    block_hash: h1.block_hash(),
+                    transactions: vec![],
+                },
+            })
+            .await;
+        let Some(Event::CompactBlockProbe(p)) = h.events.try_recv().unwrap().event else {
+            panic!("expected the probe answer");
+        };
+        assert_eq!(p.stage, ProbeStage::Answered as i32);
     }
 
     /// An announcement whose parent we do not have means the tree is behind,
