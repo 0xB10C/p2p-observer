@@ -1,0 +1,14 @@
+[package]
+name = "websocket"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { path = "../../common" }
+clap = { version = "4.6.7", features = ["derive"] }
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-tungstenite = "0.30"
+# IP -> ASN lookups with Bitcoin Core's asmap format, ASN -> name and country.
+asmap = "0.1"
+asinfo = "0.1"

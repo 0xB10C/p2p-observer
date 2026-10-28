@@ -8,4 +8,5 @@ members = [
   "tools/csv",
   "tools/logger",
   "tools/rpc",
+  "tools/websocket",
 ]
