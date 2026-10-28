@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>p2p-observer · connections</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header>
+  <nav><b>p2p-observer</b>
+    <a href="index.html">overview</a>
+    <a href="peers.html" class="active">connections</a>
+    <a href="blocks.html">blocks</a>
+  </nav>
+  <div id="websocket-picker"></div>
+  <p id="status" class="dim">not connected</p>
+  <div id="sources" data-placeholder="waiting:waiting for the first event"><span class="spinner big" title="waiting for the first event" aria-label="waiting"></span> waiting for the first event</div>
+</header>
+<main>
+  <div class="controls">
+    <input id="filter" type="search" placeholder="filter: network, ip, user agent, ASN, AS name, country…" spellcheck="false">
+    <label><input id="only-handshake" type="checkbox"> handshaked only</label>
+    <label><input id="only-otherchain" type="checkbox"> other chain only</label>
+    <label><input id="count-blocks" type="checkbox"> count block announcements</label>
+    <span id="summary" class="dim"></span>
+  </div>
+  <div id="peers-scroll" class="scroller">
+    <table id="peers">
+      <colgroup>
+        <col style="width:4rem"><col style="width:11rem"><col style="width:5rem"><col style="width:14rem">
+        <col style="width:3rem"><col style="width:15rem"><col style="width:4rem"><col style="width:13rem">
+        <col style="width:5rem"><col style="width:8rem"><col style="width:4rem"><col style="width:4rem">
+        <col style="width:5rem"><col style="width:5rem"><col style="width:4rem"><col style="width:4rem">
+        <col style="width:5rem"><col style="width:5rem"><col style="width:6rem"><col style="width:6rem">
+      </colgroup>
+      <thead>
+        <tr>
+          <th data-key="network">net</th>
+          <th data-key="peer_ip">peer</th>
+          <th data-key="asn" class="num">ASN</th>
+          <th data-key="as_name">AS</th>
+          <th data-key="transport">tr</th>
+          <th data-key="user_agent">user agent</th>
+          <th data-key="protocol_version" class="num">ver</th>
+          <th data-key="services">services</th>
+          <th data-key="start_height" class="num">height</th>
+          <th data-key="height_delta">chain</th>
+          <th data-key="flags">flags</th>
+          <th data-key="clock_skew_s" class="num">skew</th>
+          <th data-key="fee_filter" class="num">feefilter</th>
+          <th data-key="cmpct">cmpct</th>
+          <th data-key="first_seen_ms" class="num">age</th>
+          <th data-key="pings" class="num">pings</th>
+          <th data-key="rtt_ms" class="num">rtt</th>
+          <th data-key="min_rtt_ms" class="num">min</th>
+          <th data-key="srtt" class="num">srtt</th>
+          <th data-key="blocks" class="num">blocks</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <p id="peers-empty" class="empty" data-placeholder="waiting:waiting for the first event"><span class="spinner big" title="waiting for the first event" aria-label="waiting"></span> waiting for the first event</p>
+  </div>
+  <p class="note dim">
+    Every connection the observer has reported an event for, built in this page from the event stream:
+    a connection appears with its first event and goes when its session ends. The last column is the
+    kernel's smoothed round trip; hover it for the rest of the TCP sample. Only the rows in view are
+    rendered, so the table stays usable at tens of thousands of connections.
+    Counting block announcements means one message per connection per block: it is off by default.
+    A spinner means no message has carried that value yet. A greyed row is a connection that was
+    already open when this page connected: its handshake is in the past, so those columns stay empty.
+  </p>
+</main>
+<script src="js/websocket-picker.js"></script>
+<script src="js/common.js"></script>
+<script src="js/peers.js"></script>
+</body>
+</html>

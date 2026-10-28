@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>p2p-observer · overview</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header>
+  <nav><b>p2p-observer</b>
+    <a href="index.html" class="active">overview</a>
+    <a href="peers.html">connections</a>
+    <a href="blocks.html">blocks</a>
+  </nav>
+  <div id="websocket-picker"></div>
+  <p id="status" class="dim">not connected</p>
+  <div id="sources" data-placeholder="waiting:waiting for the first event"><span class="spinner big" title="waiting for the first event" aria-label="waiting"></span> waiting for the first event</div>
+</header>
+<main>
+  <h1>p2p-observer</h1>
+  <p class="note">
+    Live view of what the observer's connections report, served by the <code>websocket</code> tool from
+    the observer's NATS events. The tool keeps nothing: each page builds what it shows from the events
+    that arrive while it is open, so it starts empty and fills as the network talks. For anything that
+    happened before you opened it, replay an archive.
+  </p>
+  <div class="grid">
+    <section>
+      <h2><a href="peers.html">connections</a></h2>
+      <p class="note">Every open connection with what the peer told us in its handshake, its round trips
+        and the kernel's view of the socket. Only the rows in view are rendered, so the table holds up
+        at tens of thousands of connections.</p>
+    </section>
+    <section>
+      <h2><a href="blocks.html">blocks</a></h2>
+      <p class="note">How each block reached our peers: the share of connections that had announced it
+        over the seconds after the first announcement, with the time axis following the slowest 99th
+        percentile drawn.</p>
+    </section>
+  </div>
+  <h2>Events seen on this connection</h2>
+  <div id="counts" data-placeholder="waiting:waiting for the first event"><span class="spinner big" title="waiting for the first event" aria-label="waiting"></span> waiting for the first event</div>
+  <p class="note dim">
+    Counted here from the stream itself, one line per observer run. This page subscribes to the
+    handshakes and the connection results, which is enough to see that events are flowing without
+    taking the heavier kinds.
+  </p>
+</main>
+<script src="js/websocket-picker.js"></script>
+<script src="js/common.js"></script>
+<script>
+"use strict";
+const sources = sourceTracker();
+const sourcesEl = document.getElementById("sources");
+const countsEl = document.getElementById("counts");
+let dirty = true;
+
+function onMessage(e) {
+  const msg = parseMessage(e);
+  if (!msg) return;
+  if (msg.hello) {
+    syncClock(msg.hello.server_time_ms);
+    return;
+  }
+  if (msg.event) {
+    sources.note(msg.event);
+    dirty = true;
+  }
+}
+
+function onReset() {
+  sources.clear();
+  dirty = true;
+}
+
+function render() {
+  sources.render(sourcesEl);
+  sources.render(countsEl);
+}
+setInterval(() => {
+  if (!dirty) return;
+  dirty = false;
+  render();
+}, 1000);
+render();
+connect({ handshakes: true, connection_results: true }, onMessage, onReset);
+</script>
+</body>
+</html>
