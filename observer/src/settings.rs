@@ -12,9 +12,6 @@ pub struct Config {
     #[serde(default = "default_network")]
     pub network: String,
 
-    /// Where this instance keeps its state. The header tree, the address
-    /// snapshot and the ban list all live in `<datadir>/<network>/`, so one
-    /// network is a single directory to back up, retain or throw away.
     #[serde(default = "default_datadir")]
     pub datadir: PathBuf,
 
@@ -249,8 +246,10 @@ fn default_nats_url() -> String {
     "nats://localhost:4222".to_owned()
 }
 
+const DEFAULT_DATADIR: &str = "./data";
+
 fn default_datadir() -> PathBuf {
-    PathBuf::from("./data")
+    PathBuf::from(DEFAULT_DATADIR)
 }
 
 fn default_tor_proxy() -> String {
@@ -324,7 +323,7 @@ mod tests {
     fn test_defaults() {
         let cfg = parse_str("");
         assert_eq!(cfg.network, "signet");
-        assert_eq!(cfg.datadir, PathBuf::from("./data"));
+        assert_eq!(cfg.datadir, PathBuf::from(DEFAULT_DATADIR));
         assert_eq!(cfg.ping_interval_secs, 120);
         assert_eq!(cfg.connections_per_second, 10);
         assert_eq!(cfg.user_agent, crate::protocol::USER_AGENT);

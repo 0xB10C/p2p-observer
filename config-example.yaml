@@ -7,12 +7,6 @@ network: signet
 # Where to keep this instance's state. Each network gets its own
 # subdirectory, so the files are <datadir>/<network>/headers.bin,
 # addresses.bin and banlist.json. Created on startup if missing.
-#
-# Earlier versions wrote headers-<network>.bin, addresses-<network>.bin and
-# banlist-<network>.json into the working directory. They are not read from
-# there any more; move them in by hand, or the observer starts with no
-# headers and -- more importantly -- no ban list:
-#   mkdir -p data/signet && mv headers-signet.bin data/signet/headers.bin
 datadir: ./data
 
 # How often to send a ping to connected peers, in seconds.
