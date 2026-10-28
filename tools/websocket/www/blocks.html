@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>p2p-observer · blocks</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header>
+  <nav><b>p2p-observer</b>
+    <a href="index.html">overview</a>
+    <a href="peers.html">connections</a>
+    <a href="blocks.html" class="active">blocks</a>
+  </nav>
+  <div id="websocket-picker"></div>
+  <p id="status" class="dim">not connected</p>
+  <div id="sources" data-placeholder="waiting:waiting for the first event"><span class="spinner big" title="waiting for the first event" aria-label="waiting"></span> waiting for the first event</div>
+</header>
+<main>
+  <div class="controls">
+    <label>network <select id="network"><option value="">all</option></select></label>
+    <label>curves <input id="curves" type="number" min="1" max="50" value="10" style="width:4rem"></label>
+    <label><input id="placed-only" type="checkbox" checked> blocks with a height only</label>
+    <span id="summary" class="dim"></span>
+  </div>
+  <div id="legend" class="legend"></div>
+  <figure id="chart" class="chart"></figure>
+  <p id="chart-empty" class="empty" data-placeholder="waiting:waiting for the first block announcement"><span class="spinner big" title="waiting for the first block announcement" aria-label="waiting"></span> waiting for the first block announcement</p>
+  <div class="tablewrap">
+    <table id="blocks">
+      <thead>
+        <tr>
+          <th class="num">height</th><th>hash</th><th>net</th><th>first seen</th><th>first via</th><th>first peer</th>
+          <th class="num">announced</th><th class="num">cmpct/hdr/inv</th><th class="num">new</th><th class="num">txs</th>
+          <th class="num">t50</th><th class="num">t90</th><th class="num">t99</th><th class="num">probes</th>
+          <th class="num">probe p50</th><th class="num">batch</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <p id="blocks-empty" class="empty" data-placeholder="waiting:waiting for the first block announcement"><span class="spinner big" title="waiting for the first block announcement" aria-label="waiting"></span> waiting for the first block announcement</p>
+  </div>
+  <p class="note dim">
+    The chart shows, per block, the share of its announcements that had arrived so many seconds after the
+    first one; t50, t90 and t99 are that curve's 50%, 90% and 99% points. The time axis ends at the
+    slowest t99 among the drawn curves, so it follows the data rather than a fixed window. A block
+    without a height never connected to the observer's header tree: a block of another chain, or one
+    announced by a peer far behind. Probes are compact block round trips, which the observer only sends
+    when it is configured to.
+  </p>
+</main>
+<script src="js/d3@7.js"></script>
+<script src="js/plot@0.6.js"></script>
+<script src="js/websocket-picker.js"></script>
+<script src="js/common.js"></script>
+<script src="js/blocks.js"></script>
+</body>
+</html>

@@ -1,0 +1,60 @@
+body { font-family: system-ui, sans-serif; font-size: 0.9rem; margin: 0 1rem 2rem; color: #222; background: #fff; }
+header { padding: 0.6rem 0; border-bottom: 1px solid #ddd; margin-bottom: 0.8rem; }
+nav a { margin-right: 0.8rem; }
+nav a.active { font-weight: bold; text-decoration: none; }
+h1 { font-size: 1.2rem; margin: 0.4rem 0; }
+h2 { font-size: 1rem; margin: 1.2rem 0 0.4rem; }
+p.note { color: #555; max-width: 70rem; }
+#websocket-picker { margin: 0.4rem 0; }
+#websocket-picker span { margin-right: 0.8rem; }
+#status.error { color: #b00020; }
+.dim { color: #777; }
+.error { color: #b00020; }
+.observer { font-family: monospace; font-size: 0.8rem; margin: 0.2rem 0; }
+.observer.stale { color: #b00020; }
+.controls { margin: 0.4rem 0; display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+.controls input[type=search] { width: 24rem; }
+.tablewrap { overflow-x: auto; }
+
+/* The virtualised connections table. The row height is fixed because the
+   scroll offset is turned into a row index with it, and the layout is fixed
+   so the columns do not jump as other rows scroll into view. */
+.scroller { overflow: auto; height: calc(100vh - 16rem); min-height: 20rem; border-bottom: 1px solid #ddd; }
+.scroller table { table-layout: fixed; width: max-content; }
+.scroller tbody tr { height: 22px; }
+.scroller tbody td { height: 22px; line-height: 22px; padding: 0 0.45rem; vertical-align: middle; overflow: hidden; text-overflow: ellipsis; }
+.scroller tbody tr.spacer td { padding: 0; border: 0; }
+table { border-collapse: collapse; font-family: monospace; font-size: 0.78rem; white-space: nowrap; }
+th, td { padding: 0.15rem 0.45rem; border-bottom: 1px solid #eee; text-align: left; vertical-align: top; }
+th { background: #f4f4f4; cursor: pointer; position: sticky; top: 0; }
+th.sorted::after { content: " ▼"; }
+th.sorted.asc::after { content: " ▲"; }
+td.num, th.num { text-align: right; }
+td.ua { max-width: 22rem; overflow: hidden; text-overflow: ellipsis; }
+tr.nohandshake { color: #999; }
+tr.otherchain td:first-child { box-shadow: inset 3px 0 0 #b00020; }
+.tag { display: inline-block; padding: 0 0.3rem; border-radius: 3px; background: #eee; margin-right: 0.2rem; }
+.tag.ahead { background: #ffd8d8; }
+.tag.syncing { background: #e0e8ff; }
+.tag.behind { background: #fff2cc; }
+.empty { color: #999; font-style: italic; }
+
+/* A spinner means "no message about this yet", which is not the same as
+   "nothing there": the tool keeps no state, so every value appears only once
+   an event carries it. Reduced motion slows it rather than hiding it, since
+   it is the only thing distinguishing the two cases. */
+.spinner {
+  display: inline-block; width: 0.75em; height: 0.75em; vertical-align: -0.1em;
+  border: 2px solid #ddd; border-top-color: #666; border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+.spinner.big { width: 1.1em; height: 1.1em; border-width: 3px; }
+@keyframes spin { to { transform: rotate(1turn); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr)); gap: 1rem 2rem; }
+figure { margin: 0.5rem 0; }
+/* Both have a fixed height: a redraw must not change the height of anything
+   above the rest of the page, or the page moves under the reader. */
+.chart { height: 380px; overflow: hidden; }
+.chart svg { max-width: 100%; height: auto; }
+.legend { height: 3.2rem; overflow-y: auto; font-size: 0.78rem; }
