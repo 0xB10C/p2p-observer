@@ -7,5 +7,6 @@ members = [
   "tools/archive",
   "tools/csv",
   "tools/logger",
+  "tools/metrics",
   "tools/rpc",
 ]
