@@ -96,6 +96,42 @@ every connection from its handshake to its result and to guess at the ones
 that were open when it started; the websocket tool's connections page is
 where that population is shown.
 
+## Dashboards
+
+`dashboards/playlist/` holds Grafana dashboards for a playlist, one per
+question: each has a single panel and a description, and is tagged
+`p2p-observer-playlist` plus a topic (`pipeline`, `connections`,
+`handshakes`, `pings`, `blocks`, `feefilter`, `compact-blocks`, `addr`).
+Grafana builds a playlist from a tag, so the whole set is one playlist and
+a topic is a smaller one. Every panel splits by `network`; all times are
+UTC.
+
+The description is a dashboard link with the `doc` icon and `#` as its
+URL, which Grafana shows at the top of the dashboard and which goes nowhere
+when clicked. Its title is the text, a few sentences on what the dashboard
+shows and why it might matter. Grafana does not wrap it, so it stays short.
+The same convention as peer-observer's dashboards.
+
+The dashboards reference the Prometheus datasource by the uid
+`prometheus-p2p-observer`, so they can be provisioned without editing:
+give the datasource that uid, for instance in a provisioning file:
+
+```yaml
+apiVersion: 1
+datasources:
+  - name: p2p-observer
+    type: prometheus
+    uid: prometheus-p2p-observer
+    url: http://127.0.0.1:9090
+```
+
+A test checks every dashboard for the single panel, the description, the
+tag, UTC and the datasource uid, and lists them:
+
+```
+cargo test -p metrics --test dashboards -- --nocapture
+```
+
 ## Usage
 
 ```
