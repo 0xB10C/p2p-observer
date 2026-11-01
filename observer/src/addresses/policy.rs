@@ -40,6 +40,21 @@ pub const ADDR_BURST: f64 = 1000.0;
 /// Fixed retry interval for operator-supplied and bootstrap addresses.
 const MANUAL_RETRY_SECS: u32 = 60;
 
+/// How long a peer that is on another chain is left alone.
+///
+/// Long, because the answer does not change quickly: a node following a fork
+/// of this network's rules is running software that has to be replaced to
+/// follow ours, and until then every connection to it ends the same way. A
+/// day is short enough that a node which switches back is picked up again
+/// without an operator doing anything, and long enough that five hundred such
+/// peers cost one handshake each a day instead of one every five seconds.
+///
+/// It applies to operator-supplied addresses too, which otherwise keep a
+/// short fixed retry: an operator asked for a peer on this network, and
+/// reconnecting every minute to be told the same thing is not what they
+/// asked for.
+const OTHER_CHAIN_SECS: u32 = 24 * 60 * 60;
+
 /// Wait after a session that ended having run for a healthy length of time.
 /// Short, because we want to be connected to this peer.
 const STABLE_RECONNECT_SECS: u32 = 5;
@@ -155,6 +170,11 @@ pub enum Outcome {
     /// A session ran and then ended. `silent` when the peer sent no message
     /// at all after the handshake.
     Disconnected { uptime_secs: u32, silent: bool },
+    /// The peer is on a chain we refuse, and said so. Not a failure of the
+    /// address -- it answered, handshook and told us something true about
+    /// itself -- so nothing is counted against it; it is simply not a peer on
+    /// this network, and a day is how long we take its word for it.
+    OtherChain,
     /// We could not even make the attempt: no route to that network, the Tor
     /// proxy is down, and so on. Never counted against the address, because it
     /// says nothing about the peer.
@@ -223,6 +243,12 @@ pub fn retry_delay_secs(
     failures: u8,
     short_sessions: u8,
 ) -> u32 {
+    // A chain verdict outranks everything below, the operator's own addresses
+    // included: see OTHER_CHAIN_SECS.
+    if matches!(outcome, Outcome::OtherChain) {
+        return OTHER_CHAIN_SECS;
+    }
+
     // Operator-supplied addresses keep a short fixed interval whatever
     // happens: the operator asked for this address specifically, and backing
     // off to days would quietly stop honouring that.
@@ -231,6 +257,9 @@ pub fn retry_delay_secs(
     }
 
     match outcome {
+        // Handled above, before the origin check.
+        Outcome::OtherChain => OTHER_CHAIN_SECS,
+
         Outcome::OurFault(reason) => match reason {
             OurFault::ProxyUnreachable => PROXY_UNREACHABLE_SECS,
             OurFault::NetworkUnreachable => NETWORK_UNREACHABLE_SECS,
@@ -469,6 +498,34 @@ mod tests {
                 MANUAL_RETRY_SECS
             );
         }
+        // With one exception: an operator asked for a peer on this network,
+        // and a minute's retry on a peer that is not would just repeat the
+        // same handshake and the same answer all day.
+        assert_eq!(
+            retry_delay_secs(&Outcome::OtherChain, Origin::Manual, true, 0, 0),
+            OTHER_CHAIN_SECS
+        );
+    }
+
+    /// A peer on a chain we refuse is left for a day, and nothing is held
+    /// against the address: it answered and told us the truth about itself.
+    #[test]
+    fn test_another_chain_waits_a_day_and_is_not_a_failure() {
+        for origin in [Origin::Gossip, Origin::Manual] {
+            assert_eq!(
+                retry_delay_secs(&Outcome::OtherChain, origin, true, 0, 0),
+                24 * 60 * 60
+            );
+        }
+        // However many times it has happened: the delay is the verdict, not
+        // a backoff that doubles.
+        assert_eq!(
+            retry_delay_secs(&Outcome::OtherChain, Origin::Gossip, true, 9, 9),
+            OTHER_CHAIN_SECS
+        );
+        assert!(!Outcome::OtherChain.counts_as_failure());
+        // Not an eviction either. We hung up, so the length says nothing.
+        assert!(!Outcome::OtherChain.is_short_session());
     }
 
     #[test]

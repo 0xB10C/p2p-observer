@@ -101,11 +101,21 @@ pub(crate) async fn attempt(dial: Dial, cfg: Config, addrman: Handle) {
                     // result event is the only event a session that sent
                     // nothing else produces.
                     let silent = end.silent();
+                    // We hung up on a peer following another chain. Not a
+                    // disconnect to judge by its length: the length is ours.
+                    let other_chain = end
+                        .error
+                        .as_ref()
+                        .is_some_and(|e| crate::protocol::other_chain_of(e).is_some());
                     user_agent = end.user_agent;
                     (
-                        Outcome::Disconnected {
-                            uptime_secs: uptime.as_secs() as u32,
-                            silent,
+                        if other_chain {
+                            Outcome::OtherChain
+                        } else {
+                            Outcome::Disconnected {
+                                uptime_secs: uptime.as_secs() as u32,
+                                silent,
+                            }
                         },
                         // The session ran, so the transport is settled whatever
                         // the hint said going in.
@@ -174,6 +184,12 @@ fn classify_session_end(err: Option<&anyhow::Error>) -> common::events::Disconne
         return R::Unknown;
     };
 
+    // Our own verdict, not a transport failure: we hung up because the peer
+    // is following a chain we refuse.
+    if crate::protocol::other_chain_of(err).is_some() {
+        return R::OtherChain;
+    }
+
     if let Some(fault) = crate::transport::fault_of(err) {
         return match fault {
             Fault::PeerClosed => R::PeerClosed,
@@ -233,8 +249,9 @@ fn failed_result(outcome: Outcome, elapsed: Duration) -> common::events::connect
             .into(),
             setup_ms,
         }),
-        // Unreachable: a session has its own constructor above.
-        Outcome::Disconnected { .. } => {
+        // Unreachable: both of these are sessions that ran, and a session has
+        // its own constructor above.
+        Outcome::OtherChain | Outcome::Disconnected { .. } => {
             connection_result::Result::Failed(connection_result::Failed {
                 reason: FailureReason::Unknown.into(),
                 setup_ms,
@@ -305,9 +322,19 @@ pub(crate) async fn bootstrap_attempt(
         let guard = addrman.end_guard(addr);
         match connect_and_run(id, &dial, cfg, addrman).await {
             Ok((_, end)) => {
-                guard.finish(Outcome::Disconnected {
-                    uptime_secs: end.connected_at.elapsed().as_secs() as u32,
-                    silent: end.silent(),
+                // A bootstrap peer on another chain is no more use for the
+                // sync than for anything else, and gets the same day off.
+                let other_chain = end
+                    .error
+                    .as_ref()
+                    .is_some_and(|e| crate::protocol::other_chain_of(e).is_some());
+                guard.finish(if other_chain {
+                    Outcome::OtherChain
+                } else {
+                    Outcome::Disconnected {
+                        uptime_secs: end.connected_at.elapsed().as_secs() as u32,
+                        silent: end.silent(),
+                    }
                 });
                 Ok(end.connected_at)
             }
@@ -1029,6 +1056,26 @@ mod tests {
 
     /// Every fault the transport can tag maps to its own reason, so a clean
     /// close and a message we could not read are never the same record.
+    /// Our own verdict on the peer's chain, which is neither a transport
+    /// fault nor an io error, and must not be read as one.
+    #[test]
+    fn test_session_end_reads_the_other_chain_verdict() {
+        use crate::headertree::HeaderError;
+        use crate::protocol::OtherChain;
+        use common::events::DisconnectReason as R;
+
+        let err = anyhow::Error::new(OtherChain {
+            reason: HeaderError::ForkBelowCheckpoint,
+        })
+        .context("handling headers");
+        assert_eq!(classify_session_end(Some(&err)), R::OtherChain);
+
+        // And an ordinary close is still an ordinary close.
+        let closed = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+            .context(Fault::PeerClosed);
+        assert_eq!(classify_session_end(Some(&closed)), R::PeerClosed);
+    }
+
     #[test]
     fn test_session_end_reads_the_tagged_fault() {
         use common::events::DisconnectReason as R;

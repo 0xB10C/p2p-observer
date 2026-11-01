@@ -274,6 +274,13 @@ enum DisconnectReason {
   // Our own send failed.
   DISCONNECT_REASON_WRITE_ERROR = 6;
   DISCONNECT_REASON_OTHER = 7;
+  // We hung up: the peer sent a header from a chain this observer refuses --
+  // a fork at or below a checkpoint it holds, a different block at a
+  // checkpoint height, or work that does not meet the network's rules. The
+  // block that carried it is announced first, with its unplaced reason, so
+  // the archive says what the peer was following when we dropped it. Its
+  // address is then left alone for a day.
+  DISCONNECT_REASON_OTHER_CHAIN = 8;
 }
 
 // Why an attempt never reached a session.
@@ -390,6 +397,41 @@ message BlockAnnouncement {
   // For a compact block, the shape the peer sent it in. Absent for an inv
   // or a HEADERS announcement, which carry no transactions at all.
   optional CompactBlockShape compact_block = 8;
+  // Why the tree could not place the block. Set exactly when height is not.
+  optional Unplaced unplaced = 9;
+}
+
+// Why an announced block has no height.
+//
+// Another chain on this network's magic -- a fork that kept the magic and
+// changed the rules -- announces its blocks like any other peer does, and
+// without this they were indistinguishable from a block the tree had not yet
+// caught up to. A tree that refuses a header now says why, and a header built
+// on a refused one is refused for the same reason.
+enum Unplaced {
+  UNPLACED_UNKNOWN = 0;
+  // Only the hash was announced, and the tree has not seen the header.
+  UNPLACED_NO_HEADER = 1;
+  // The header's parent is not in the tree: the tree is behind, and has asked
+  // peers for the headers it lacks.
+  UNPLACED_ORPHAN = 2;
+  // The header fails proof of work under this network's rules, or its target
+  // is above the maximum, or it descends from one that does.
+  UNPLACED_INVALID_POW = 3;
+  // The header forks off at or below a checkpoint the tree has reached, or
+  // descends from one that does. Another chain.
+  UNPLACED_FORK_BELOW_CHECKPOINT = 4;
+  // The header sits at a checkpoint height with another hash, or descends
+  // from one that does.
+  UNPLACED_CHECKPOINT_MISMATCH = 5;
+  // The tree cannot place the header and its own target is far easier than
+  // the tree's tip, so the chain it belongs to puts a fraction of the work
+  // into a block that ours does. Being behind looks like ORPHAN; this is a
+  // weaker chain, and the observer hangs up on the peer that sent it.
+  //
+  // Never reported on a network that allows minimum-difficulty blocks, where
+  // an honest header's target says nothing.
+  UNPLACED_WEAKER_CHAIN = 6;
 }
 
 // How a peer built the compact block it sent us (BIP152).
