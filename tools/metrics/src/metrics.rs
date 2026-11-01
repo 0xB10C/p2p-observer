@@ -113,6 +113,7 @@ pub struct Metrics {
     pub session_duration_seconds: HistogramVec,
     pub session_messages_total: IntCounterVec,
     pub unsolicited_pongs_total: IntCounterVec,
+    pub silent_sessions_total: IntCounterVec,
 
     // What peers say about themselves.
     pub handshakes_total: IntCounterVec,
@@ -303,6 +304,14 @@ impl Metrics {
                 &r,
                 "unsolicited_pongs_total",
                 "Pongs over ended sessions whose nonce was never sent.",
+                &["network"],
+            )?,
+            silent_sessions_total: counter(
+                &r,
+                "silent_sessions_total",
+                "Ended sessions in which the peer sent no message after the handshake. \
+                 A peer that connects, says nothing and hangs up on a timer looks like \
+                 any other in the handshake counts; this is where it shows.",
                 &["network"],
             )?,
 

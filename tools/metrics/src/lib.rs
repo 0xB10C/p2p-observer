@@ -555,6 +555,14 @@ fn observe_connection_result(network: &str, result: &ConnectionResult, metrics: 
                     .with_label_values(&[network])
                     .inc_by(d.unsolicited_pongs as u64);
             }
+            // Not a message received, of any command. The handshake does not
+            // count: it is what made this a session at all.
+            if d.messages_by_command.is_empty() && d.messages_other == 0 {
+                metrics
+                    .silent_sessions_total
+                    .with_label_values(&[network])
+                    .inc();
+            }
             (
                 "disconnected",
                 labels::enum_label(d.reason().as_str_name(), "DISCONNECT_REASON_"),
@@ -1062,6 +1070,16 @@ mod tests {
                 undecodable: 0,
             })),
         };
+        // A peer that completed the handshake, said nothing for a minute and
+        // hung up.
+        let silent = ConnectionResult {
+            result: Some(AttemptResult::Disconnected(Disconnected {
+                setup_ms: 120,
+                uptime_ms: 60_000,
+                reason: DisconnectReason::PeerClosed as i32,
+                ..Default::default()
+            })),
+        };
         let failed = ConnectionResult {
             result: Some(AttemptResult::Failed(Failed {
                 reason: FailureReason::TcpConnectTimeout as i32,
@@ -1074,9 +1092,15 @@ mod tests {
                 setup_ms: 1,
             })),
         };
-        for (i, r) in [disconnected, failed, our_fault, ConnectionResult::default()]
-            .into_iter()
-            .enumerate()
+        for (i, r) in [
+            disconnected,
+            silent,
+            failed,
+            our_fault,
+            ConnectionResult::default(),
+        ]
+        .into_iter()
+        .enumerate()
         {
             observe(
                 NET,
@@ -1091,8 +1115,9 @@ mod tests {
                 &m.connection_attempts_total,
                 &[NET, "disconnected", "peer_closed"]
             ),
-            1
+            2
         );
+        assert_eq!(counter(&m.silent_sessions_total, &[NET]), 1);
         assert_eq!(
             counter(
                 &m.connection_attempts_total,
@@ -1111,7 +1136,7 @@ mod tests {
             counter(&m.connection_attempts_total, &[NET, "unknown", "unknown"]),
             1
         );
-        assert_eq!(histogram_sum(&m.session_duration_seconds, &[NET]), 90.0);
+        assert_eq!(histogram_sum(&m.session_duration_seconds, &[NET]), 150.0);
         assert_eq!(
             histogram_sum(&m.connection_setup_seconds, &[NET, "failed"]),
             10.0
