@@ -151,6 +151,10 @@ message AddressAnnouncement {
   // treats it as one: a solicited announcement is not charged against the rate
   // limit at all. Without this the limiter's behaviour cannot be reconstructed
   // from the stream, because nothing else in it records that we asked.
+  //
+  // Always false on a message holding only the peer's own address: that is
+  // its self-announcement, sent whether or not anyone asked, and it leaves the
+  // request outstanding for the message that answers it.
   bool solicited = 4;
   // How many of the entries above the rate limit discarded, so the gap between
   // what was announced and what the address book was offered is explicit
