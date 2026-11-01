@@ -56,7 +56,10 @@ The **network** metrics are what the events say about the peers:
   pong, `ping_tcp_*`.
 - Blocks: `block_announcements_total` and `blocks_total` by message type,
   `block_propagation_seconds` (how long after the first sighting each further
-  peer announced a block), the shape of compact blocks, probe steps.
+  peer announced a block), the shape of compact blocks, probe steps. All
+  three carry `height`, `known` or `unknown`: whether the observer's header
+  tree could place the block. Another chain on this network's magic
+  announces blocks the tree refuses, and the dashboards keep those apart.
 - Policy: `fee_filter_sat_per_kvb`, `send_cmpct_total` by mode and version.
 - Gossip: announcements by message, entries by network and service bit, the
   age of what is announced, what the rate limit discarded, self-announcements.
