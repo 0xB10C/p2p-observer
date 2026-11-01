@@ -609,7 +609,10 @@ mod tests {
         m.apply(
             Lifecycle::Ended {
                 addr,
-                outcome: Outcome::Disconnected { uptime_secs: 600 },
+                outcome: Outcome::Disconnected {
+                    uptime_secs: 600,
+                    silent: false,
+                },
             },
             NOW + 600,
         );
@@ -637,12 +640,19 @@ mod tests {
         }
 
         // And when it does report, the real outcome is what arrives.
-        handle
-            .end_guard(addr)
-            .finish(Outcome::Disconnected { uptime_secs: 42 });
+        handle.end_guard(addr).finish(Outcome::Disconnected {
+            uptime_secs: 42,
+            silent: false,
+        });
         match life_rx.try_recv().expect("nothing reported") {
             Lifecycle::Ended { outcome, .. } => {
-                assert_eq!(outcome, Outcome::Disconnected { uptime_secs: 42 });
+                assert_eq!(
+                    outcome,
+                    Outcome::Disconnected {
+                        uptime_secs: 42,
+                        silent: false
+                    }
+                );
             }
             other => panic!("unexpected message: {other:?}"),
         }

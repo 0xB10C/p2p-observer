@@ -100,10 +100,12 @@ pub(crate) async fn attempt(dial: Dial, cfg: Config, addrman: Handle) {
                     // The handshake completed, so this is known -- and the
                     // result event is the only event a session that sent
                     // nothing else produces.
+                    let silent = end.silent();
                     user_agent = end.user_agent;
                     (
                         Outcome::Disconnected {
                             uptime_secs: uptime.as_secs() as u32,
+                            silent,
                         },
                         // The session ran, so the transport is settled whatever
                         // the hint said going in.
@@ -305,6 +307,7 @@ pub(crate) async fn bootstrap_attempt(
             Ok((_, end)) => {
                 guard.finish(Outcome::Disconnected {
                     uptime_secs: end.connected_at.elapsed().as_secs() as u32,
+                    silent: end.silent(),
                 });
                 Ok(end.connected_at)
             }
