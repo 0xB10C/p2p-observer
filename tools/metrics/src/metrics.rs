@@ -421,15 +421,18 @@ impl Metrics {
             block_announcements_total: counter(
                 &r,
                 "block_announcements_total",
-                "Block announcements received, by the message that carried them.",
-                &["network", "type"],
+                "Block announcements received, by the message that carried them and \
+                 whether the observer's header tree could place the block at a height. \
+                 An unknown height is a block the tree has not caught up to, or one of \
+                 another chain on this network's magic.",
+                &["network", "type", "height"],
             )?,
             blocks_total: counter(
                 &r,
                 "blocks_total",
                 "Blocks first heard of through an announcement, by the message that \
-                 carried the first one.",
-                &["network", "type"],
+                 carried the first one and whether the block has a known height.",
+                &["network", "type", "height"],
             )?,
             block_announcement_batch_size: histogram(
                 &r,
@@ -443,9 +446,11 @@ impl Metrics {
                 &r,
                 "block_propagation_seconds",
                 "How long after the first sighting of a block each further peer \
-                 announced it. Only for blocks whose first sighting this tool saw.",
+                 announced it. Only for blocks whose first sighting this tool saw. \
+                 Blocks of unknown height are kept apart: another chain's blocks \
+                 travel among its own peers, not the network's.",
                 PROPAGATION_BUCKETS,
-                &["network", "type"],
+                &["network", "type", "height"],
             )?,
             compact_block_short_ids: histogram(
                 &r,
@@ -576,7 +581,7 @@ mod tests {
             .inc();
         metrics
             .block_propagation_seconds
-            .with_label_values(&["signet", "inv"])
+            .with_label_values(&["signet", "inv", "known"])
             .observe(1.0);
         let families = metrics.registry.gather();
         let names: Vec<&str> = families.iter().map(|f| f.name()).collect();

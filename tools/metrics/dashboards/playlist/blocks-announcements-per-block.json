@@ -120,7 +120,7 @@
             "uid": "prometheus-p2p-observer"
           },
           "editorMode": "code",
-          "expr": "sum by (network, type) (increase(p2pobserver_block_announcements_total[6h])) / ignoring(type) group_left sum by (network) (increase(p2pobserver_blocks_total[6h]))",
+          "expr": "sum by (network, type) (increase(p2pobserver_block_announcements_total{height=\"known\"}[6h])) / ignoring(type) group_left sum by (network) (increase(p2pobserver_blocks_total{height=\"known\"}[6h]))",
           "legendFormat": "{{network}} {{type}}",
           "range": true,
           "refId": "A"

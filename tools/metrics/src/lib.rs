@@ -481,9 +481,18 @@ fn observe_block_announcement(
     state: &mut State,
 ) {
     let atype = labels::enum_label(blk.announcement_type().as_str_name(), "ANNOUNCEMENT_TYPE_");
+    // Whether the observer's header tree could place the block. Another
+    // chain on this network's magic announces blocks the tree refuses, and
+    // mixed in they distort every block panel: first sightings, propagation,
+    // announcements per block.
+    let height = if blk.height.is_some() {
+        "known"
+    } else {
+        "unknown"
+    };
     metrics
         .block_announcements_total
-        .with_label_values(&[network, &atype])
+        .with_label_values(&[network, &atype, height])
         .inc();
     metrics
         .block_announcement_batch_size
@@ -514,7 +523,7 @@ fn observe_block_announcement(
     if blk.new_to_us {
         metrics
             .blocks_total
-            .with_label_values(&[network, &atype])
+            .with_label_values(&[network, &atype, height])
             .inc();
         net.blocks.record(&blk.block_hash, event.timestamp_ms);
         // The first sighting is the zero every other announcement of the
@@ -525,7 +534,7 @@ fn observe_block_announcement(
         let delay = (event.timestamp_ms as f64 - first_ms as f64).max(0.0) / 1000.0;
         metrics
             .block_propagation_seconds
-            .with_label_values(&[network, &atype])
+            .with_label_values(&[network, &atype, height])
             .observe(delay);
     }
 }
@@ -1001,13 +1010,55 @@ mod tests {
             &mut state,
             0,
         );
-        assert_eq!(counter(&m.blocks_total, &[NET, "inv"]), 1);
-        assert_eq!(counter(&m.block_announcements_total, &[NET, "inv"]), 4);
+        assert_eq!(counter(&m.blocks_total, &[NET, "inv", "known"]), 1);
         assert_eq!(
-            histogram_count(&m.block_propagation_seconds, &[NET, "inv"]),
+            counter(&m.block_announcements_total, &[NET, "inv", "known"]),
+            3
+        );
+        assert_eq!(
+            counter(&m.block_announcements_total, &[NET, "inv", "unknown"]),
+            1
+        );
+        assert_eq!(
+            histogram_count(&m.block_propagation_seconds, &[NET, "inv", "known"]),
             2
         );
-        assert!((histogram_sum(&m.block_propagation_seconds, &[NET, "inv"]) - 5.5).abs() < 1e-9);
+        assert!(
+            (histogram_sum(&m.block_propagation_seconds, &[NET, "inv", "known"]) - 5.5).abs()
+                < 1e-9
+        );
+    }
+
+    /// A block the tree could not place is counted apart, first sighting and
+    /// propagation alike, so another chain's blocks stay out of the network's
+    /// numbers.
+    #[test]
+    fn test_blocks_of_unknown_height_are_kept_apart() {
+        let m = Metrics::new().unwrap();
+        let mut state = State::default();
+        for (conn, at, new) in [(1, 10_000, true), (2, 11_000, false)] {
+            observe(
+                NET,
+                &event(
+                    conn,
+                    at,
+                    peer_event::Event::BlockAnnouncement(announcement("fork", new, None)),
+                ),
+                &m,
+                &mut state,
+                0,
+            );
+        }
+        assert_eq!(counter(&m.blocks_total, &[NET, "inv", "unknown"]), 1);
+        assert_eq!(counter(&m.blocks_total, &[NET, "inv", "known"]), 0);
+        assert_eq!(
+            histogram_count(&m.block_propagation_seconds, &[NET, "inv", "unknown"]),
+            1
+        );
+        assert_eq!(
+            histogram_count(&m.block_propagation_seconds, &[NET, "inv", "known"]),
+            0
+        );
     }
 
     #[test]
@@ -1042,7 +1093,10 @@ mod tests {
             &mut state,
             0,
         );
-        assert_eq!(counter(&m.blocks_total, &[NET, "compact_block"]), 1);
+        assert_eq!(
+            counter(&m.blocks_total, &[NET, "compact_block", "known"]),
+            1
+        );
         assert_eq!(histogram_sum(&m.compact_block_short_ids, &[NET]), 2500.0);
         assert_eq!(histogram_sum(&m.compact_block_prefilled_txs, &[NET]), 1.0);
     }

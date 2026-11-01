@@ -120,7 +120,7 @@
             "uid": "prometheus-p2p-observer"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (network, le) (rate(p2pobserver_block_propagation_seconds_bucket[6h])))",
+          "expr": "histogram_quantile(0.5, sum by (network, le) (rate(p2pobserver_block_propagation_seconds_bucket{height=\"known\"}[6h])))",
           "legendFormat": "{{network}} p50",
           "range": true,
           "refId": "A"
@@ -131,7 +131,7 @@
             "uid": "prometheus-p2p-observer"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (network, le) (rate(p2pobserver_block_propagation_seconds_bucket[6h])))",
+          "expr": "histogram_quantile(0.9, sum by (network, le) (rate(p2pobserver_block_propagation_seconds_bucket{height=\"known\"}[6h])))",
           "legendFormat": "{{network}} p90",
           "range": true,
           "refId": "B"
@@ -142,7 +142,7 @@
             "uid": "prometheus-p2p-observer"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (network, le) (rate(p2pobserver_block_propagation_seconds_bucket[6h])))",
+          "expr": "histogram_quantile(0.99, sum by (network, le) (rate(p2pobserver_block_propagation_seconds_bucket{height=\"known\"}[6h])))",
           "legendFormat": "{{network}} p99",
           "range": true,
           "refId": "C"

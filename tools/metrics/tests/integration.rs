@@ -398,21 +398,24 @@ async fn test_events_become_metrics() {
     )));
     assert_eq!(get("p2pobserver_ping_rtt_seconds_sum", &[net]), 0.12);
     assert_eq!(
-        get("p2pobserver_blocks_total", &[net, ("type", "headers")]),
+        get(
+            "p2pobserver_blocks_total",
+            &[net, ("type", "headers"), ("height", "known")]
+        ),
         1.0
     );
     assert_eq!(get("p2pobserver_best_height", &[net]), 100.0);
     assert_eq!(
         get(
             "p2pobserver_block_propagation_seconds_count",
-            &[net, ("type", "headers")]
+            &[net, ("type", "headers"), ("height", "known")]
         ),
         1.0
     );
     assert_eq!(
         get(
             "p2pobserver_block_propagation_seconds_sum",
-            &[net, ("type", "headers")]
+            &[net, ("type", "headers"), ("height", "known")]
         ),
         2.5
     );
