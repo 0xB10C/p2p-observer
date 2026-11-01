@@ -1115,7 +1115,14 @@ mod tests {
         // Repeated evictions accumulate and the retry grows.
         let mut last = 0;
         for i in 1..=3u32 {
-            t.record_ended(addr, NOW, Outcome::Disconnected { uptime_secs: 2 });
+            t.record_ended(
+                addr,
+                NOW,
+                Outcome::Disconnected {
+                    uptime_secs: 2,
+                    silent: false,
+                },
+            );
             let e = t.entry(&addr).unwrap();
             assert_eq!(u32::from(e.short_sessions), i);
             let delay = e.next_attempt - NOW;
@@ -1124,7 +1131,14 @@ mod tests {
         }
 
         // A session that ran properly clears the suspicion.
-        t.record_ended(addr, NOW, Outcome::Disconnected { uptime_secs: 600 });
+        t.record_ended(
+            addr,
+            NOW,
+            Outcome::Disconnected {
+                uptime_secs: 600,
+                silent: false,
+            },
+        );
         let e = t.entry(&addr).unwrap();
         assert_eq!(e.short_sessions, 0);
         assert!(

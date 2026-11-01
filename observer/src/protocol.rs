@@ -213,6 +213,15 @@ pub(crate) struct SessionEnd {
     pub(crate) unsolicited_pongs: u32,
 }
 
+impl SessionEnd {
+    /// Whether the peer sent nothing at all after the handshake. Such a
+    /// session taught us nothing, and the address manager backs off a peer
+    /// that keeps producing them.
+    pub(crate) fn silent(&self) -> bool {
+        self.messages_by_command.is_empty() && self.messages_other == 0
+    }
+}
+
 /// A live connection to a peer, created after a successful version handshake.
 struct Connection<R: TransportReader, W: TransportWriter> {
     reader: R,

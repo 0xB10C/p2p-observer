@@ -67,8 +67,8 @@ const NETWORK_DISABLED_SECS: u32 = 24 * 60 * 60;
 // clamped at `CAP`. The multiplier lives with the call in `retry_delay_secs`,
 // because it is the one part that differs between the three.
 
-/// After a session that ended early enough to look like an eviction. Doubles
-/// per consecutive short session.
+/// After a session that ended early enough to look like an eviction, or in
+/// which the peer never sent a message. Doubles per consecutive such session.
 const EVICTION_BASE_SECS: u32 = 60;
 const EVICTION_CAP_SECS: u32 = 60 * 60;
 
@@ -152,8 +152,9 @@ pub enum OurFault {
 pub enum Outcome {
     /// Never reached a working session.
     Failed(Reason),
-    /// A session ran and then ended.
-    Disconnected { uptime_secs: u32 },
+    /// A session ran and then ended. `silent` when the peer sent no message
+    /// at all after the handshake.
+    Disconnected { uptime_secs: u32, silent: bool },
     /// We could not even make the attempt: no route to that network, the Tor
     /// proxy is down, and so on. Never counted against the address, because it
     /// says nothing about the peer.
@@ -166,9 +167,15 @@ impl Outcome {
         matches!(self, Outcome::Failed(_))
     }
 
-    /// Whether this outcome is a session that ended suspiciously early.
+    /// Whether this outcome is a session that gave us nothing: one that ended
+    /// suspiciously early, or one the peer sat through without sending a
+    /// message. Both are backed off the same way.
     pub fn is_short_session(&self) -> bool {
-        matches!(self, Outcome::Disconnected { uptime_secs } if *uptime_secs < SHORT_SESSION_SECS)
+        matches!(
+            self,
+            Outcome::Disconnected { uptime_secs, silent }
+                if *silent || *uptime_secs < SHORT_SESSION_SECS
+        )
     }
 }
 
@@ -230,13 +237,16 @@ pub fn retry_delay_secs(
             OurFault::NetworkDisabled => NETWORK_DISABLED_SECS,
         },
 
-        Outcome::Disconnected { uptime_secs } => {
-            if *uptime_secs >= SHORT_SESSION_SECS {
-                STABLE_RECONNECT_SECS
-            } else {
-                // Probably being evicted. Back off so we stop hammering a peer
-                // whose inbound slots are full.
+        Outcome::Disconnected { .. } => {
+            if outcome.is_short_session() {
+                // Probably being evicted, or a peer that completes the
+                // handshake, says nothing, and hangs up on a timer -- a fleet
+                // of those closing at exactly a minute was two thirds of all
+                // sessions, redialled five seconds after each. Back off so we
+                // stop hammering either.
                 exp_backoff(EVICTION_BASE_SECS, 2, short_sessions, EVICTION_CAP_SECS)
+            } else {
+                STABLE_RECONNECT_SECS
             }
         }
 
@@ -324,16 +334,49 @@ mod tests {
 
     #[test]
     fn test_stable_session_retries_quickly() {
-        let out = Outcome::Disconnected { uptime_secs: 600 };
+        let out = Outcome::Disconnected {
+            uptime_secs: 600,
+            silent: false,
+        };
         assert_eq!(
             retry_delay_secs(&out, Origin::Gossip, true, 0, 0),
             STABLE_RECONNECT_SECS
         );
     }
 
+    /// A peer that holds the session open for a while but never sends a
+    /// message is backed off like an eviction, however long it stayed.
+    #[test]
+    fn test_silent_session_backs_off_like_an_eviction() {
+        let silent = Outcome::Disconnected {
+            uptime_secs: 60,
+            silent: true,
+        };
+        assert!(silent.is_short_session());
+        for (short_sessions, expected) in [(1, 60), (2, 120), (3, 240)] {
+            assert_eq!(
+                retry_delay_secs(&silent, Origin::Gossip, true, 0, short_sessions),
+                expected
+            );
+        }
+        // The same uptime with something said is a stable session.
+        let spoke = Outcome::Disconnected {
+            uptime_secs: 60,
+            silent: false,
+        };
+        assert!(!spoke.is_short_session());
+        assert_eq!(
+            retry_delay_secs(&spoke, Origin::Gossip, true, 0, 3),
+            STABLE_RECONNECT_SECS
+        );
+    }
+
     #[test]
     fn test_eviction_backs_off_and_caps() {
-        let out = Outcome::Disconnected { uptime_secs: 5 };
+        let out = Outcome::Disconnected {
+            uptime_secs: 5,
+            silent: false,
+        };
         assert!(out.is_short_session());
         // 60s doubling per consecutive short session.
         for (short_sessions, expected) in [(1, 60), (2, 120), (3, 240), (4, 480)] {
@@ -416,7 +459,10 @@ mod tests {
         for outcome in [
             failed(),
             Outcome::OurFault(OurFault::NetworkUnreachable),
-            Outcome::Disconnected { uptime_secs: 0 },
+            Outcome::Disconnected {
+                uptime_secs: 0,
+                silent: false,
+            },
         ] {
             assert_eq!(
                 retry_delay_secs(&outcome, Origin::Manual, false, 200, 200),
