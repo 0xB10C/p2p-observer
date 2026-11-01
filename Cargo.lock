@@ -1489,6 +1489,7 @@ dependencies = [
  "common",
  "corepc-node",
  "libc",
+ "rand 0.10.3",
  "sha3",
  "tokio",
  "tokio-socks",

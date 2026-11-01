@@ -8,6 +8,7 @@ common = { path = "../common" }
 bip324 = { git = "https://github.com/rust-bitcoin/bip324", package = "bip324", features = ["tokio"] }
 tokio-socks = "0.5"
 sha3 = "0.12"
+rand = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
