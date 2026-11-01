@@ -223,7 +223,8 @@ struct Connection<R: TransportReader, W: TransportWriter> {
     addr_tokens: f64,
     addr_tokens_updated: Instant,
     /// Set while we are expecting the reply to our own GETADDR. That reply is
-    /// solicited, so it is not charged against the bucket.
+    /// solicited, so it is not charged against the bucket. Taken by the first
+    /// addr message that is not the peer's own self-announcement.
     getaddr_outstanding: bool,
     handshake_info: HandshakeInfo,
     stats: ConnectionStats,
@@ -853,7 +854,13 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         received: usize,
         mut parsed: Vec<Gossiped>,
     ) {
-        let solicited = std::mem::take(&mut self.getaddr_outstanding);
+        // A peer announces its own address on its own schedule, and usually
+        // gets that one-entry message out before it answers our GETADDR. It
+        // is not the reply, so it must not take the flag: that left the real
+        // reply charged against the bucket, which it drained for the rest of
+        // the session, and archived as unsolicited.
+        let self_announcement = received == 1 && parsed.len() == 1 && parsed[0].addr == self.addr;
+        let solicited = !self_announcement && std::mem::take(&mut self.getaddr_outstanding);
 
         // Refilled whether or not this message will be charged, so the level
         // reported below means the same thing on both paths. Harmless to the
@@ -1096,7 +1103,9 @@ mod tests {
     }
 
     fn harness(tree: Arc<RwLock<HeaderTree>>) -> Harness {
-        let (event_tx, events) = mpsc::channel(64);
+        // Roomier than the gossip shedding threshold, so address
+        // announcements reach the tests too.
+        let (event_tx, events) = mpsc::channel(crate::emit::GOSSIP_SHED_BELOW + 64);
         let (addrman, g, l, c) = crate::addresses::channels();
         let NetworkMessage::Version(version) = build_version(USER_AGENT, 0) else {
             unreachable!()
@@ -1477,6 +1486,48 @@ mod tests {
         };
         assert!(s.high_bandwidth);
         assert_eq!(s.version, 2);
+    }
+
+    /// The peer's own one-entry announcement is not the reply to our GETADDR,
+    /// so it leaves the flag for the message that is.
+    #[tokio::test]
+    async fn test_self_announcement_does_not_answer_getaddr() {
+        use crate::headertree::testing::regtest_params;
+        use common::events::peer_event::Event;
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let mut h = harness(tree);
+        let gossip = |addr| Gossiped {
+            addr,
+            services: 0,
+            ntime: 0,
+        };
+        let solicited = |h: &mut Harness| match h.events.try_recv().unwrap().event {
+            Some(Event::AddressAnnouncement(a)) => a.solicited,
+            other => panic!("not an address announcement: {other:?}"),
+        };
+
+        h.conn.getaddr_outstanding = true;
+        let own = h.conn.addr;
+        h.conn
+            .offer_gossip(common::events::AddrMessage::Addrv2, 1, vec![gossip(own)]);
+        assert!(!solicited(&mut h));
+        assert!(h.conn.getaddr_outstanding);
+
+        let reply = vec![
+            gossip(PeerAddr::Ipv4([10, 0, 0, 1], 8333)),
+            gossip(PeerAddr::Ipv4([10, 0, 0, 2], 8333)),
+        ];
+        h.conn
+            .offer_gossip(common::events::AddrMessage::Addrv2, 2, reply);
+        assert!(solicited(&mut h));
+        assert!(!h.conn.getaddr_outstanding);
+
+        // Another peer's single address is not a self-announcement either.
+        h.conn.getaddr_outstanding = true;
+        let other = vec![gossip(PeerAddr::Ipv4([10, 0, 0, 3], 8333))];
+        h.conn
+            .offer_gossip(common::events::AddrMessage::Addrv2, 1, other);
+        assert!(solicited(&mut h));
     }
 
     /// A reply to our own getheaders is not the peer announcing blocks, however
