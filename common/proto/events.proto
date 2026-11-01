@@ -147,8 +147,9 @@ message AddressAnnouncement {
   // addrv2 message may still carry only IPv4.
   AddrMessage message = 1;
   // Entries we could not parse, almost always zero. Non-zero means an AddrV2
-  // type we do not understand, which is the one thing the raw count was
-  // carrying that the list below does not.
+  // type we do not understand, or an entry the decoder rejects -- an IPv4
+  // address sent under the IPv6 network id, say -- which is the one thing the
+  // raw count was carrying that the list below does not.
   uint32 unparsed = 2;
   // Every entry we could parse, before the rate limit was applied.
   repeated GossipedAddress addresses = 3;
@@ -226,6 +227,14 @@ message ConnectionResult {
     // number -- but a peer answering pings it was not sent is behaviour worth
     // counting.
     uint32 unsolicited_pongs = 6;
+    // Messages that arrived under a command we could read with a payload we
+    // could not deserialize. Each is also counted under its command in
+    // messages_by_command, and the session went on without it: the frame
+    // boundary was known, so one unreadable message is not a stream that
+    // cannot be followed. Before this field existed such a message ended the
+    // session with DISCONNECT_REASON_DECODE_ERROR, which is how every session
+    // with a btcd peer ended -- on its addrv2 reply to our getaddr.
+    uint32 undecodable = 7;
   }
 
   // Never reached a session.
@@ -266,7 +275,10 @@ enum DisconnectReason {
   DISCONNECT_REASON_TRUNCATED = 2;
   // The connection was reset or the pipe broke under us.
   DISCONNECT_REASON_CONNECTION_RESET = 3;
-  // A message arrived that we could not deserialize.
+  // A frame arrived that could not be read at all: a v1 command that is not
+  // a command string, or a v2 short id outside the table. A readable command
+  // with a payload that would not deserialize is not this -- that message is
+  // skipped and counted in Disconnected.undecodable.
   DISCONNECT_REASON_DECODE_ERROR = 4;
   // A v2 packet failed to decrypt, which means the stream is out of sync and
   // nothing further on it can be trusted.

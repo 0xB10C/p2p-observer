@@ -1059,6 +1059,7 @@ mod tests {
                 messages_by_command: [("ping".to_owned(), 3), ("weird".to_owned(), 2)].into(),
                 messages_other: 4,
                 unsolicited_pongs: 1,
+                undecodable: 0,
             })),
         };
         let failed = ConnectionResult {

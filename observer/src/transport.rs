@@ -5,7 +5,7 @@ use common::{
     bitcoin::consensus::{deserialize, serialize},
     p2p::{
         Magic,
-        message::{NetworkMessage, RawNetworkMessage, V2NetworkMessage},
+        message::{CommandString, NetworkMessage, RawNetworkMessage, V2NetworkMessage},
     },
     tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     tracing,
@@ -14,6 +14,96 @@ use std::io::{Error, ErrorKind};
 
 pub trait TransportReader {
     async fn recv(&mut self) -> Result<NetworkMessage>;
+
+    /// Messages received under a readable command whose payload would not
+    /// deserialize, and were handed up as [`NetworkMessage::Unknown`] rather
+    /// than ending the session. See [`undecodable`].
+    fn undecodable(&self) -> u32 {
+        0
+    }
+}
+
+/// The message to hand up for a payload that would not deserialize.
+///
+/// A payload we cannot read under a command we can is one message lost, not a
+/// stream we can no longer follow: the frame boundary is known, and the next
+/// message is where it always was. Ending the session over it threw away
+/// everything the peer would have said afterwards, and the archive blamed the
+/// peer for a decode error that was as often a gap in our parser -- btcd's
+/// thousand-entry addrv2 reply failed this way on every connection. So the
+/// message goes up as `Unknown`, with its raw payload, for the protocol layer
+/// to count under its command and, where it has a more forgiving parser, to
+/// read anyway. Bitcoin Core does the same: a message it cannot deserialize is
+/// logged and skipped.
+///
+/// `None` when the command itself is not a command string. Then nothing about
+/// the frame can be trusted, and the session ends with a decode fault as
+/// before.
+fn undecodable(command: &[u8], payload: &[u8]) -> Option<NetworkMessage> {
+    let end = command
+        .iter()
+        .position(|b| *b == 0)
+        .unwrap_or(command.len());
+    let command = String::from_utf8(command[..end].to_vec()).ok()?;
+    let command = CommandString::try_from(command).ok()?;
+    Some(NetworkMessage::Unknown {
+        command,
+        payload: payload.to_vec(),
+    })
+}
+
+/// The commands BIP324 gives a one-byte id, in id order from 1.
+///
+/// The ids are the BIP's and are fixed on the wire: a message type without one
+/// travels as a zero byte followed by its twelve-byte command, so this grows
+/// only if the BIP itself assigns more. Spelled out here because rust-bitcoin
+/// keeps the same mapping in the match arms of its encoder and decoder,
+/// exporting neither, and reports a failed decode without saying which command
+/// failed.
+///
+/// Not maintained by eye: `test_the_short_id_table_agrees_with_the_decoder`
+/// holds it to that decoder's own answer wherever the decoder can be asked.
+const SHORT_IDS: [&str; 28] = [
+    "addr",
+    "block",
+    "blocktxn",
+    "cmpctblock",
+    "feefilter",
+    "filteradd",
+    "filterclear",
+    "filterload",
+    "getblocks",
+    "getblocktxn",
+    "getdata",
+    "getheaders",
+    "headers",
+    "inv",
+    "mempool",
+    "merkleblock",
+    "notfound",
+    "ping",
+    "pong",
+    "sendcmpct",
+    "tx",
+    "getcfilters",
+    "cfilter",
+    "getcfheaders",
+    "cfheaders",
+    "getcfcheckpt",
+    "cfcheckpt",
+    "addrv2",
+];
+
+/// The command of a v2 message from its first bytes: a [`SHORT_IDS`] id, or
+/// zero followed by the twelve-byte command.
+fn v2_undecodable(contents: &[u8]) -> Option<NetworkMessage> {
+    match contents.split_first()? {
+        (0, rest) => undecodable(rest.get(..12)?, &rest[12..]),
+        (id, rest) => {
+            let command = SHORT_IDS.get(usize::from(*id) - 1)?;
+            undecodable(command.as_bytes(), rest)
+        }
+    }
 }
 
 pub trait TransportWriter {
@@ -37,7 +127,8 @@ pub enum Fault {
     /// zero-length read as `ConnectionAborted` without saying whether it landed
     /// on a packet boundary.
     Truncated,
-    /// A message arrived that would not deserialize.
+    /// A frame arrived that could not be read at all. A readable command with
+    /// a payload that would not deserialize is not this: see [`undecodable`].
     Decode,
     /// A v2 packet would not decrypt, so the channel is out of sync and
     /// nothing further on it means anything.
@@ -97,6 +188,16 @@ fn v2_fault(e: bip324::io::ProtocolError) -> common::anyhow::Error {
 
 pub struct TransportV2Reader<R> {
     pub reader: bip324::futures::ProtocolReader<R>,
+    undecodable: u32,
+}
+
+impl<R> TransportV2Reader<R> {
+    pub fn new(reader: bip324::futures::ProtocolReader<R>) -> Self {
+        Self {
+            reader,
+            undecodable: 0,
+        }
+    }
 }
 
 pub struct TransportV2Writer<W> {
@@ -123,11 +224,21 @@ where
                     hex = contents[..contents.len().min(64)].iter().map(|b| format!("{b:02x}")).collect::<String>(),
                     "v2 deserialize failed: {e:#}"
                 );
-                return Err(common::anyhow::Error::new(e).context(Fault::Decode))
-                    .context("v2 deserialize");
+                return match v2_undecodable(contents) {
+                    Some(msg) => {
+                        self.undecodable = self.undecodable.saturating_add(1);
+                        Ok(msg)
+                    }
+                    None => Err(common::anyhow::Error::new(e).context(Fault::Decode))
+                        .context("v2 deserialize"),
+                };
             }
         };
         Ok(msg.into_payload())
+    }
+
+    fn undecodable(&self) -> u32 {
+        self.undecodable
     }
 }
 
@@ -152,6 +263,7 @@ where
 pub struct TransportV1Reader<R> {
     reader: R,
     state: V1ReadState,
+    undecodable: u32,
 }
 
 enum V1ReadState {
@@ -173,6 +285,7 @@ impl<R> TransportV1Reader<R> {
                 buf: [0u8; 24],
                 pos: 0,
             },
+            undecodable: 0,
         }
     }
 }
@@ -254,13 +367,20 @@ where
                         hex = buf[24..buf.len().min(88)].iter().map(|b| format!("{b:02x}")).collect::<String>(),
                         "v1 deserialize failed: {e}"
                     );
+                    let fallback = undecodable(&header[4..16], &buf[24..]);
                     // Reset state for the next message.
                     self.state = V1ReadState::Header {
                         buf: [0u8; 24],
                         pos: 0,
                     };
-                    return Err(common::anyhow::Error::new(e).context(Fault::Decode))
-                        .context("v1 deserialize");
+                    return match fallback {
+                        Some(msg) => {
+                            self.undecodable = self.undecodable.saturating_add(1);
+                            Ok(msg)
+                        }
+                        None => Err(common::anyhow::Error::new(e).context(Fault::Decode))
+                            .context("v1 deserialize"),
+                    };
                 }
             };
 
@@ -273,6 +393,10 @@ where
         } else {
             unreachable!()
         }
+    }
+
+    fn undecodable(&self) -> u32 {
+        self.undecodable
     }
 }
 
@@ -292,5 +416,121 @@ where
             .await
             .context(Fault::Write)
             .context("v1 write")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::bitcoin::hashes::sha256d;
+
+    /// A v1 frame as the peer would put it on the wire.
+    fn frame(command: &[u8; 12], payload: &[u8]) -> Vec<u8> {
+        let mut f = serialize(&Magic::REGTEST);
+        f.extend_from_slice(command);
+        f.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        f.extend_from_slice(&sha256d::Hash::hash(payload).to_byte_array()[..4]);
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// A payload that will not deserialize under a command we can read comes
+    /// up as that command with the raw bytes, is counted, and the frame after
+    /// it reads as it always did.
+    #[tokio::test]
+    async fn test_v1_undecodable_payload_is_skipped_not_fatal() {
+        // An addrv2 declaring one entry and then running out of bytes.
+        let bad = [0x01, 0xff, 0xff];
+        let mut stream = frame(b"addrv2\0\0\0\0\0\0", &bad);
+        stream.extend(serialize(&RawNetworkMessage::new(
+            Magic::REGTEST,
+            NetworkMessage::Ping(7),
+        )));
+        let mut reader = TransportV1Reader::new(&stream[..]);
+
+        match reader.recv().await.unwrap() {
+            NetworkMessage::Unknown { command, payload } => {
+                assert_eq!(command.as_ref(), "addrv2");
+                assert_eq!(payload, bad);
+            }
+            other => panic!("expected the frame as Unknown: {other:?}"),
+        }
+        assert!(matches!(
+            reader.recv().await.unwrap(),
+            NetworkMessage::Ping(7)
+        ));
+        assert_eq!(reader.undecodable(), 1);
+    }
+
+    /// A frame whose command is not a command string still ends the session
+    /// with a decode fault: nothing about it can be trusted.
+    #[tokio::test]
+    async fn test_v1_unreadable_command_is_a_decode_fault() {
+        let stream = frame(b"\xff\xfe{versio\0\0\0", &[0xff]);
+        let mut reader = TransportV1Reader::new(&stream[..]);
+
+        let err = reader.recv().await.unwrap_err();
+        assert_eq!(fault_of(&err), Some(Fault::Decode));
+        assert_eq!(reader.undecodable(), 0);
+    }
+
+    /// The v2 fallback names the command from the short id table or the
+    /// spelled-out command, and gives up on anything outside both.
+    #[test]
+    fn test_v2_undecodable_names_the_command() {
+        let unknown = |msg: Option<NetworkMessage>| match msg {
+            Some(NetworkMessage::Unknown { command, payload }) => (command.to_string(), payload),
+            other => panic!("expected Unknown: {other:?}"),
+        };
+        assert_eq!(
+            unknown(v2_undecodable(&[28, 1, 2, 3])),
+            ("addrv2".to_owned(), vec![1, 2, 3])
+        );
+        let mut spelled = vec![0u8];
+        spelled.extend_from_slice(b"wtxidrelay\0\0");
+        spelled.push(9);
+        assert_eq!(
+            unknown(v2_undecodable(&spelled)),
+            ("wtxidrelay".to_owned(), vec![9])
+        );
+
+        assert!(v2_undecodable(&[]).is_none());
+        assert!(v2_undecodable(&[29]).is_none());
+        assert!(v2_undecodable(&[0, b'a']).is_none());
+    }
+
+    /// The short id table, held to the decoder that owns the same mapping
+    /// rather than read over by eye.
+    ///
+    /// A command whose payload is a vector decodes from a single zero byte,
+    /// and one with no payload from no bytes at all, so for those ids
+    /// rust-bitcoin will say which command the id is. Nine of the twenty-eight
+    /// answer today -- addrv2 among them, and it is the last entry, so an id
+    /// inserted or dropped anywhere before it shifts one of the nine and fails
+    /// here.
+    #[test]
+    fn test_the_short_id_table_agrees_with_the_decoder() {
+        let mut checked = Vec::new();
+        for id in 1..=SHORT_IDS.len() as u8 {
+            // The two shapes a payload-free probe can take; an id the decoder
+            // cannot answer for either way is left to the BIP.
+            for probe in [vec![id], vec![id, 0x00]] {
+                let Ok(decoded) = deserialize::<V2NetworkMessage>(&probe) else {
+                    continue;
+                };
+                let Some(NetworkMessage::Unknown { command, .. }) = v2_undecodable(&probe) else {
+                    panic!("short id {id} is not in the table");
+                };
+                assert_eq!(
+                    command.to_string(),
+                    decoded.into_payload().command().to_string(),
+                    "short id {id}"
+                );
+                checked.push(id);
+            }
+        }
+        // Without this the test would also pass if the decoder stopped
+        // answering for anything at all.
+        assert_eq!(checked, [1, 6, 7, 11, 13, 14, 15, 17, 28]);
     }
 }
