@@ -1010,10 +1010,7 @@ pub(crate) fn build_version(user_agent: &str, start_height: i32) -> NetworkMessa
             &SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             ServiceFlags::NONE,
         ),
-        // Since we don't accept inbound connections, we don't have to fear about
-        // connecting to ourself. The peer likely won't use zero to open a connection
-        // at the same time, so this should be fine.
-        nonce: 0,
+        nonce: rand::random(),
         user_agent: UserAgent::from_nonstandard(user_agent),
         start_height,
         relay: false,
@@ -1152,6 +1149,18 @@ mod tests {
         w.0.iter()
             .filter(|m| matches!(m, NetworkMessage::GetHeaders(_)))
             .count()
+    }
+
+    #[test]
+    fn test_version_nonce_is_fresh() {
+        let nonce = |msg: NetworkMessage| match msg {
+            NetworkMessage::Version(v) => v.nonce,
+            other => panic!("not a version message: {other:?}"),
+        };
+        let first = nonce(build_version(USER_AGENT, 0));
+        let second = nonce(build_version(USER_AGENT, 0));
+        assert_ne!(first, 0);
+        assert_ne!(first, second);
     }
 
     #[test]
