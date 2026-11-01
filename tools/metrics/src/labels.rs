@@ -147,6 +147,11 @@ pub fn command(raw: &str) -> &str {
 
 /// Service bits by name, as Bitcoin Core knows them. A bit without a name
 /// is `bit_<n>`, which is precisely the bit worth noticing.
+///
+/// A field with every bit set is `all`, on its own: it is not a peer
+/// advertising sixty-four services but a few sources gossiping a filled-in
+/// field, and split into bits it put hundreds of thousands of entries on
+/// every unnamed bit and drowned the real ones.
 pub fn service_bits(services: u64) -> Vec<String> {
     const NAMED: &[(u64, &str)] = &[
         (1, "network"),
@@ -160,6 +165,9 @@ pub fn service_bits(services: u64) -> Vec<String> {
     ];
     if services == 0 {
         return vec!["none".to_owned()];
+    }
+    if services == u64::MAX {
+        return vec!["all".to_owned()];
     }
     (0..64)
         .filter(|bit| services & (1u64 << bit) != 0)
@@ -270,6 +278,9 @@ mod tests {
             vec!["network", "bloom", "witness", "network_limited"]
         );
         assert_eq!(service_bits(1 << 40), vec!["bit_40"]);
+        // Every bit set is one label, not sixty-four.
+        assert_eq!(service_bits(u64::MAX), vec!["all"]);
+        assert_eq!(service_bits(u64::MAX - 1).len(), 63);
     }
 
     #[test]

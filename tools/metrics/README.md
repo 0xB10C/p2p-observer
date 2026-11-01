@@ -72,7 +72,10 @@ labels come from the peer. Those are normalised and then capped:
 - Protocol versions are capped the same way, at 32.
 - A message command outside the known P2P commands is `other`.
 - A service bit without a name is `bit_<n>`: at most 64 values, and the
-  unnamed one is exactly the one worth seeing.
+  unnamed one is exactly the one worth seeing. A field with every bit set
+  is `all`, one label rather than sixty-four: it is a filled-in field from a
+  few sources, not a peer advertising every service, and split into bits it
+  put the same hundreds of thousands of entries on every unnamed bit.
 
 There is no per-peer or per-connection series: nothing is labelled by
 address, ASN or connection id.
