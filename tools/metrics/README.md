@@ -44,7 +44,10 @@ The **network** metrics are what the events say about the peers:
 
 - Attempts and sessions: `connection_attempts_total` by result and reason,
   `connection_setup_seconds`, `session_duration_seconds`,
-  `session_messages_total` by command, `unsolicited_pongs_total`.
+  `session_messages_total` by command, `unsolicited_pongs_total`, and
+  `silent_sessions_total`, sessions in which the peer sent nothing after the
+  handshake. A fleet that connects, says nothing and hangs up on a timer is
+  invisible in the handshake counts and plain here.
 - Handshakes: `handshakes_total` by transport, and the peer's claims by user
   agent, protocol version, service bit and feature; `handshake_clock_skew_seconds`;
   `handshake_height_delta` against `best_height`, the highest height any
