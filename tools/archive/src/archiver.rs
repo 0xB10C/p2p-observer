@@ -579,6 +579,7 @@ mod tests {
                 sendaddrv2: true,
                 wtxid_relay: true,
                 user_agent: "/Satoshi:30.0.0/".to_owned(),
+                nonce: 0x1234_5678_9abc_def0,
             })),
             ..Default::default()
         }

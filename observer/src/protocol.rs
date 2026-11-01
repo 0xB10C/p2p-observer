@@ -381,6 +381,7 @@ fn emit_handshake(
                     sendaddrv2: info.send_addr_v2,
                     wtxid_relay: info.wtxid_relay,
                     user_agent: version.user_agent.to_string(),
+                    nonce: version.nonce,
                 },
             )),
             ..Default::default()
