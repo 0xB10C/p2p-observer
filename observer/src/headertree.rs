@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -32,6 +32,39 @@ const RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 /// would cost a block interval of being behind. Three is what Bitcoin Core
 /// settled on for block downloads, for the same reason.
 const RECOVERY_PEERS: u8 = 3;
+
+/// Headers the tree has rejected that it keeps the reason for.
+///
+/// A rejected header's descendants are rejected for the same reason without
+/// being asked for: another chain on this network's magic announces a block
+/// every few minutes from hundreds of peers, and without this every one of
+/// those was an orphan the tree asked three peers to explain, and the reply
+/// -- two thousand headers off a fork below the checkpoint -- was rejected
+/// and forgotten in time for the next block. Bounded because the hashes come
+/// from peers; at a few hundred a day this is weeks of such a chain.
+const REJECTED_REMEMBERED: usize = 8192;
+
+/// How much easier than our own tip's target an unplaceable header's target
+/// may be before the chain it belongs to is read as weaker than ours.
+///
+/// A retarget can legitimately ease the target fourfold, which is the most a
+/// peer a little ahead of us can show, so anything inside that is left as an
+/// ordinary orphan. The fork this exists for is three orders of magnitude
+/// easier: on mainnet its blocks have sixteen leading zero digits where the
+/// chain has nineteen to twenty-one.
+///
+/// Only consulted on networks that do not allow minimum-difficulty blocks.
+/// On testnet an honest header really can be difficulty 1, and nothing can be
+/// told from its target at all.
+///
+/// The comparison is against our own tip, so it assumes the tip is roughly
+/// current, which the header sync at startup and the recovery requests after
+/// it are there to keep true. A tree left many retarget periods behind would
+/// be comparing against a difficulty the network has moved away from -- and
+/// one still at genesis simply never finds anything weaker, since nothing is
+/// easier than difficulty 1, so a fresh observer under-detects rather than
+/// dropping honest peers.
+const WEAKER_CHAIN_FACTOR: f64 = 4.0;
 
 /// The requests out for one block the tree does not have.
 struct Recovery {
@@ -126,17 +159,49 @@ pub(crate) struct HeaderTree {
     /// hold up the next; shared across connections, which is what makes it a
     /// throttle rather than a per-peer courtesy.
     recovery: HashMap<BlockHash, Recovery>,
+    /// Headers rejected by validation, or descended from one that was, with
+    /// why. Oldest first in `rejected_order`, which is what bounds it. See
+    /// [`REJECTED_REMEMBERED`].
+    rejected: HashMap<BlockHash, HeaderError>,
+    rejected_order: VecDeque<BlockHash>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeaderError {
     OrphanHeader,
+    /// The parent is unknown and the header's own target is far easier than
+    /// our chain's, so whatever chain it belongs to is weaker than ours.
+    WeakerChain,
     InvalidPow,
     TargetTooEasy,
     /// A header at a checkpoint height with another hash.
     CheckpointMismatch,
     /// A header at or below a checkpoint the tree has reached.
     ForkBelowCheckpoint,
+}
+
+impl HeaderError {
+    /// Whether this says the peer follows a chain we will never accept,
+    /// rather than that we are behind.
+    ///
+    /// A fork at or below a checkpoint we hold, a different block at a
+    /// checkpoint height, or work that does not meet this network's rules:
+    /// each means the peer built on history we have already rejected, and our
+    /// own chain carries the work to that point. An orphan is the opposite --
+    /// the tree is behind and the peer is ahead of it -- and a valid header on
+    /// a side branch is not here at all, because the tree accepts it: a fork
+    /// with less work than our tip is an ordinary race that resolves in
+    /// minutes, and a peer on one is still a peer on our chain.
+    pub(crate) fn is_other_chain(&self) -> bool {
+        match self {
+            HeaderError::OrphanHeader => false,
+            HeaderError::WeakerChain
+            | HeaderError::InvalidPow
+            | HeaderError::TargetTooEasy
+            | HeaderError::CheckpointMismatch
+            | HeaderError::ForkBelowCheckpoint => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +226,7 @@ impl std::fmt::Display for HeaderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HeaderError::OrphanHeader => write!(f, "parent header not in tree"),
+            HeaderError::WeakerChain => write!(f, "unplaceable header of a weaker chain"),
             HeaderError::InvalidPow => write!(f, "invalid proof of work"),
             HeaderError::TargetTooEasy => write!(f, "target exceeds maximum"),
             HeaderError::CheckpointMismatch => write!(f, "hash differs from the checkpoint"),
@@ -197,6 +263,8 @@ impl HeaderTree {
             reached_checkpoint: None,
             pruned: 0,
             recovery: HashMap::new(),
+            rejected: HashMap::new(),
+            rejected_order: VecDeque::new(),
         }
     }
 
@@ -302,15 +370,37 @@ impl HeaderTree {
             return Ok(false);
         }
 
-        let parent = self
-            .headers
-            .get(&header.prev_blockhash)
-            .ok_or(HeaderError::OrphanHeader)?;
+        let parent = match self.headers.get(&header.prev_blockhash) {
+            Some(parent) => parent,
+            // The parent is not in the tree. When that is because the tree
+            // threw it out, this header goes the same way, for the same
+            // reason, and nobody is asked for headers to explain it.
+            None => {
+                return Err(match self.rejected.get(&header.prev_blockhash).copied() {
+                    Some(reason) => {
+                        self.remember_rejected(hash, reason);
+                        reason
+                    }
+                    // Nothing says where this header sits, but its own target
+                    // says how much work its chain puts into a block. Far
+                    // below ours is not a chain we are behind on.
+                    None if self.weaker_than_our_tip(&header) => {
+                        self.remember_rejected(hash, HeaderError::WeakerChain);
+                        HeaderError::WeakerChain
+                    }
+                    None => HeaderError::OrphanHeader,
+                });
+            }
+        };
         let height = parent.height + 1;
+        let parent_work = parent.chain_work;
 
-        self.validate_header(&header, height, parent)?;
+        if let Err(e) = self.validate_header(&header, height, parent) {
+            self.remember_rejected(hash, e);
+            return Err(e);
+        }
 
-        let chain_work = parent.chain_work + header.work();
+        let chain_work = parent_work + header.work();
         self.headers.insert(
             hash,
             HeaderEntry {
@@ -356,14 +446,15 @@ impl HeaderTree {
         let mut accepted = 0;
         let mut err = None;
 
+        // Carries on past a rejected header rather than stopping at it, so
+        // that the headers built on it in the same message are recorded as
+        // rejected too. The first error is the one reported: it is the one
+        // that explains the rest.
         for header in headers {
             match self.insert_inner(*header, true) {
                 Ok(true) => accepted += 1,
                 Ok(false) => {} // already known, skip
-                Err(e) => {
-                    err = Some(e);
-                    break;
-                }
+                Err(e) => err = err.or(Some(e)),
             }
         }
 
@@ -456,13 +547,55 @@ impl HeaderTree {
         (self.tip, self.tip_height)
     }
 
-    pub(crate) fn contains(&self, hash: &BlockHash) -> bool {
-        self.headers.contains_key(hash)
-    }
-
     /// The height of a header the tree holds.
     pub(crate) fn height_of(&self, hash: &BlockHash) -> Option<u32> {
         self.headers.get(hash).map(|e| e.height)
+    }
+
+    /// Why the tree rejected a header, if it did and still remembers.
+    pub(crate) fn rejection_of(&self, hash: &BlockHash) -> Option<HeaderError> {
+        self.rejected.get(hash).copied()
+    }
+
+    /// Whether an unplaceable header's own target is so much easier than our
+    /// tip's that its chain cannot be the one we are behind on.
+    ///
+    /// The header's target is the one thing it carries that can be read
+    /// without its parent: it is what that chain's own retarget rules asked
+    /// of this block. See [`WEAKER_CHAIN_FACTOR`].
+    fn weaker_than_our_tip(&self, header: &Header) -> bool {
+        if self.params.allow_min_difficulty_blocks {
+            return false;
+        }
+        let Some(tip) = self.headers.get(&self.tip) else {
+            return false;
+        };
+        let ours = tip.header.target().difficulty_float(&self.params);
+        let theirs = header.target().difficulty_float(&self.params);
+        theirs * WEAKER_CHAIN_FACTOR < ours
+    }
+
+    /// Whether this block has reached the tree at all, accepted or rejected.
+    ///
+    /// What "new to us" is judged by, and the reason it is not
+    /// [`Self::contains`]: a block the tree refuses is never held, so every
+    /// announcement of it looked like the first. Two peers on another chain
+    /// announcing the same block counted as two blocks, and on signet that
+    /// turned thirty of their blocks into sixty first sightings.
+    pub(crate) fn seen(&self, hash: &BlockHash) -> bool {
+        self.headers.contains_key(hash) || self.rejected.contains_key(hash)
+    }
+
+    fn remember_rejected(&mut self, hash: BlockHash, reason: HeaderError) {
+        if self.rejected.insert(hash, reason).is_some() {
+            return;
+        }
+        self.rejected_order.push_back(hash);
+        while self.rejected_order.len() > REJECTED_REMEMBERED {
+            if let Some(old) = self.rejected_order.pop_front() {
+                self.rejected.remove(&old);
+            }
+        }
     }
 
     /// Whether a connection that has just found `missing` absent from the tree
@@ -910,10 +1043,10 @@ mod tests {
 
         // Both forks should be preserved
         for header in &chain_a {
-            assert!(loaded.contains(&header.block_hash()));
+            assert!(loaded.height_of(&header.block_hash()).is_some());
         }
         for header in &chain_b {
-            assert!(loaded.contains(&header.block_hash()));
+            assert!(loaded.height_of(&header.block_hash()).is_some());
         }
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1101,7 +1234,7 @@ mod tests {
 
         // Chain A headers are still in the tree
         for header in &chain_a {
-            assert!(tree.contains(&header.block_hash()));
+            assert!(tree.height_of(&header.block_hash()).is_some());
         }
 
         // Total headers: genesis + 10 (chain A) + 12 (chain B) = 23
@@ -1376,7 +1509,7 @@ mod tests {
         assert_eq!(tree.tip().1, 4);
         // Reaching the checkpoint pruned B's two headers below it.
         assert_eq!(tree.len(), 5);
-        assert!(!tree.contains(&chain_b[0].block_hash()));
+        assert!(tree.height_of(&chain_b[0].block_hash()).is_none());
     }
 
     #[test]
@@ -1401,6 +1534,100 @@ mod tests {
         assert_eq!(tree.chain_tips().len(), 2);
     }
 
+    /// An unplaceable header whose own target is far easier than our tip's
+    /// belongs to a weaker chain, which is a different thing from the tree
+    /// being behind. This is how the fork on mainnet is recognised: it never
+    /// hands us a header we can place, only compact blocks of its own chain,
+    /// and its blocks take a fraction of the work ours do.
+    #[test]
+    fn test_an_unplaceable_header_of_a_weaker_chain_is_not_an_orphan() {
+        use common::bitcoin::{
+            CompactTarget, Network, TxMerkleNode, blockdata::block::Version, network::Params,
+            time::BlockTime,
+        };
+
+        // Mainnet, so the tip is the genesis block at difficulty 1 and the
+        // network does not allow minimum-difficulty blocks.
+        let mut tree = HeaderTree::new(Params::new(Network::Bitcoin));
+        let orphan = |bits: u32, seed: u8| Header {
+            version: Version::ONE,
+            // A parent the tree has never seen, so nothing can place it.
+            prev_blockhash: BlockHash::from_byte_array([seed; 32]),
+            merkle_root: TxMerkleNode::from_byte_array([seed; 32]),
+            time: BlockTime::from(1_700_000_000),
+            bits: CompactTarget::from_consensus(bits),
+            nonce: 0,
+        };
+
+        // Same difficulty as our tip: we are simply behind, and the tree says
+        // so, which is what sends a getheaders rather than ending a session.
+        let (_, err) = tree.insert_batch(&[orphan(0x1d00_ffff, 1)]);
+        assert_eq!(err, Some(HeaderError::OrphanHeader));
+        assert!(!HeaderError::OrphanHeader.is_other_chain());
+
+        // Sixteen times easier. No chain that costs this little per block is
+        // the chain we are behind on.
+        let weak = orphan(0x1e00_ffff, 2);
+        let (_, err) = tree.insert_batch(&[weak]);
+        assert_eq!(err, Some(HeaderError::WeakerChain));
+        assert!(HeaderError::WeakerChain.is_other_chain());
+        // Remembered, so the next block of that chain needs no judging of its
+        // own and no peer is asked to explain it.
+        assert_eq!(
+            tree.rejection_of(&weak.block_hash()),
+            Some(HeaderError::WeakerChain)
+        );
+        let child = Header {
+            prev_blockhash: weak.block_hash(),
+            ..orphan(0x1e00_ffff, 3)
+        };
+        let (_, err) = tree.insert_batch(&[child]);
+        assert_eq!(err, Some(HeaderError::WeakerChain));
+
+        // On a network where an honest header can be difficulty 1, the target
+        // says nothing and the same header is only an orphan.
+        let mut testnet = HeaderTree::new(Params::new(Network::Testnet(
+            common::bitcoin::network::TestnetVersion::V3,
+        )));
+        let (_, err) = testnet.insert_batch(&[orphan(0x1e00_ffff, 2)]);
+        assert_eq!(err, Some(HeaderError::OrphanHeader));
+    }
+
+    /// A header built on a rejected one is rejected for the same reason, not
+    /// reported as an orphan the tree should go and ask about.
+    #[test]
+    fn test_descendants_of_a_rejected_header_inherit_the_reason() {
+        let genesis = regtest_tree().tip().0;
+        let chain_a = mine_chain(genesis, 5, 0);
+        let mut tree =
+            HeaderTree::with_checkpoints(regtest_params(), vec![checkpoint_at(&chain_a, 3)]);
+        tree.insert_batch(&chain_a);
+
+        // Another chain forking below the checkpoint, announced block by
+        // block as its peers would, then two at once.
+        let fork = mine_chain(chain_a[0].block_hash(), 4, 7);
+        let (_, err) = tree.insert_batch(&fork[..1]);
+        assert_eq!(err, Some(HeaderError::ForkBelowCheckpoint));
+        let (_, err) = tree.insert_batch(&fork[1..2]);
+        assert_eq!(err, Some(HeaderError::ForkBelowCheckpoint), "inherited");
+        let (accepted, err) = tree.insert_batch(&fork[2..]);
+        assert_eq!((accepted, err), (0, Some(HeaderError::ForkBelowCheckpoint)));
+        for h in &fork {
+            assert_eq!(
+                tree.rejection_of(&h.block_hash()),
+                Some(HeaderError::ForkBelowCheckpoint)
+            );
+            assert!(tree.height_of(&h.block_hash()).is_none());
+        }
+
+        // A header whose parent the tree has simply never seen is still an
+        // orphan, and nothing is remembered about it.
+        let stray = mine_header(BlockHash::from_byte_array([0xab; 32]), 1296688700, 9);
+        let (_, err) = tree.insert_batch(&[stray]);
+        assert_eq!(err, Some(HeaderError::OrphanHeader));
+        assert_eq!(tree.rejection_of(&stray.block_hash()), None);
+    }
+
     #[test]
     fn test_forks_allowed_before_the_checkpoint_is_reached() {
         let genesis = regtest_tree().tip().0;
@@ -1415,7 +1642,7 @@ mod tests {
         tree.insert_batch(&chain_a);
         // Reaching it cleans up.
         assert_eq!(tree.len(), 6);
-        assert!(!tree.contains(&chain_b[1].block_hash()));
+        assert!(tree.height_of(&chain_b[1].block_hash()).is_none());
         assert_eq!(tree.tip().1, 5);
     }
 
@@ -1442,7 +1669,7 @@ mod tests {
         assert_eq!(loaded.tip().0, real[5].block_hash());
         assert_eq!(loaded.chain_tips().len(), 1);
         for h in &stray {
-            assert!(!loaded.contains(&h.block_hash()));
+            assert!(loaded.height_of(&h.block_hash()).is_none());
         }
         // The load is dirty: the next save writes the pruned tree.
         assert!(loaded.dirty);

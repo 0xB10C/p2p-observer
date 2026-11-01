@@ -172,9 +172,29 @@ All in `policy.rs`, all pure. Starting values, each with ±10% jitter:
 | Our own fault: proxy down | 30s | — |
 | Our own fault: no route | 1h | — |
 | Our own fault: network disabled | 24h | — |
+| Peer is on a chain we refuse | 24h | — |
 | Manual | 60s fixed | — |
 
 `n` is consecutive failures, `k` consecutive short sessions.
+
+### A chain we refuse is not a failure either
+
+A peer that sends a header this observer's tree refuses has told us which
+chain it follows, and it is not ours. The address is as reachable as any
+good one, so nothing is counted against it and its class does not move; it is
+simply not a peer on this network. The session ends there and the address
+waits a day, which is the one delay that also applies to the operator's own
+addresses: they asked for a peer on this network, and reconnecting every
+minute to be told the same thing is not what they asked for.
+
+The verdict comes from the header tree, never from a user agent or a claimed
+height. Both lie, and on one network the fork claims to be thousands of
+blocks ahead while on another it claims to be behind. What cannot be faked is
+the work in a header: a fork at or below a checkpoint we hold, a different
+block at a checkpoint height, work that does not meet the network's rules, or
+an unplaceable header whose own target is a fraction of our tip's. Being
+behind looks different -- the parent is simply missing, at our own difficulty
+-- and that still asks the peer for headers rather than hanging up.
 
 ### `OurFault` is not a failure
 

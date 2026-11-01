@@ -513,6 +513,14 @@ impl Book {
             // Our own fault: no route, proxy down. Says nothing about the
             // peer, so no counter moves and the class does not change.
             Outcome::OurFault(_) => {}
+            // It answered and handshook, so it is as reachable as any good
+            // address; only the chain is wrong, and the delay says the rest.
+            // Counting it as a short session would back it off as an eviction
+            // on top of the day it already has.
+            Outcome::OtherChain => {
+                entry.last_attempt_failed = false;
+                entry.failures = 0;
+            }
             Outcome::Disconnected { .. } => {
                 entry.last_attempt_failed = false;
                 entry.failures = 0;
@@ -1103,6 +1111,43 @@ mod tests {
             Class::Unknown,
             "our own fault must not make an address look bad"
         );
+    }
+
+    /// A peer on a chain we refuse is due again in a day, with nothing held
+    /// against the address and its eviction count untouched.
+    #[test]
+    fn test_another_chain_is_due_in_a_day() {
+        let mut t = Book::new(100, 1);
+        let addr = ip(1, 2, 3, 4);
+        insert(&mut t, addr, Class::Unknown);
+        t.record_connected(addr, NOW, 0, 2);
+        // A short session first, so there is a counter to leave alone.
+        t.record_ended(
+            addr,
+            NOW,
+            Outcome::Disconnected {
+                uptime_secs: 2,
+                silent: false,
+            },
+        );
+        assert_eq!(t.entry(&addr).unwrap().short_sessions, 1);
+
+        t.record_ended(addr, NOW, Outcome::OtherChain);
+        let e = t.entry(&addr).unwrap();
+        let delay = e.next_attempt - NOW;
+        // A day, give or take the jitter every delay gets.
+        assert!(
+            (77_760..=95_040).contains(&delay),
+            "expected about a day, got {delay}"
+        );
+        assert_eq!(e.failures, 0);
+        assert!(!e.last_attempt_failed);
+        assert_eq!(
+            e.short_sessions, 1,
+            "the eviction count is not ours to move"
+        );
+        // It connected, so it is still an address worth keeping.
+        assert_eq!(e.class(), Class::Good);
     }
 
     #[test]

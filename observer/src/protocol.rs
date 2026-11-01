@@ -42,6 +42,33 @@ impl std::fmt::Display for SyncComplete {
 
 impl std::error::Error for SyncComplete {}
 
+/// The peer sent a header from a chain we will never accept, so the session
+/// ends. Carries why the tree refused it.
+///
+/// A sentinel error rather than a quiet return, for the same reason
+/// [`SyncComplete`] is one: the message loop's only way out is an error, and
+/// the caller needs to tell this apart from a peer that went away -- it
+/// decides both what the connection result says and how long the address
+/// manager leaves the address alone.
+#[derive(Debug, Clone)]
+pub(crate) struct OtherChain {
+    pub(crate) reason: HeaderError,
+}
+
+impl std::fmt::Display for OtherChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "peer is on another chain: {}", self.reason)
+    }
+}
+
+impl std::error::Error for OtherChain {}
+
+/// The other-chain verdict carried by an error, if it carries one.
+pub(crate) fn other_chain_of(err: &common::anyhow::Error) -> Option<&OtherChain> {
+    err.downcast_ref::<OtherChain>()
+        .or_else(|| err.chain().find_map(|c| c.downcast_ref::<OtherChain>()))
+}
+
 pub(crate) const USER_AGENT: &str = "/p2p-observer:0.1.0/";
 
 /// Maximum time allowed for the version handshake once the transport is up.
@@ -531,7 +558,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             match item {
                 Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
                     tracing::info!(target: TARGET, %hash, "inv: block");
-                    let known = self.header_tree.read().unwrap().contains(&hash);
+                    let known = self.header_tree.read().unwrap().seen(&hash);
                     self.emit_block_announcement(
                         hash,
                         common::events::AnnouncementType::Inv,
@@ -547,7 +574,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                 }
                 Inventory::CompactBlock(hash) => {
                     tracing::info!(target: TARGET, %hash, "inv: compact block");
-                    let known = self.header_tree.read().unwrap().contains(&hash);
+                    let known = self.header_tree.read().unwrap().seen(&hash);
                     self.emit_block_announcement(
                         hash,
                         common::events::AnnouncementType::Inv,
@@ -589,12 +616,9 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         // mean anything.
         let known_before: Vec<bool> = {
             let tree = self.header_tree.read().unwrap();
-            headers
-                .iter()
-                .map(|h| tree.contains(&h.block_hash()))
-                .collect()
+            headers.iter().map(|h| tree.seen(&h.block_hash())).collect()
         };
-        let accepted = self.accept_headers(&headers).await?;
+        let (accepted, other_chain) = self.accept_headers(&headers).await?;
 
         if !self.sync_headers {
             if headers.len() > MAX_HEADERS_ANNOUNCED {
@@ -612,6 +636,12 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             }
         }
 
+        // The announcements are out, so the block and the reason it has no
+        // height are recorded. Now the session ends.
+        if let Some(reason) = other_chain {
+            return Err(OtherChain { reason }.into());
+        }
+
         if self.sync_headers && accepted > 0 {
             self.send_getheaders().await?;
         }
@@ -621,16 +651,22 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
 
     /// Offer headers to the tree, and ask this peer for more if they show the
     /// tree to be behind. Returns how many were new.
+    /// Returns how many headers were new, and the verdict when the peer has
+    /// just shown itself to be on a chain we refuse. The verdict is handed
+    /// back rather than raised here so the caller can publish the
+    /// announcement first: the block it carried is an observation, and the
+    /// archive should have it along with the reason it has no height.
     async fn accept_headers(
         &mut self,
         headers: &[common::bitcoin::block::Header],
-    ) -> Result<usize> {
+    ) -> Result<(usize, Option<HeaderError>)> {
         let (accepted, err) = self.header_tree.write().unwrap().insert_batch(headers);
         let (tip, height) = self.header_tree.read().unwrap().tip();
 
         if accepted > 0 {
             tracing::info!(target: TARGET, accepted, height, %tip, "headers inserted");
         }
+        let mut other_chain = None;
         match err {
             // The parent is missing: the tree is behind, and only a getheaders
             // catches it up. During the initial sync that cannot happen, since
@@ -643,10 +679,18 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                     self.recover_headers(newest.block_hash(), true).await?;
                 }
             }
-            Some(e) => tracing::warn!(target: TARGET, "header insert error: {e}"),
+            // Rejected, or built on something that was. A peer that sends us
+            // a header of a chain we refuse is telling us which chain it
+            // follows, which is the one thing worth acting on here.
+            Some(e) => {
+                tracing::debug!(target: TARGET, "header not placed: {e}");
+                if e.is_other_chain() {
+                    other_chain = Some(e);
+                }
+            }
             None => {}
         }
-        Ok(accepted)
+        Ok((accepted, other_chain))
     }
 
     /// Ask this peer for headers because an announcement has just shown the
@@ -662,6 +706,17 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     /// announcement carried its header.
     async fn recover_headers(&mut self, missing: BlockHash, proven: bool) -> Result<()> {
         if self.asked_for == Some(missing) {
+            return Ok(());
+        }
+        // Not missing: refused. Asking for it again would fetch the same
+        // chain and refuse it again.
+        if self
+            .header_tree
+            .read()
+            .unwrap()
+            .rejection_of(&missing)
+            .is_some()
+        {
             return Ok(());
         }
         if !self
@@ -684,12 +739,12 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         let header = cmpct.compact_block.header;
         let hash = header.block_hash();
         tracing::info!(target: TARGET, %hash, "compact block");
-        let known = self.header_tree.read().unwrap().contains(&hash);
+        let known = self.header_tree.read().unwrap().seen(&hash);
         let shape = common::events::CompactBlockShape {
             short_ids: cmpct.compact_block.short_ids.len() as u32,
             prefilled_txs: cmpct.compact_block.prefilled_txs.len() as u32,
         };
-        self.accept_headers(&[header]).await?;
+        let (_, other_chain) = self.accept_headers(&[header]).await?;
         self.emit_block_announcement(
             hash,
             common::events::AnnouncementType::CompactBlock,
@@ -697,6 +752,9 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             !known,
             Some(shape),
         );
+        if let Some(reason) = other_chain {
+            return Err(OtherChain { reason }.into());
+        }
         if self.probe_compact_blocks {
             self.request_compact_block_coinbase(hash).await?;
         }
@@ -711,8 +769,23 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         new_to_us: bool,
         compact_block: Option<common::events::CompactBlockShape>,
     ) {
+        use common::events::{AnnouncementType, Unplaced};
         // Looked up after any insertion, so a header just accepted has one.
-        let height = self.header_tree.read().unwrap().height_of(&hash);
+        let (height, unplaced) = {
+            let tree = self.header_tree.read().unwrap();
+            let height = tree.height_of(&hash);
+            let unplaced = match (height, tree.rejection_of(&hash)) {
+                (Some(_), _) => None,
+                (None, Some(reason)) => Some(unplaced_for(reason)),
+                // No header has been seen for a bare inv; any other
+                // announcement carried one, so the tree lacks its parent.
+                (None, None) if announcement_type == AnnouncementType::Inv => {
+                    Some(Unplaced::NoHeader)
+                }
+                (None, None) => Some(Unplaced::Orphan),
+            };
+            (height, unplaced)
+        };
         self.emit_event(common::events::peer_event::Event::BlockAnnouncement(
             common::events::BlockAnnouncement {
                 block_hash: hash.to_string(),
@@ -726,6 +799,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                 height,
                 new_to_us,
                 compact_block,
+                unplaced: unplaced.map(i32::from),
             },
         ));
     }
@@ -1009,6 +1083,18 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     }
 }
 
+/// Why the tree refused a header, as the archive says it.
+fn unplaced_for(reason: HeaderError) -> common::events::Unplaced {
+    use common::events::Unplaced;
+    match reason {
+        HeaderError::OrphanHeader => Unplaced::Orphan,
+        HeaderError::WeakerChain => Unplaced::WeakerChain,
+        HeaderError::InvalidPow | HeaderError::TargetTooEasy => Unplaced::InvalidPow,
+        HeaderError::CheckpointMismatch => Unplaced::CheckpointMismatch,
+        HeaderError::ForkBelowCheckpoint => Unplaced::ForkBelowCheckpoint,
+    }
+}
+
 pub(crate) fn build_version(user_agent: &str, start_height: i32) -> NetworkMessage {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1202,7 +1288,7 @@ mod tests {
         let mut h = harness(tree.clone());
         h.conn.handle_cmpct_block(compact_block(h1)).await.unwrap();
 
-        assert!(tree.read().unwrap().contains(&h1.block_hash()));
+        assert!(tree.read().unwrap().height_of(&h1.block_hash()).is_some());
         assert_eq!(tree.read().unwrap().tip().1, 1);
         // Announced with its height, and as the first time we saw it.
         let Some(common::events::peer_event::Event::BlockAnnouncement(a)) =
@@ -1300,7 +1386,7 @@ mod tests {
         }
 
         assert!(
-            !tree.read().unwrap().contains(&h2.block_hash()),
+            tree.read().unwrap().height_of(&h2.block_hash()).is_none(),
             "orphan stays out"
         );
         let sent: Vec<usize> = conns
@@ -1308,6 +1394,98 @@ mod tests {
             .map(|c| getheaders_sent(&c.conn.writer))
             .collect();
         assert_eq!(sent, vec![1, 1, 1, 0], "three peers asked, once each");
+        let Some(common::events::peer_event::Event::BlockAnnouncement(a)) =
+            conns[1].events.try_recv().unwrap().event
+        else {
+            panic!("expected an announcement");
+        };
+        assert_eq!(
+            (a.height, a.unplaced()),
+            (None, common::events::Unplaced::Orphan)
+        );
+    }
+
+    /// A peer that sends a header from a chain we refuse is announced with the
+    /// reason, nobody is asked for its headers, and the session ends.
+    #[tokio::test]
+    async fn test_a_refused_chain_is_announced_and_ends_the_session() {
+        use crate::headertree::{Checkpoint, testing::mine_header, testing::regtest_params};
+        use common::events::{Unplaced, peer_event::Event};
+        let (genesis, _) = HeaderTree::new(regtest_params()).tip();
+        let mut chain = Vec::new();
+        let mut prev = genesis;
+        for i in 0..5u32 {
+            let h = mine_header(prev, 1_700_000_000 + i, 0);
+            prev = h.block_hash();
+            chain.push(h);
+        }
+        let checkpoint = Checkpoint {
+            height: 3,
+            hash: chain[2].block_hash(),
+        };
+        let mut tree = HeaderTree::with_checkpoints(regtest_params(), vec![checkpoint]);
+        tree.insert_batch(&chain);
+        let tree = Arc::new(RwLock::new(tree));
+
+        // A fork below the checkpoint, announced block by block from two
+        // connections, as its peers would announce it.
+        let f1 = mine_header(chain[0].block_hash(), 1_700_000_100, 7);
+        let f2 = mine_header(f1.block_hash(), 1_700_000_160, 7);
+        let mut a = harness(tree.clone());
+        let mut b = harness(tree.clone());
+        let announced = |h: &mut Harness| match h.events.try_recv().unwrap().event {
+            Some(Event::BlockAnnouncement(a)) => (a.height, a.unplaced()),
+            other => panic!("not a block announcement: {other:?}"),
+        };
+
+        // The announcement goes out first -- the block is an observation --
+        // and then the session ends with the verdict on it.
+        let err = a.conn.handle_headers(vec![f1]).await.unwrap_err();
+        assert_eq!(announced(&mut a), (None, Unplaced::ForkBelowCheckpoint));
+        let verdict = other_chain_of(&err).expect("an other-chain verdict");
+        assert_eq!(verdict.reason, HeaderError::ForkBelowCheckpoint);
+
+        // The second peer, on the same chain one block further on, gets the
+        // same answer: the fork's own parent is refused, so the descendant is
+        // refused for the same reason without asking anyone.
+        let err = b.conn.handle_headers(vec![f2]).await.unwrap_err();
+        assert_eq!(announced(&mut b), (None, Unplaced::ForkBelowCheckpoint));
+        assert!(other_chain_of(&err).is_some());
+
+        // An inv for a block the tree has already refused is not news and
+        // not worth a getheaders, and it is no longer "new to us" either:
+        // before, every announcement of an unplaceable block was a first
+        // sighting, so two peers on a fork counted as two blocks each time.
+        b.conn
+            .handle_inv(vec![Inventory::Block(f2.block_hash())])
+            .await
+            .unwrap();
+        let Some(Event::BlockAnnouncement(seen)) = b.events.try_recv().unwrap().event else {
+            panic!("expected an announcement");
+        };
+        assert_eq!(
+            (seen.height, seen.unplaced()),
+            (None, Unplaced::ForkBelowCheckpoint)
+        );
+        assert!(!seen.new_to_us);
+        assert_eq!(getheaders_sent(&a.conn.writer), 0);
+        assert_eq!(getheaders_sent(&b.conn.writer), 0);
+    }
+
+    /// Being behind is not being on another chain: an orphan leaves the
+    /// session alone and asks the peer for headers, as it always did.
+    #[tokio::test]
+    async fn test_an_orphan_does_not_end_the_session() {
+        use crate::headertree::testing::{mine_header, regtest_params};
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let (genesis, _) = tree.read().unwrap().tip();
+        let h1 = mine_header(genesis, 1_700_000_000, 1);
+        let h2 = mine_header(h1.block_hash(), 1_700_000_060, 2);
+
+        let mut h = harness(tree);
+        // h2's parent is missing, so the tree is behind rather than wrong.
+        h.conn.handle_headers(vec![h2]).await.unwrap();
+        assert_eq!(getheaders_sent(&h.conn.writer), 1);
     }
 
     /// An inv carries only a hash. A hash we do not know is the same signal.
@@ -1344,6 +1522,7 @@ mod tests {
             panic!("expected an announcement for the unknown block");
         };
         assert_eq!((a.height, a.new_to_us), (None, true));
+        assert_eq!(a.unplaced(), common::events::Unplaced::NoHeader);
 
         // An inv says nothing about whether the peer has validated the block,
         // so while a request is out another inv for it waits.
