@@ -160,6 +160,107 @@ Options:
 
 `RUST_LOG` sets the log level, as elsewhere in the workspace.
 
+## stats
+
+Adds up what is in one or more archives and prints it as a few tables: how
+much the files cover, how sessions ended, the hosts with the most sessions,
+hosts announcing blocks the observer could not place at a height, user agents
+by the number of hosts running them, distinct block hashes by leading zero
+digits, and service bits for handshakes and gossiped entries.
+
+Everything is keyed by host, so a host that opens six thousand sessions is one
+row rather than six thousand. That is what the tables are for: the questions a
+reader asks first of an archive -- who dominates it, whether another chain is
+riding on this network's magic, which claims not to believe -- are all answered
+by a host that stands out from the rest.
+
+Two things the tables keep apart on purpose. Blocks without a height are
+counted separately from blocks with one, because a chain that kept this
+network's magic and changed the rules announces blocks the header tree
+refuses, and mixed in they distort every block number. A services field with
+every bit set is one row of its own rather than one count on each of sixty-four
+bits, because a few sources gossip such fields by the hundred thousand.
+
+```bash
+$ cargo run --bin stats -- archive/mainnet.*.bin.zst --top 10
+```
+== coverage (mainnet)
+  events                            33
+  span                              2026-10-25T12:00:00Z to 2026-10-25T17:03:00Z (0d 05h 03m)
+  observer instances                1
+  events dropped by the observer    12
+  hosts seen                        4
+  hosts that completed a handshake  4
+  sessions ended                    11
+  block announcements               10
+  distinct block hashes             4
+
+== how sessions ended
+  decode_error         1   9.1%
+  peer_closed          10  90.9%
+  (peer sent nothing)  6   54.5%
+
+== attempts that never reached a session
+  connection_refused  1  100.0%
+  (our fault)         0
+
+== hosts by sessions (top 10)
+  host           sessions  silent  mean s  longest s  decode err  failed  unplaced  rate limited  user agent
+  198.51.100.7   6         6       60      60         0           0       6         0             /Satoshi:25.1.0/
+  192.0.2.10     3         0       4,000   7,200      0           0       0         3             /Satoshi:30.0.0/
+  203.0.113.42   1         0       900     900        1           1       0         0             /btcwire:0.5.0/btcd:0.24.2/
+  [2001:db8::1]  1         0       1,800   1,800      0           0       0         0             /Satoshi:29.0.0/
+
+== hosts announcing blocks without a height (1 hosts, top 10)
+  host          unplaced  sessions  user agent
+  198.51.100.7  6         6         /Satoshi:25.1.0/
+
+== user agents by hosts (top 10)
+  user agent                   hosts  handshakes
+  /Satoshi:25.1.0/             1      6
+  /Satoshi:29.0.0/             1      1
+  /Satoshi:30.0.0/             1      2
+  /btcwire:0.5.0/btcd:0.24.2/  1      1
+
+== distinct block hashes by leading zero hex digits
+  zeros  with height  without height
+  16     0            1
+  19     3            0
+
+== handshake service bits (10 fields)
+  bit  name             fields  share
+  0    network          4       40.0%
+  2    bloom            2       20.0%
+  3    witness          4       40.0%
+  10   network_limited  4       40.0%
+  all  every bit set    0       0.0%
+
+== gossiped entry service bits (2 fields)
+  bit  name             fields  share
+  0    network          1       50.0%
+  3    witness          1       50.0%
+  10   network_limited  1       50.0%
+  all  every bit set    1       50.0%
+
+
+```
+
+### Usage
+
+```
+Summarise p2p-observer archive files
+
+Usage: stats [OPTIONS] <FILE>...
+
+Arguments:
+  <FILE>...  Archive files to read, either `.bin` or `.bin.zst`. Read in the order given, as one stream
+
+Options:
+      --top <TOP>  Rows to show in the per-host and per-user-agent tables [default: 20]
+  -h, --help       Print help
+  -V, --version    Print version
+```
+
 ## replayer
 
 Reads archive files and prints what is in them, in the same one-line form the

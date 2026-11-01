@@ -6,6 +6,7 @@ pub(crate) const TARGET_REPLAYER: &str = "replayer";
 pub mod archiver;
 pub mod read;
 pub mod replayer;
+pub mod stats;
 
 /// Sets up logging for the binaries in this crate, honouring `RUST_LOG` the way
 /// the rest of the workspace does and defaulting to info.
