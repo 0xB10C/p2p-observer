@@ -115,6 +115,14 @@ message Handshake {
   // The peer's user agent, also on the enclosing PeerEvent. Duplicated so this
   // message is a complete record of the version handshake on its own.
   string user_agent = 9;
+  // The nonce the peer put in its version message, exactly as sent.
+  //
+  // A node draws a fresh one per connection so it can recognise a connection
+  // to itself. Recorded because deviations are telling: a constant nonce
+  // across hosts is one implementation, or one operator, behind all of them,
+  // and a zero is software that never bothered. Neither can be seen without
+  // the value.
+  uint64 nonce = 10;
 }
 
 // Addresses a peer told us about.
