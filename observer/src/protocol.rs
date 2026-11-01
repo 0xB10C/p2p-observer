@@ -4,7 +4,7 @@ use common::{
     p2p::{
         ProtocolVersion, ServiceFlags, address,
         address::{AddrV2Message, Address},
-        message::NetworkMessage,
+        message::{CommandString, NetworkMessage},
         message_blockdata::{GetHeadersMessage, Inventory},
         message_compact_blocks::{BlockTxn, GetBlockTxn, SendCmpct},
         message_network::{self, UserAgent},
@@ -259,6 +259,8 @@ pub(crate) struct SessionEnd {
     pub(crate) messages_by_command: BTreeMap<String, u32>,
     pub(crate) messages_other: u32,
     pub(crate) unsolicited_pongs: u32,
+    /// Messages skipped because their payload would not deserialize.
+    pub(crate) undecodable: u32,
 }
 
 impl SessionEnd {
@@ -409,6 +411,7 @@ pub(crate) async fn run_session(
         messages_by_command: conn.stats.messages_by_command,
         messages_other: conn.stats.messages_other,
         unsolicited_pongs: conn.stats.unsolicited_pongs,
+        undecodable: conn.reader.undecodable(),
     })
 }
 
@@ -608,6 +611,7 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             NetworkMessage::SendHeaders => self.handle_send_headers(),
             NetworkMessage::SendAddrV2 => self.handle_send_addr_v2(),
             NetworkMessage::BlockTxn(msg) => self.handle_blocktxn(msg).await,
+            NetworkMessage::Unknown { command, payload } => self.handle_unknown(&command, &payload),
             other => tracing::trace!(target: TARGET, "received: {:?}", other),
         }
         Ok(())
@@ -968,6 +972,12 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     }
 
     fn handle_addrv2(&mut self, addrs: &[AddrV2Message]) {
+        self.offer_addrv2(addrs.len(), addrs);
+    }
+
+    /// `received` is how many entries the message declared, which is more
+    /// than `addrs` holds when some would not parse.
+    fn offer_addrv2(&mut self, received: usize, addrs: &[AddrV2Message]) {
         let parsed: Vec<Gossiped> = addrs
             .iter()
             .filter_map(|m| {
@@ -978,7 +988,25 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
                 })
             })
             .collect();
-        self.offer_gossip(common::events::AddrMessage::Addrv2, addrs.len(), parsed);
+        self.offer_gossip(common::events::AddrMessage::Addrv2, received, parsed);
+    }
+
+    /// A message the decoder left as raw bytes: a command it does not know, or
+    /// one it knows whose payload it rejected and the transport handed up
+    /// anyway (see `transport::undecodable`).
+    fn handle_unknown(&mut self, command: &CommandString, payload: &[u8]) {
+        if command.as_ref() == "addrv2" {
+            // The decoder knows addrv2, so this is a message it rejected.
+            // It refuses the whole message over one entry it does not like;
+            // read around that entry and keep the rest.
+            let (received, entries) = parse_addrv2_leniently(payload);
+            tracing::debug!(target: TARGET, received, parsed = entries.len(), "addrv2 read leniently");
+            self.offer_addrv2(received, &entries);
+        } else {
+            tracing::trace!(target: TARGET,
+                command = command.as_ref(), len = payload.len(), "received an unknown message"
+            );
+        }
     }
 
     /// Rate-limit gossiped addresses and hand the survivors to the manager.
@@ -1155,6 +1183,79 @@ fn unplaced_for(reason: HeaderError) -> common::events::Unplaced {
         HeaderError::CheckpointMismatch => Unplaced::CheckpointMismatch,
         HeaderError::ForkBelowCheckpoint => Unplaced::ForkBelowCheckpoint,
     }
+}
+
+/// Read an addrv2 payload the decoder rejected, keeping the entries it would
+/// have accepted.
+///
+/// rust-bitcoin decodes the message as one value and refuses all of it over a
+/// single entry it does not like, and one such entry is common: btcd gossips
+/// IPv4 addresses as IPv4-mapped IPv6 under the IPv6 network id, which BIP155
+/// forbids, so its thousand-entry reply to our getaddr failed on the first of
+/// them on every connection. Each entry carries its own length, so the bad
+/// entry can be stepped over and the rest kept.
+///
+/// Returns the entry count the message declared and the entries that parsed.
+/// Stops at the first entry whose framing cannot be followed; what came before
+/// it is kept.
+fn parse_addrv2_leniently(payload: &[u8]) -> (usize, Vec<AddrV2Message>) {
+    use common::bitcoin::consensus::{
+        Decodable, deserialize,
+        encode::{ReadExt, WriteExt},
+    };
+
+    let mut r = std::io::Cursor::new(payload);
+    let Ok(count) = r.read_compact_size() else {
+        return (0, Vec::new());
+    };
+    // Every entry takes at least nine bytes, so a count that could not fit is
+    // not one to report as received.
+    let count = usize::try_from(count)
+        .unwrap_or(usize::MAX)
+        .min(payload.len() / 9);
+    let mut entries = Vec::new();
+
+    for _ in 0..count {
+        let Ok(time) = u32::consensus_decode(&mut r) else {
+            break;
+        };
+        let Ok(services) = r.read_compact_size() else {
+            break;
+        };
+        let Ok(network) = r.read_u8() else {
+            break;
+        };
+        let Ok(len) = r.read_compact_size() else {
+            break;
+        };
+        let start = r.position() as usize;
+        let Some(addr) = usize::try_from(len)
+            .ok()
+            .and_then(|len| payload.get(start..start.checked_add(len)?))
+        else {
+            break;
+        };
+        r.set_position((start + addr.len()) as u64);
+        let Ok(port) = u16::consensus_decode(&mut r) else {
+            break;
+        };
+
+        // The address alone goes to the decoder, so it still judges every
+        // entry; it just no longer judges the message by one of them.
+        let mut raw = vec![network];
+        raw.emit_compact_size(len).expect("writing to a Vec");
+        raw.extend_from_slice(addr);
+        if let Ok(addr) = deserialize::<address::AddrV2>(&raw) {
+            entries.push(AddrV2Message {
+                time,
+                services: ServiceFlags::from(services),
+                addr,
+                // Big-endian on the wire, as the decoder reads it.
+                port: port.swap_bytes(),
+            });
+        }
+    }
+    (count, entries)
 }
 
 pub(crate) fn build_version(user_agent: &str, start_height: i32) -> NetworkMessage {
@@ -1706,7 +1807,7 @@ mod tests {
         .await
         .expect("BIP324 handshake failed");
         let (pr, pw) = proto.into_split();
-        let mut r = TransportV2Reader { reader: pr };
+        let mut r = TransportV2Reader::new(pr);
         let mut w = TransportV2Writer { writer: pw };
         version_handshake(&mut r, &mut w, USER_AGENT, 0)
             .await
@@ -1780,6 +1881,77 @@ mod tests {
         h.conn
             .offer_gossip(common::events::AddrMessage::Addrv2, 1, other);
         assert!(solicited(&mut h));
+    }
+
+    /// An addrv2 payload with one entry the decoder rejects between two it
+    /// accepts, as btcd sends them.
+    fn addrv2_with_a_rejected_entry() -> (Vec<u8>, Vec<AddrV2Message>) {
+        use common::bitcoin::consensus::{encode::WriteExt, serialize};
+        let good = |last: u8| AddrV2Message {
+            time: 1_700_000_000,
+            services: ServiceFlags::NETWORK,
+            addr: address::AddrV2::Ipv4(Ipv4Addr::new(10, 0, 0, last)),
+            port: 8333,
+        };
+        let mut payload = Vec::new();
+        payload.emit_compact_size(3u64).unwrap();
+        payload.extend(serialize(&good(1)));
+        // An IPv4 address under the IPv6 network id.
+        payload.extend(1_700_000_000u32.to_le_bytes());
+        payload.emit_compact_size(1u64).unwrap();
+        payload.extend([2, 16]);
+        payload.extend([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 2]);
+        payload.extend(8333u16.to_be_bytes());
+        payload.extend(serialize(&good(3)));
+        (payload, vec![good(1), good(3)])
+    }
+
+    /// One entry the decoder rejects no longer costs the rest of the message.
+    #[test]
+    fn test_addrv2_is_read_around_a_rejected_entry() {
+        use common::bitcoin::consensus::deserialize;
+        let (payload, kept) = addrv2_with_a_rejected_entry();
+        // The decoder itself still refuses the message whole.
+        assert!(deserialize::<common::p2p::message::AddrV2Payload>(&payload).is_err());
+
+        let (received, entries) = parse_addrv2_leniently(&payload);
+        assert_eq!(received, 3);
+        assert_eq!(entries, kept);
+
+        // Framing that cannot be followed ends the read, keeping what came
+        // before it and never panicking.
+        let (received, entries) = parse_addrv2_leniently(&payload[..payload.len() - 3]);
+        assert_eq!(received, 3);
+        assert_eq!(entries, kept[..1]);
+        assert_eq!(parse_addrv2_leniently(&[]), (0, Vec::new()));
+        assert_eq!(
+            parse_addrv2_leniently(&[0xfe, 0xff, 0xff, 0xff, 0xff]),
+            (0, Vec::new())
+        );
+    }
+
+    /// The rejected message reaches the archive as an announcement with the
+    /// entries that parsed and the one that did not counted.
+    #[tokio::test]
+    async fn test_undecodable_addrv2_is_still_announced() {
+        use crate::headertree::testing::regtest_params;
+        use common::events::peer_event::Event;
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let mut h = harness(tree);
+        let (payload, kept) = addrv2_with_a_rejected_entry();
+
+        h.conn.handle_unknown(
+            &CommandString::try_from("addrv2".to_owned()).unwrap(),
+            &payload,
+        );
+
+        let Some(Event::AddressAnnouncement(a)) = h.events.try_recv().unwrap().event else {
+            panic!("expected an address announcement");
+        };
+        assert_eq!(a.unparsed, 1);
+        assert_eq!(a.addresses.len(), kept.len());
+        assert_eq!(a.addresses[0].addr, "10.0.0.1:8333");
+        assert_eq!(a.addresses[1].addr, "10.0.0.3:8333");
     }
 
     /// A reply to our own getheaders is not the peer announcing blocks, however

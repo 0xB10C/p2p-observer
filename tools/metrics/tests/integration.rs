@@ -299,6 +299,7 @@ async fn test_events_become_metrics() {
             messages_by_command: [("ping".to_owned(), 2)].into(),
             messages_other: 0,
             unsolicited_pongs: 0,
+            undecodable: 0,
         })),
     };
     h.publish(

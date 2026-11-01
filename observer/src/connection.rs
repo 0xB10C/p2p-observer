@@ -166,6 +166,7 @@ fn disconnected_result(
             messages_by_command: end.messages_by_command.clone().into_iter().collect(),
             messages_other: end.messages_other,
             unsolicited_pongs: end.unsolicited_pongs,
+            undecodable: end.undecodable,
         },
     )
 }
@@ -501,7 +502,7 @@ async fn connect_v2(id: u64, dial: &Dial, cfg: &Config, addrman: &Handle) -> Res
 
     let (pr, pw) = proto.into_split();
     run_session(
-        TransportV2Reader { reader: pr },
+        TransportV2Reader::new(pr),
         TransportV2Writer { writer: pw },
         Session {
             transport_version: 2,
@@ -794,7 +795,7 @@ mod tests {
             .await
             .unwrap();
             let (pr, pw) = proto.into_split();
-            let mut r = TransportV2Reader { reader: pr };
+            let mut r = TransportV2Reader::new(pr);
             let mut w = TransportV2Writer { writer: pw };
             server_handshake(&mut r, &mut w).await;
         });
