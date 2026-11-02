@@ -65,6 +65,11 @@ websocket over `wss://` (e.g. behind nginx) when exposing them.
   where the tail is read. Each curve is drawn from at most 200 samples however
   many peers announced the block.
 
+The snapshot is the one thing here the tool holds on to, and it holds one per
+network rather than anything per connection: the earlier version kept a record
+of every connection and every closed session, which is what the rework
+removed.
+
 Dial outcomes and the population census that earlier versions drew are gone;
 counters like those belong in a metrics endpoint rather than in a page that
 has to rebuild them from a stream. The ended sessions page is a log and not a
@@ -85,6 +90,9 @@ The kinds are `ping_rtt`, `block_announcements`, `address_announcements`,
 `send_cmpcts`. An unknown key is an error rather than a silent no-op, so a
 page cannot quietly subscribe to nothing. Address announcements carry every
 gossiped address and are the heaviest kind by far.
+
+`connection_status` is not an event kind but the periodic status update below,
+and may be combined with any of them.
 
 On connect the server sends one hello:
 
@@ -114,6 +122,40 @@ allowed to slow the others down.
 ```sh
 cargo run -p websocket --example client -- ws://127.0.0.1:47484 '{"handshakes": true}' 1
 ```
+
+## Status updates
+
+The events say what happens; they cannot say what is connected. A client that
+attaches now never sees the handshake of a session that began an hour ago, so
+it learns of that connection only when something next happens on it, with
+everything the handshake said missing for good.
+
+So a client that subscribes to `connection_status` is sent, every
+`--status-interval-secs` (60 by default, 0 to turn it off), what each observer
+says it is connected to:
+
+```json
+{"status": {"network": "mainnet", "taken_ms": 1793657370723,
+ "instance_id": 3553736845035775826, "connected": 6712, "dialing": 24,
+ "connections": [{"connection_id": 4352963, "addr": "91.157.99.72:8333",
+  "ip": {"asn": 719, "handle": "ELISA-AS", "...": "..."},
+  "uptime_ms": 569932, "user_agent": "/Satoshi:29.1.0/",
+  "start_height": 973894, "messages": 37, "...": "..."}]}}
+```
+
+That is the observer's own `connections.list` reply (see
+[`observer/docs/rpc.md`](../../observer/docs/rpc.md)), passed through with the
+autonomous system of each peer filled in exactly as on an event, so a field
+the observer adds later needs no change here. The tool keeps only the latest
+snapshot per network, to answer a client that subscribes between two polls at
+once rather than a minute later; subscribing when there is nothing cached asks
+for a poll straight away. Nothing is asked of an observer while no client is
+subscribed.
+
+Which observers to ask comes from `--network`, or from the networks seen on
+the event stream when that is not given, so the first status update then waits
+for the first event. A request that fails or times out is logged and skipped,
+and a page keeps the snapshot it has until the next one.
 
 ## Usage
 

@@ -89,6 +89,10 @@ impl Harness {
             network: None,
             listen: "127.0.0.1:0".to_owned(),
             asmap: Some(format!("{}/tests/fixtures/asmap.raw", env!("CARGO_MANIFEST_DIR")).into()),
+            // Long enough that every status update in these tests is the one
+            // a subscribing client asks for, rather than a tick arriving by
+            // luck.
+            status_interval_secs: 3600,
         };
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (bound_tx, bound_rx) = oneshot::channel();
@@ -214,6 +218,73 @@ async fn test_subscribed_events_reach_clients_enriched() {
     // The asmap fixture maps this address, so the peer arrives with its
     // autonomous system and the page does not need the map.
     assert_eq!(ev["ip"]["asn"], 1000);
+}
+
+/// The status update is the observer's own answer about its live sessions,
+/// forwarded with the peer's autonomous system filled in, and a client that
+/// subscribes gets one without waiting for the interval.
+#[tokio::test]
+async fn test_status_updates_come_from_the_observer_rpc() {
+    let Some(h) = Harness::start().await else {
+        eprintln!("NATS_SERVER_BINARY not set, skipping");
+        return;
+    };
+
+    // Stand in for an observer: answer connections.list the way it does.
+    let mut rpc = h
+        .publisher
+        .subscribe("p2p-observer.signet.rpc.connections.list")
+        .await
+        .unwrap();
+    let replier = h.publisher.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = rpc.next().await {
+            let reply = serde_json::json!({
+                "taken_ms": 1_700_000_060_000u64,
+                "instance_id": 42u64,
+                "connected": 1,
+                "dialing": 3,
+                "connections": [{
+                    "connection_id": 7,
+                    "addr": "250.1.2.3:38333",
+                    "user_agent": "/Satoshi:31.1.0/",
+                    "start_height": 5,
+                }],
+            })
+            .to_string();
+            if let Some(reply_to) = msg.reply {
+                replier.publish(reply_to, reply.into()).await.unwrap();
+            }
+        }
+    });
+
+    // Without --network the tool learns which observers exist from their
+    // events, so one has to arrive before there is anything to poll.
+    let mut events = h.client(r#"{"handshakes":true}"#).await;
+    h.publish(
+        "signet",
+        "handshake",
+        &event(1, "250.1.2.3:38333", handshake()),
+    )
+    .await;
+    next_json(&mut events, "handshake event").await;
+
+    let mut ws = h.client(r#"{"connection_status":true}"#).await;
+    let msg = next_json(&mut ws, "status update").await;
+    let status = &msg["status"];
+    assert_eq!(status["network"], "signet");
+    // Passed through as the observer sent it.
+    assert_eq!(status["connected"], 1);
+    assert_eq!(status["dialing"], 3);
+    assert_eq!(status["instance_id"], 42);
+    let c = &status["connections"][0];
+    assert_eq!(c["connection_id"], 7);
+    assert_eq!(c["user_agent"], "/Satoshi:31.1.0/");
+    // Added here, from the asmap, exactly as on an event.
+    assert_eq!(c["ip"]["asn"], 1000);
+
+    // A client that did not ask for it gets none of this.
+    expect_silence(&mut events).await;
 }
 
 #[tokio::test]
