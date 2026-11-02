@@ -111,11 +111,19 @@ fn dropped_by_kind() -> DroppedEvents {
 ///
 /// Every event goes through here so that no emit site can forget the stamp,
 /// and so there is one place where the decision to drop is made.
+/// The id of this observer run, the same on every event it emits and in
+/// anything else that has to be matched up with them -- a connection id
+/// counts from zero per process, so it only identifies a connection
+/// alongside this.
+pub(crate) fn instance_id() -> u64 {
+    *INSTANCE.get_or_init(fresh_instance_id)
+}
+
 pub(crate) fn send(tx: &mpsc::Sender<PeerEvent>, mut event: PeerEvent) {
     let dropped = DROPPED.load(Ordering::Relaxed);
     event.dropped_events = dropped;
     event.dropped_by_kind = (dropped > 0).then(dropped_by_kind);
-    event.instance_id = *INSTANCE.get_or_init(fresh_instance_id);
+    event.instance_id = instance_id();
 
     let kind = Kind::of(&event);
     let is_gossip = matches!(kind, Some(Kind::AddressAnnouncement));

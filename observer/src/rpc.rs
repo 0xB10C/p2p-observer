@@ -14,6 +14,7 @@ use common::{async_nats, futures_util::StreamExt, serde_json, tracing};
 use crate::addresses::banlist::BanEntry;
 use crate::addresses::peer_addr::PeerAddr;
 use crate::addresses::{Handle, policy::Class};
+use crate::connections::Registry;
 use crate::headertree::{ChainTipStatus, HeaderTree};
 
 pub(crate) struct Rpc {
@@ -25,6 +26,7 @@ pub(crate) struct Rpc {
 struct Handler {
     addrman: Handle,
     header_tree: Arc<RwLock<HeaderTree>>,
+    connections: Arc<Registry>,
 }
 
 impl Rpc {
@@ -33,6 +35,7 @@ impl Rpc {
         network: &str,
         addrman: Handle,
         header_tree: Arc<RwLock<HeaderTree>>,
+        connections: Arc<Registry>,
     ) -> Self {
         Self {
             nats,
@@ -40,6 +43,7 @@ impl Rpc {
             handler: Handler {
                 addrman,
                 header_tree,
+                connections,
             },
         }
     }
@@ -85,6 +89,7 @@ impl Handler {
             Some("addresses.info") => self.addresses_info().await,
             Some("addresses.inspect") => self.inspect(payload).await,
             Some("addresses.due") => self.due_next(payload).await,
+            Some("connections.list") => self.connections_list().await,
             Some("headertree.tips") => self.chain_tips(),
             Some("banlist.add") => self.ban_add(payload).await,
             Some("banlist.list") => self.ban_list().await,
@@ -107,6 +112,63 @@ impl Handler {
             "bad": s.bad,
             "dialing": s.dialing,
             "connected": s.connected,
+        })
+        .to_string())
+    }
+
+    /// The sessions running right now.
+    ///
+    /// Here rather than on the event stream because it is the one question
+    /// the events cannot answer: a consumer that attaches now cannot learn
+    /// about a session that handshook an hour ago. Each entry carries the
+    /// peer's claims as it made them, and the totals as of that session's
+    /// last ping -- `updated_ms` says when that was, so a reader can see how
+    /// stale they are instead of assuming they are current.
+    async fn connections_list(&self) -> Result<String, String> {
+        let now = crate::protocol::unix_ms();
+        let live = self.connections.snapshot();
+        // Attempts in flight are not sessions and are not listed, but the
+        // count says how much of the dial budget is busy, which is the first
+        // thing anyone asks next.
+        let dialing = self.addrman.stats().await.map(|s| s.dialing);
+
+        let connections: Vec<serde_json::Value> = live
+            .into_iter()
+            .map(|(id, c)| {
+                serde_json::json!({
+                    "connection_id": id,
+                    "addr": c.addr.to_string(),
+                    "transport_version": c.transport_version,
+                    "connected_ms": c.connected_ms,
+                    "uptime_ms": now.saturating_sub(c.connected_ms),
+                    "user_agent": c.user_agent,
+                    "protocol_version": c.protocol_version,
+                    "services": c.services,
+                    "start_height": c.start_height,
+                    "relay": c.relay,
+                    "sendaddrv2": c.sendaddrv2,
+                    "wtxid_relay": c.wtxid_relay,
+                    "addr_recv": c.addr_recv,
+                    "peer_timestamp": c.peer_timestamp,
+                    "messages": c.counters.messages,
+                    "unsolicited_pongs": c.counters.unsolicited_pongs,
+                    "rtt_ms": c.counters.rtt_ms,
+                    "min_rtt_ms": c.counters.min_rtt_ms,
+                    // Zero until the first ping of the session, which is when
+                    // the counters above first mean anything.
+                    "updated_ms": c.updated_ms,
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "taken_ms": now,
+            // A connection id is unique within one observer run, so this is
+            // what makes the pair identify a connection at all.
+            "instance_id": crate::emit::instance_id(),
+            "connected": connections.len(),
+            "dialing": dialing,
+            "connections": connections,
         })
         .to_string())
     }
@@ -314,6 +376,7 @@ mod tests {
             Handler {
                 addrman: handle,
                 header_tree,
+                connections: Registry::new(),
             },
             TestManager {
                 task,
@@ -431,6 +494,69 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&h.dispatch(Some("addresses.inspect"), &payload).await).unwrap();
         assert!(v["error"].as_str().unwrap().contains("unparseable"));
+    }
+
+    /// The sessions the registry holds, with the dialing count beside them.
+    #[tokio::test]
+    async fn test_connections_list() {
+        use crate::connections::{Counters, Live};
+        let (handler, _m) = handler_with_manager("connections");
+
+        let empty: serde_json::Value =
+            serde_json::from_str(&handler.connections_list().await.unwrap()).unwrap();
+        assert_eq!(empty["connected"], 0);
+        assert_eq!(empty["connections"], serde_json::json!([]));
+        // The manager is up, so the count is a number rather than null.
+        assert_eq!(empty["dialing"], 0);
+        assert_ne!(empty["instance_id"].as_u64(), Some(0));
+
+        let _registered = handler.connections.register(
+            7,
+            Live {
+                addr: PeerAddr::Ipv4([1, 2, 3, 4], 8333),
+                transport_version: 2,
+                connected_ms: 1_700_000_000_000,
+                user_agent: "/Satoshi:30.0.0/".to_owned(),
+                protocol_version: 70016,
+                services: 1033,
+                start_height: 225_381,
+                relay: true,
+                sendaddrv2: true,
+                wtxid_relay: false,
+                addr_recv: "0.0.0.0:0".to_owned(),
+                peer_timestamp: 1_700_000_000,
+                counters: Counters {
+                    messages: 37,
+                    unsolicited_pongs: 2,
+                    rtt_ms: Some(37),
+                    min_rtt_ms: Some(35),
+                },
+                updated_ms: 1_700_000_060_000,
+            },
+        );
+
+        let v: serde_json::Value =
+            serde_json::from_str(&handler.connections_list().await.unwrap()).unwrap();
+        assert_eq!(v["connected"], 1);
+        let c = &v["connections"][0];
+        assert_eq!(c["connection_id"], 7);
+        assert_eq!(c["addr"], "1.2.3.4:8333");
+        assert_eq!(c["user_agent"], "/Satoshi:30.0.0/");
+        assert_eq!(c["start_height"], 225_381);
+        assert_eq!(c["wtxid_relay"], false);
+        assert_eq!(c["messages"], 37);
+        assert_eq!(c["rtt_ms"], 37);
+        assert_eq!(c["updated_ms"], 1_700_000_060_000u64);
+        // Uptime is against the observer's clock at the time of the call, so
+        // it is whatever has elapsed since a timestamp in 2023.
+        assert!(c["uptime_ms"].as_u64().unwrap() > 0);
+        assert!(v["taken_ms"].as_u64().unwrap() >= c["connected_ms"].as_u64().unwrap());
+
+        // The guard is what takes it out again.
+        drop(_registered);
+        let v: serde_json::Value =
+            serde_json::from_str(&handler.connections_list().await.unwrap()).unwrap();
+        assert_eq!(v["connected"], 0);
     }
 
     #[tokio::test]

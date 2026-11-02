@@ -677,6 +677,7 @@ mod tests {
 
     fn test_config(event_tx: mpsc::Sender<common::events::PeerEvent>) -> Config {
         Config {
+            connections: crate::connections::Registry::new(),
             magic: MAGIC,
             ping_interval: Duration::from_secs(120),
             user_agent: crate::protocol::USER_AGENT.to_owned(),

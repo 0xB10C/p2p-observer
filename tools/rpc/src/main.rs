@@ -50,6 +50,9 @@ enum Command {
     /// The address book
     #[command(subcommand)]
     Addresses(Addresses),
+    /// Live connections
+    #[command(subcommand)]
+    Connections(Connections),
     /// The header tree
     #[command(subcommand)]
     Headertree(Headertree),
@@ -87,6 +90,12 @@ enum Addresses {
         #[arg(short, long)]
         limit: Option<usize>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum Connections {
+    /// The sessions running right now, with what each peer claimed
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -131,6 +140,7 @@ fn request(command: &Command) -> Result<Request> {
             "addresses.due",
             limit.map(|l| l.to_string()).unwrap_or_default(),
         ),
+        Command::Connections(Connections::List) => ("connections.list", String::new()),
         Command::Headertree(Headertree::Tips) => ("headertree.tips", String::new()),
         Command::Banlist(Banlist::Add {
             comment,
@@ -266,6 +276,13 @@ mod tests {
         );
         assert_eq!(req(&["addresses", "due"]).payload, "");
         assert_eq!(req(&["addresses", "due", "--limit", "5"]).payload, "5");
+        assert_eq!(
+            req(&["connections", "list"]),
+            Request {
+                method: "connections.list".into(),
+                payload: String::new()
+            }
+        );
         assert_eq!(req(&["headertree", "tips"]).method, "headertree.tips");
         assert_eq!(req(&["banlist", "list"]).method, "banlist.list");
     }
