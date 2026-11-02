@@ -24,6 +24,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::addresses::{Handle, book::Gossiped, peer_addr::PeerAddr, policy};
+use crate::connections::{self, Registry};
 use crate::headertree::{HeaderError, HeaderTree};
 use crate::transport::{TransportReader, TransportWriter};
 
@@ -91,6 +92,9 @@ pub(crate) struct Config {
     pub(crate) user_agent: String,
     pub(crate) event_tx: mpsc::Sender<common::events::PeerEvent>,
     pub(crate) header_tree: Arc<RwLock<HeaderTree>>,
+    /// The live sessions of this observer, which this connection adds itself
+    /// to once its handshake is done.
+    pub(crate) connections: Arc<Registry>,
     pub(crate) sync_headers: bool,
     /// Ask for the coinbase of every compact block, see `probe_compact_blocks`
     /// in the settings.
@@ -204,6 +208,23 @@ impl ConnectionStats {
         }
     }
 
+    /// The totals as they stand, for the registry.
+    fn counters(&self) -> connections::Counters {
+        connections::Counters {
+            messages: self
+                .messages_by_command
+                .values()
+                .map(|n| u64::from(*n))
+                .sum::<u64>()
+                + u64::from(self.messages_other),
+            unsolicited_pongs: self.unsolicited_pongs,
+            // The window the connection keeps, so the lowest here is the
+            // lowest of the recent samples rather than of the session.
+            rtt_ms: self.rtt_history.back().copied(),
+            min_rtt_ms: self.rtt_history.iter().min().copied(),
+        }
+    }
+
     fn record_rtt(&mut self, rtt_ms: u32) {
         self.rtt_history.push_back(rtt_ms);
         if self.rtt_history.len() > 10 {
@@ -272,6 +293,7 @@ struct Connection<R: TransportReader, W: TransportWriter> {
     connection_id: u64,
     event_tx: mpsc::Sender<common::events::PeerEvent>,
     header_tree: Arc<RwLock<HeaderTree>>,
+    connections: Arc<Registry>,
     sync_headers: bool,
     /// The missing block this connection last asked its peer about, so the
     /// same peer announcing the same block twice is not asked twice. How many
@@ -338,6 +360,13 @@ pub(crate) async fn run_session(
     // first.
     emit_handshake(cfg, connection_id, addr, transport_version, &info);
 
+    // Held for the life of the session: dropping it takes the session out of
+    // the registry, so a task that ends, panics or is cancelled cannot leave
+    // a connection in there that is no longer running.
+    let _registered = cfg
+        .connections
+        .register(connection_id, live(addr, transport_version, &info));
+
     let mut conn = Connection {
         reader,
         writer,
@@ -354,6 +383,7 @@ pub(crate) async fn run_session(
         connection_id,
         event_tx: cfg.event_tx.clone(),
         header_tree: cfg.header_tree.clone(),
+        connections: cfg.connections.clone(),
         sync_headers: cfg.sync_headers,
         asked_for: None,
         probe_compact_blocks: cfg.probe_compact_blocks,
@@ -380,6 +410,32 @@ pub(crate) async fn run_session(
         messages_other: conn.stats.messages_other,
         unsolicited_pongs: conn.stats.unsolicited_pongs,
     })
+}
+
+/// What the registry holds about a session that has just handshaken: the
+/// peer's claims as made, and no counters yet.
+fn live(addr: PeerAddr, transport_version: u8, info: &HandshakeInfo) -> connections::Live {
+    let version = &info.version;
+    connections::Live {
+        addr,
+        transport_version,
+        connected_ms: unix_ms(),
+        user_agent: version.user_agent.to_string(),
+        protocol_version: u32::from(version.version),
+        services: version.services.to_u64(),
+        start_height: version.start_height,
+        relay: version.relay,
+        sendaddrv2: info.send_addr_v2,
+        wtxid_relay: info.wtxid_relay,
+        addr_recv: version
+            .receiver
+            .socket_addr()
+            .map(|s| s.to_string())
+            .unwrap_or_default(),
+        peer_timestamp: version.timestamp,
+        counters: connections::Counters::default(),
+        updated_ms: 0,
+    }
 }
 
 /// Publish what the peer said about itself in its version message.
@@ -527,6 +583,12 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         let nonce = unix_ms();
         tracing::trace!(target: TARGET, ts_ms = nonce, "sending ping");
         self.stats.record_ping(nonce);
+        // The ping timer is the registry's refresh timer too: it is the one
+        // thing a long session does on a schedule, so the totals there are
+        // never more than a ping interval old and nothing else has to wake up
+        // to keep them so.
+        self.connections
+            .refresh(self.connection_id, self.stats.counters(), nonce);
         self.writer.send(NetworkMessage::Ping(nonce)).await
     }
 
@@ -1120,7 +1182,7 @@ pub(crate) fn build_version(user_agent: &str, start_height: i32) -> NetworkMessa
     })
 }
 
-fn unix_ms() -> u64 {
+pub(crate) fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1226,6 +1288,7 @@ mod tests {
             connection_id: 7,
             event_tx,
             header_tree: tree,
+            connections: Registry::new(),
             sync_headers: false,
             asked_for: None,
             probe_compact_blocks: false,

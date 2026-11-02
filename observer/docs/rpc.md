@@ -63,6 +63,30 @@ $ nats request p2p-observer.signet.rpc.addresses.due '5'
 [{"addr":"1.2.3.4:38333","next_attempt":1792801006}, ...]
 ```
 
+## `connections.list`
+
+The sessions running right now: one entry per connection whose handshake has
+completed, with what the peer claimed as it claimed it.
+
+This is the one question the event stream cannot answer. A consumer that
+attaches now cannot learn about a session that handshook an hour ago, because
+the handshake that described it has already gone past; it sees such a
+connection only when something next happens on it, with everything the
+handshake said missing for good. Attempts still dialling are not sessions and
+are not listed, but `dialing` says how many there are.
+
+A connection id counts from zero per observer run, so `instance_id` is what
+makes the pair identify a connection; it is the same value the events carry.
+The totals on each entry are refreshed on that session's own ping timer rather
+than as they change, so `updated_ms` says how old they are, and is 0 before
+the first ping of a session. Everything that moves faster is on the event
+stream.
+
+```bash
+$ nats request p2p-observer.signet.rpc.connections.list ''
+{"taken_ms":1793657370723,"instance_id":3553736845035775826,"connected":2,"dialing":3,"connections":[{"addr":"1.2.3.4:38333","addr_recv":"0.0.0.0:0","connected_ms":1793657310700,"connection_id":41,"messages":37,"min_rtt_ms":35,"peer_timestamp":1793657310,"protocol_version":70016,"relay":true,"rtt_ms":37,"sendaddrv2":true,"services":1033,"start_height":225381,"transport_version":2,"unsolicited_pongs":0,"uptime_ms":60023,"updated_ms":1793657350700,"user_agent":"/Satoshi:30.0.0/","wtxid_relay":true}, ...]}
+```
+
 ## `headertree.tips`
 
 Chain tips from the header tree — headers not referenced as a parent by

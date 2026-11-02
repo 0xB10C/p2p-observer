@@ -11,6 +11,7 @@ pub(crate) const TARGET_ADDRMAN: &str = "addrman";
 
 mod addresses;
 mod connection;
+mod connections;
 mod emit;
 mod headertree;
 mod logging;
@@ -78,7 +79,22 @@ async fn main() {
     // connection task, and the manager needs the dialer.
     let (addrman, gossip_rx, life_rx, cmd_rx) = addresses::channels();
 
-    tokio::spawn(rpc::Rpc::new(nats, &cfg.network, addrman.clone(), header_tree.clone()).run());
+    // Not persisted and not published: what is connected right now, for the
+    // RPC to answer, since no event can say it after the fact. Made here
+    // because both the RPC below and every connection task need it, the
+    // bootstrap sync included.
+    let connections = connections::Registry::new();
+
+    tokio::spawn(
+        rpc::Rpc::new(
+            nats,
+            &cfg.network,
+            addrman.clone(),
+            header_tree.clone(),
+            connections.clone(),
+        )
+        .run(),
+    );
 
     let bootstrap: Vec<PeerAddr> = cfg
         .bootstrap_addrs
@@ -97,7 +113,16 @@ async fn main() {
     // from the first connection. This path deliberately bypasses the manager:
     // it is sequential, it must see its own errors, and it has no business
     // influencing retry scheduling.
-    bootstrap_sync(&bootstrap, magic, &cfg, &header_tree, &event_tx, &addrman).await;
+    bootstrap_sync(
+        &bootstrap,
+        magic,
+        &cfg,
+        &header_tree,
+        &event_tx,
+        &addrman,
+        &connections,
+    )
+    .await;
 
     let proto_cfg = protocol::Config {
         magic,
@@ -106,6 +131,7 @@ async fn main() {
         user_agent: cfg.user_agent.clone(),
         event_tx,
         header_tree: header_tree.clone(),
+        connections: connections.clone(),
         sync_headers: false,
         networks: cfg.networks.clone(),
     };
@@ -170,6 +196,7 @@ async fn bootstrap_sync(
     header_tree: &Arc<RwLock<headertree::HeaderTree>>,
     event_tx: &tokio::sync::mpsc::Sender<common::events::PeerEvent>,
     addrman: &addresses::Handle,
+    connections: &Arc<connections::Registry>,
 ) {
     if bootstrap.is_empty() {
         tracing::warn!(target: TARGET_MAIN, "no bootstrap peers configured, skipping header sync");
@@ -183,6 +210,7 @@ async fn bootstrap_sync(
         user_agent: cfg.user_agent.clone(),
         event_tx: event_tx.clone(),
         header_tree: header_tree.clone(),
+        connections: connections.clone(),
         sync_headers: true,
         networks: cfg.networks.clone(),
     };

@@ -1390,6 +1390,7 @@ mod tests {
         let (addrman, _gossip_rx, _life_rx, _cmd_rx) = addresses::channels();
 
         let make_cfg = |sync_headers: bool| protocol::Config {
+            connections: crate::connections::Registry::new(),
             magic: Magic::REGTEST,
             ping_interval: common::tokio::time::Duration::from_secs(120),
             user_agent: protocol::USER_AGENT.to_owned(),
