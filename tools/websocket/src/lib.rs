@@ -16,11 +16,11 @@
 //! sends one `{"hello": …}` with its clock, so a page can relate event
 //! timestamps to its own time.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, RwLock as StdRwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::anyhow::{Context, Result};
 use common::clap::Parser;
@@ -30,7 +30,7 @@ use common::prost::Message;
 use common::serde::{Deserialize, Serialize};
 use common::serde_json;
 use common::tokio::net::{TcpListener, TcpStream};
-use common::tokio::sync::{Mutex, mpsc, oneshot, watch};
+use common::tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 use common::tokio::{self, task::JoinHandle};
 use common::{async_nats, tracing};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -47,6 +47,11 @@ const MAX_CLIENT_MESSAGE: usize = 512;
 /// A block arrives at every connection at once, so this has to hold a burst
 /// of one event per connection.
 const CLIENT_QUEUE: usize = 16_384;
+
+/// How long a status request waits for an observer to answer. Generous: the
+/// reply lists every live session, and the observer builds it while it is
+/// also talking to thousands of peers.
+const STATUS_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Forward p2p-observer events to browsers over a websocket
 #[derive(Parser, Debug, Clone)]
@@ -69,6 +74,12 @@ pub struct Args {
     /// ASN information
     #[arg(long)]
     pub asmap: Option<PathBuf>,
+
+    /// Seconds between status updates, which ask each observer over RPC what
+    /// it is connected to and send the answer to the clients that subscribed
+    /// to it. 0 turns them off
+    #[arg(long, default_value_t = 60)]
+    pub status_interval_secs: u64,
 }
 
 impl Args {
@@ -109,6 +120,9 @@ pub struct ClientSubscriptions {
     pub compact_block_probes: bool,
     pub fee_filters: bool,
     pub send_cmpcts: bool,
+    /// Not an event kind: the periodic snapshot of what each observer is
+    /// connected to, which answers what no event can -- see [`StatusUpdate`].
+    pub connection_status: bool,
 }
 
 impl ClientSubscriptions {
@@ -143,6 +157,27 @@ pub struct TaggedEvent<'a> {
     pub event: &'a PeerEvent,
 }
 
+/// A snapshot of what one observer is connected to, as its
+/// `connections.list` RPC answered, with the autonomous system of each peer
+/// filled in where an asmap is loaded.
+///
+/// Every other message here is an event, and events cannot say what is
+/// connected: a client that connects now never sees the handshake of a
+/// session that began an hour ago. The snapshot is the answer, so a page can
+/// show the whole population immediately instead of discovering it one
+/// message at a time.
+///
+/// The observer's reply is passed through as it came, rather than restated
+/// field by field, so a field added there reaches clients without a change
+/// here.
+#[derive(Debug, Serialize)]
+#[serde(crate = "common::serde")]
+pub struct StatusUpdate<'a> {
+    pub network: &'a str,
+    #[serde(flatten)]
+    pub connections: serde_json::Value,
+}
+
 /// What the server says for itself when a client connects. The clock is here
 /// because event timestamps come from the observer's clock, which a page has
 /// to relate to its own; `asmap` tells a page whether to expect `ip`.
@@ -160,6 +195,7 @@ pub struct Hello {
 pub enum Outgoing<'a> {
     Hello(Hello),
     Event(TaggedEvent<'a>),
+    Status(StatusUpdate<'a>),
 }
 
 struct Client {
@@ -172,6 +208,37 @@ type Clients = Arc<Mutex<HashMap<SocketAddr, Client>>>;
 struct Shared {
     clients: Clients,
     lookup: IpLookup,
+    /// The networks seen on the event stream, which is what the status poll
+    /// asks each observer about. A set of names rather than anything per
+    /// connection: with `--network` it holds that one from the start, and
+    /// otherwise it fills in as events arrive.
+    networks: StdRwLock<BTreeSet<String>>,
+    /// The latest status update per network, so a client that subscribes
+    /// between two polls is answered at once rather than after a minute.
+    latest_status: StdRwLock<BTreeMap<String, Arc<str>>>,
+    /// Raised when a client subscribes to the status and there is nothing
+    /// cached to give it, so it waits for one round trip instead of for the
+    /// next interval.
+    poll_now: Notify,
+}
+
+impl Shared {
+    /// Notes a network seen on the event stream. Takes the write lock only
+    /// for one it has not seen, which after the first event of each is never.
+    fn note_network(&self, network: &str) {
+        if self
+            .networks
+            .read()
+            .expect("networks lock")
+            .contains(network)
+        {
+            return;
+        }
+        self.networks
+            .write()
+            .expect("networks lock")
+            .insert(network.to_owned());
+    }
 }
 
 /// The peer's autonomous system, or `None` without an asmap and for an
@@ -205,9 +272,15 @@ pub async fn run(
             IpLookup::none()
         }
     };
+    // With one network given it is known from the start; otherwise the status
+    // poll learns which observers are out there from their events.
+    let networks: BTreeSet<String> = args.network.iter().cloned().collect();
     let shared = Arc::new(Shared {
         clients: Arc::new(Mutex::new(HashMap::new())),
         lookup,
+        networks: StdRwLock::new(networks),
+        latest_status: StdRwLock::new(BTreeMap::new()),
+        poll_now: Notify::new(),
     });
 
     let nats = async_nats::connect(&args.nats_url)
@@ -240,6 +313,40 @@ pub async fn run(
         })
     };
 
+    let status_task: Option<JoinHandle<()>> = (args.status_interval_secs > 0).then(|| {
+        let shared = Arc::clone(&shared);
+        let nats = nats.clone();
+        let period = Duration::from_secs(args.status_interval_secs);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(period);
+            loop {
+                // Either the interval came round, or a client just asked for
+                // a status it cannot be given from the cache.
+                let on_demand = tokio::select! {
+                    _ = ticker.tick() => false,
+                    _ = shared.poll_now.notified() => true,
+                };
+                // An observer is not polled to fill a cache nobody reads.
+                if !on_demand && !wants_status(&shared.clients).await {
+                    continue;
+                }
+                let networks: Vec<String> = shared
+                    .networks
+                    .read()
+                    .expect("networks lock")
+                    .iter()
+                    .cloned()
+                    .collect();
+                for network in networks {
+                    poll_status(&shared, &nats, &network).await;
+                }
+            }
+        })
+    });
+    if status_task.is_none() {
+        tracing::info!(target: TARGET, "status updates are off (--status-interval-secs 0)");
+    }
+
     let listener = TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("binding websocket server to {}", args.listen))?;
@@ -271,6 +378,9 @@ pub async fn run(
     }
     tracing::info!(target: TARGET, "shutting down");
     nats_task.abort();
+    if let Some(task) = status_task {
+        task.abort();
+    }
     shared.clients.lock().await.clear();
     Ok(())
 }
@@ -299,6 +409,9 @@ async fn broadcast(
 /// when none does -- the common case for the address gossip, which no page
 /// subscribes to by default.
 async fn handle_event(shared: &Shared, network: &str, event: &PeerEvent) {
+    // Which observers are out there, for the status poll to ask. Only the
+    // first event of a network takes a write lock.
+    shared.note_network(network);
     let wanted = shared
         .clients
         .lock()
@@ -317,6 +430,101 @@ async fn handle_event(shared: &Shared, network: &str, event: &PeerEvent) {
         return;
     };
     broadcast(&shared.clients, text, |s| s.wants(event)).await;
+}
+
+/// Whether any client has subscribed to the status updates.
+async fn wants_status(clients: &Clients) -> bool {
+    clients
+        .lock()
+        .await
+        .values()
+        .any(|c| c.subscriptions.connection_status)
+}
+
+/// Asks one observer what it is connected to, and sends the answer on.
+///
+/// The reply is passed through as it arrived, with the autonomous system of
+/// each peer added where an asmap is loaded, so a field the observer adds
+/// later needs no change here. A failed or late reply is logged and skipped:
+/// the next interval tries again, and a page keeps the snapshot it has.
+async fn poll_status(shared: &Shared, nats: &async_nats::Client, network: &str) {
+    let subject = format!("p2p-observer.{network}.rpc.connections.list");
+    let reply =
+        match tokio::time::timeout(STATUS_RPC_TIMEOUT, nats.request(subject, "".into())).await {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(e)) => {
+                tracing::warn!(target: TARGET, network, "status request failed: {e}");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(target: TARGET, network, "status request timed out");
+                return;
+            }
+        };
+
+    let mut value: serde_json::Value = match serde_json::from_slice(&reply.payload) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(target: TARGET, network, "status reply is not JSON: {e}");
+            return;
+        }
+    };
+    // An observer that could not answer says so in the reply rather than by
+    // failing the request.
+    if let Some(error) = value.get("error") {
+        tracing::warn!(target: TARGET, network, %error, "observer refused the status request");
+        return;
+    }
+    annotate_peers(&shared.lookup, &mut value);
+
+    let connections = value
+        .get("connections")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let Some(text) = encode(
+        "status",
+        Outgoing::Status(StatusUpdate {
+            network,
+            connections: value,
+        }),
+    ) else {
+        return;
+    };
+    tracing::debug!(target: TARGET, network, connections, bytes = text.len(), "status update");
+
+    shared
+        .latest_status
+        .write()
+        .expect("status lock")
+        .insert(network.to_owned(), Arc::clone(&text));
+    broadcast(&shared.clients, text, |s| s.connection_status).await;
+}
+
+/// Adds the autonomous system of every peer in a status reply, in place.
+fn annotate_peers(lookup: &IpLookup, value: &mut serde_json::Value) {
+    if !lookup.available() {
+        return;
+    }
+    let Some(connections) = value
+        .get_mut("connections")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for connection in connections {
+        let Some(addr) = connection.get("addr").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(info) = ip_info(lookup, addr) else {
+            continue;
+        };
+        if let Some(object) = connection.as_object_mut()
+            && let Ok(info) = serde_json::to_value(info)
+        {
+            object.insert("ip".to_owned(), info);
+        }
+    }
 }
 
 fn encode<T: Serialize>(what: &str, value: T) -> Option<Arc<str>> {
@@ -387,8 +595,29 @@ async fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Shared>)
                     break;
                 };
                 client.subscriptions = subs;
+                drop(clients);
                 if !subs.any() {
                     tracing::debug!(target: TARGET, client = %addr, "client subscribed to nothing");
+                }
+                // A page that wants the status wants it now, not at the next
+                // interval: give it what is cached, and ask for a poll when
+                // there is nothing to give.
+                if subs.connection_status {
+                    let cached: Vec<Arc<str>> = shared
+                        .latest_status
+                        .read()
+                        .expect("status lock")
+                        .values()
+                        .cloned()
+                        .collect();
+                    if cached.is_empty() {
+                        shared.poll_now.notify_one();
+                    }
+                    for text in cached {
+                        if tx.send(text).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
             _ => {}
