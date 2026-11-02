@@ -49,7 +49,10 @@ websocket over `wss://` (e.g. behind nginx) when exposing them.
   kernel's view of the socket. Only the rows in view are rendered, so the
   table holds up at tens of thousands of connections. Counting block
   announcements per peer means receiving one event per connection per block,
-  so it is a checkbox rather than the default.
+  so it is a checkbox rather than the default. The page subscribes to the
+  status updates as well, so it shows the whole population rather than only
+  the connections something has happened on since it was opened, and the
+  summary says how recently that was true.
 * `sessions.html` – a log of the sessions that have ended since the page was
   opened, newest first: how long each ran, how it ended, what the peer
   claimed in its handshake and what it sent while it was up. Separate from
