@@ -37,6 +37,11 @@ let asmapLoaded = false;
 // "nothing to show" everywhere on this page.
 let seenEvent = false;
 let rows = [];
+// When the last status update was taken, and how many attempts were in
+// flight then: the population is complete as of that moment, which is worth
+// saying on a page that otherwise only knows what it has been told.
+let statusAtMs = null;
+let statusDialing = null;
 
 const filterEl = document.getElementById("filter");
 const onlyHandshakeEl = document.getElementById("only-handshake");
@@ -59,6 +64,10 @@ function subscriptions() {
     fee_filters: true,
     send_cmpcts: true,
     block_announcements: countBlocksEl.checked,
+    // What is connected, which no event can say: without it a session that
+    // handshook before this page did shows up only when something next
+    // happens on it, with every handshake column empty for good.
+    connection_status: true,
   };
 }
 
@@ -183,6 +192,92 @@ function apply(ev) {
     default:
       break;
   }
+}
+
+// Fills the table from an observer's snapshot of its live sessions: the rows
+// it has never seen an event for, and the handshake columns of the rows it
+// met mid-session.
+//
+// The snapshot wins on what the handshake settled, which does not change for
+// the life of a session, and never on what events carry better: a round trip
+// measured a moment ago beats one from the last ping, and the counts of pings
+// and blocks are this page's own tally.
+function applyStatus(status) {
+  seenEvent = true;
+  const taken = status.taken_ms || nowMs();
+  const seen = new Set();
+
+  for (const c of status.connections || []) {
+    // The same key an event would produce: a connection id counts from zero
+    // per observer run, so it only identifies a connection with the run.
+    const key = status.network + "/" + String(status.instance_id) + "/" + c.connection_id;
+    seen.add(key);
+    const { ip, port } = splitAddr(c.addr);
+    let peer = peers.get(key);
+    if (!peer) {
+      peer = {
+        key,
+        network: status.network,
+        instance_id: String(status.instance_id),
+        connection_id: c.connection_id,
+        peer_addr: c.addr,
+        peer_ip: ip,
+        peer_port: port,
+        fee_filter: null,
+        sendcmpct: null,
+        pings: 0,
+        rtt_ms: null,
+        min_rtt_ms: null,
+        tcp: null,
+        blocks: 0,
+        blocks_new: 0,
+      };
+      peers.set(key, peer);
+    }
+    // Every session here is past its handshake, so these are known.
+    peer.handshake = true;
+    peer.user_agent = c.user_agent || peer.user_agent || "";
+    peer.transport = c.transport_version === 1 ? "v1" : c.transport_version === 2 ? "v2" : "unknown";
+    peer.protocol_version = c.protocol_version;
+    peer.services = c.services;
+    peer.start_height = c.start_height;
+    peer.relay = c.relay;
+    peer.sendaddrv2 = c.sendaddrv2;
+    peer.wtxid_relay = c.wtxid_relay;
+    peer.addr_recv = c.addr_recv || "";
+    peer.clock_skew_s = Math.round(c.peer_timestamp - c.connected_ms / 1000);
+    if (c.ip && !peer.ip) peer.ip = c.ip;
+    // When the handshake completed, which is the session's real age; a row
+    // built from events can only know when this page first saw one.
+    if (c.connected_ms) peer.first_seen_ms = c.connected_ms;
+    // Being listed is proof the session is alive, so it does not age out for
+    // being quiet. A peer sends nothing for hours and is still connected.
+    peer.last_seen_ms = Math.max(peer.last_seen_ms || 0, taken);
+    // Only as a fallback: these are from the session's last ping, and this
+    // page's own samples are newer.
+    if (peer.rtt_ms === null && c.rtt_ms !== null && c.rtt_ms !== undefined) {
+      peer.rtt_ms = c.rtt_ms;
+    }
+    if (peer.min_rtt_ms === null && c.min_rtt_ms !== null && c.min_rtt_ms !== undefined) {
+      peer.min_rtt_ms = c.min_rtt_ms;
+    }
+    noteHeight(status.network, c.start_height);
+    if (peer.height_delta === null || peer.height_delta === undefined) {
+      peer.height_delta = heightDelta(status.network, c.start_height);
+    }
+  }
+
+  // Reconcile: a row the observer does not list is gone. Only for rows older
+  // than the snapshot, because a session that handshook after it was taken is
+  // rightly missing from it.
+  for (const [key, peer] of peers) {
+    if (peer.network === status.network && !seen.has(key) && peer.first_seen_ms < taken) {
+      peers.delete(key);
+    }
+  }
+
+  statusAtMs = taken;
+  statusDialing = status.dialing;
 }
 
 function heightDelta(network, startHeight) {
@@ -356,6 +451,10 @@ function refresh() {
   summaryEl.textContent = seenEvent
     ? rows.length + " of " + peers.size + " connections shown, " + handshaked + " with handshake" +
       (other ? ", " + other + " on another chain" : "") +
+      (statusAtMs
+        ? " · complete as of " + time(statusAtMs) +
+          (statusDialing ? ", " + statusDialing + " attempts dialling then" : "")
+        : " · only what has been seen since this page connected") +
       (asmapLoaded ? "" : " · no asmap loaded (start websocket with --asmap)")
     : "";
   sources.render(sourcesEl);
@@ -371,6 +470,7 @@ function onMessage(e) {
     return;
   }
   if (msg.event) apply(msg.event);
+  if (msg.status) applyStatus(msg.status);
 }
 
 function onReset() {
@@ -379,6 +479,8 @@ function onReset() {
   sources.clear();
   seenEvent = false;
   rows = [];
+  statusAtMs = null;
+  statusDialing = null;
   refresh();
 }
 

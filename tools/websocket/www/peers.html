@@ -64,14 +64,17 @@
     <p id="peers-empty" class="empty" data-placeholder="waiting:waiting for the first event"><span class="spinner big" title="waiting for the first event" aria-label="waiting"></span> waiting for the first event</p>
   </div>
   <p class="note dim">
-    Every connection the observer has reported an event for, built in this page from the event stream:
-    a connection appears with its first event and goes when its session ends, which the ended
-    sessions page keeps a log of. The last column is the
+    Every connection the observer has open, built in this page from the event stream and from the
+    status update the observer answers every minute: a connection appears with its first event or in
+    the next status update, and goes when its session ends, which the ended sessions page keeps a log
+    of. The last column is the
     kernel's smoothed round trip; hover it for the rest of the TCP sample. Only the rows in view are
     rendered, so the table stays usable at tens of thousands of connections.
     Counting block announcements means one message per connection per block: it is off by default.
-    A spinner means no message has carried that value yet. A greyed row is a connection that was
-    already open when this page connected: its handshake is in the past, so those columns stay empty.
+    A spinner means no message has carried that value yet. A greyed row is a connection whose
+    handshake happened before this page connected and before the last status update, so what the peer
+    claimed is not known yet; the next status update fills it in. The summary says how recently the
+    population was complete.
   </p>
 </main>
 <script src="js/websocket-picker.js"></script>
