@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>p2p-observer · ended sessions</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header>
+  <nav><b>p2p-observer</b>
+    <a href="index.html">overview</a>
+    <a href="peers.html">connections</a>
+    <a href="sessions.html" class="active">ended sessions</a>
+    <a href="blocks.html">blocks</a>
+  </nav>
+  <div id="websocket-picker"></div>
+  <p id="status" class="dim">not connected</p>
+  <div id="sources" data-placeholder="waiting:waiting for the first event"><span class="spinner big" title="waiting for the first event" aria-label="waiting"></span> waiting for the first event</div>
+</header>
+<main>
+  <div class="controls">
+    <input id="filter" type="search" placeholder="filter: network, ip, user agent, AS name, reason…" spellcheck="false">
+    <label><input id="only-silent" type="checkbox"> sent nothing only</label>
+    <label><input id="only-unclean" type="checkbox"> unclean ends only</label>
+    <span id="summary" class="dim"></span>
+  </div>
+  <div class="log">
+    <table id="sessions">
+      <thead>
+        <tr>
+          <th data-key="network">net</th>
+          <th data-key="peer_ip">peer</th>
+          <th data-key="asn" class="num">ASN</th>
+          <th data-key="as_name">AS</th>
+          <th data-key="transport">tr</th>
+          <th data-key="user_agent">user agent</th>
+          <th data-key="start_height" class="num">height</th>
+          <th data-key="uptime_ms" class="num">uptime</th>
+          <th data-key="setup_ms" class="num">setup</th>
+          <th data-key="reason">ended</th>
+          <th data-key="messages">messages received</th>
+          <th data-key="unsolicited_pongs" class="num">pongs</th>
+          <th data-key="ended_at_ms">at</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <p id="sessions-empty" class="empty" data-placeholder="waiting:waiting for the first event"><span class="spinner big" title="waiting for the first event" aria-label="waiting"></span> waiting for the first event</p>
+  </div>
+  <p class="note dim">
+    Every session whose end the observer reported while this page was open, newest first. A session
+    that is still running is on the connections page; this one only grows, so it keeps the most recent
+    few hundred and forgets the rest. Uptime is the session itself and setup is the dial and handshake
+    before it. Height is what the peer claimed in its handshake, and is empty for a session that
+    handshook before this page connected. A session with no message received taught us nothing: the
+    peer completed the handshake, said nothing and went away, which a fleet of such peers does on a
+    timer. Attempts that never reached a session are not here, and counting attempts by outcome belongs
+    in a metrics endpoint rather than in a log.
+  </p>
+</main>
+<script src="js/websocket-picker.js"></script>
+<script src="js/common.js"></script>
+<script src="js/sessions.js"></script>
+</body>
+</html>
