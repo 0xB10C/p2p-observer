@@ -732,6 +732,7 @@ mod tests {
             height,
             new_to_us,
             compact_block: None,
+            unplaced: None,
         }
     }
 
