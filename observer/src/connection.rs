@@ -207,6 +207,12 @@ fn classify_session_end(err: Option<&anyhow::Error>) -> common::events::Disconne
     if err.downcast_ref::<crate::protocol::PingTimeout>().is_some() {
         return R::PingTimeout;
     }
+    if err
+        .downcast_ref::<crate::protocol::ProtocolViolation>()
+        .is_some()
+    {
+        return R::ProtocolViolation;
+    }
 
     if has_kind(err, std::io::ErrorKind::ConnectionReset)
         || has_kind(err, std::io::ErrorKind::BrokenPipe)
