@@ -257,12 +257,34 @@ const CLASS_UNKNOWN: usize = 0;
 const CLASS_WAS_GOOD: usize = 1;
 const CLASS_BAD: usize = 2;
 
+/// How many entries one eviction pass reclaims.
+///
+/// Finding a victim means walking the table, and the table holds up to two
+/// million entries. Reclaiming one entry per walk made the cost of learning an
+/// address proportional to how many we already knew: a reply to our own
+/// GETADDR is a thousand addresses and is exempt from the gossip rate limit --
+/// we asked for it -- so one new connection could cost a thousand full walks,
+/// on the manager task, which is also the task that starts every dial.
+///
+/// A pass now takes a batch of victims while it is already walking, so the
+/// walk happens once per batch rather than once per address. Which entries go
+/// is unchanged: anything past its forget rule first, then unknowns at random,
+/// never an address we have reached and never a manual one.
+const EVICTION_BATCH: usize = 1_024;
+
+/// Never take more than this fraction of the table in one pass, so a small
+/// configured capacity does not lose most of what it knows to one flood.
+const EVICTION_BATCH_SHARE: usize = 16;
+
 pub struct Book {
     entries: HashMap<PeerAddr, Entry>,
     active: HashMap<PeerAddr, Phase>,
     /// Carried-over fractional dial budget for unknown / was_good / bad.
     credit: [f32; 3],
     capacity: usize,
+    /// Eviction passes made, so a test can show the walk is amortised rather
+    /// than paid per address.
+    eviction_passes: u64,
     rng: Rng,
 }
 
@@ -273,6 +295,7 @@ impl Book {
             active: HashMap::new(),
             credit: [0.0; 3],
             capacity,
+            eviction_passes: 0,
             rng: Rng::new(seed),
         }
     }
@@ -363,7 +386,7 @@ impl Book {
                 continue;
             }
 
-            if self.entries.len() >= self.capacity && !self.evict_one(now) {
+            if self.entries.len() >= self.capacity && !self.evict_batch(now) {
                 // Nothing evictable: the book is full of addresses we have
                 // reason to keep. Drop the new one rather than grow.
                 continue;
@@ -398,16 +421,25 @@ impl Book {
         added
     }
 
-    /// Drop one entry to make room. Prefers an entry already past its forget
-    /// rule; failing that, a random unknown.
+    /// Drop up to [`EVICTION_BATCH`] entries to make room, and say whether
+    /// there is any. Prefers entries already past their forget rule; failing
+    /// that, unknowns at random.
     ///
-    /// Entries that have connected before are never evicted to make room for a new
-    /// unknown one, which is what stops a flood of invented addresses from
+    /// Entries that have connected before are never evicted to make room for a
+    /// new unknown one, which is what stops a flood of invented addresses from
     /// displacing peers we have actually reached. Manual entries are never
-    /// evicted at all.
-    fn evict_one(&mut self, now: u32) -> bool {
-        let mut forgettable: Option<PeerAddr> = None;
-        let mut unknown = Reservoir::new(1);
+    /// evicted at all, and neither is an address a connection is using right
+    /// now.
+    ///
+    /// A batch rather than one entry because the walk is the expensive part:
+    /// see [`EVICTION_BATCH`].
+    fn evict_batch(&mut self, now: u32) -> bool {
+        self.eviction_passes += 1;
+        let batch = EVICTION_BATCH
+            .min(self.capacity / EVICTION_BATCH_SHARE)
+            .max(1);
+        let mut forgettable: Vec<PeerAddr> = Vec::new();
+        let mut unknown = Reservoir::new(batch);
 
         for (addr, entry) in &self.entries {
             if entry.origin == Origin::Manual || self.active.contains_key(addr) {
@@ -420,8 +452,13 @@ impl Book {
                 entry.last_announced,
                 entry.failures,
             ) {
-                forgettable = Some(*addr);
-                break;
+                forgettable.push(*addr);
+                // Enough to fill the batch from entries nothing is waiting on;
+                // the rest of the table can stay unread.
+                if forgettable.len() >= batch {
+                    break;
+                }
+                continue;
             }
             if entry.class() == Class::Unknown {
                 unknown.offer(
@@ -434,14 +471,20 @@ impl Book {
             }
         }
 
-        let victim = forgettable.or_else(|| unknown.items.first().map(|d| d.addr));
-        match victim {
-            Some(addr) => {
-                self.entries.remove(&addr);
-                true
+        let mut removed = 0;
+        for addr in &forgettable {
+            if self.entries.remove(addr).is_some() {
+                removed += 1;
             }
-            None => false,
         }
+        // Unknowns only make up what the forget rule did not, so a table full
+        // of entries worth keeping still loses as little as possible.
+        for dial in unknown.items.iter().take(batch - removed) {
+            if self.entries.remove(&dial.addr).is_some() {
+                removed += 1;
+            }
+        }
+        removed > 0
     }
 
     /// Drop every entry matching a newly added ban.
@@ -858,6 +901,40 @@ mod tests {
     }
 
     // ── Growth ───────────────────────────────────────────────────────────────
+
+    fn invented(i: u32) -> Gossiped {
+        let b = i.to_be_bytes();
+        Gossiped {
+            addr: PeerAddr::Ipv4([100, b[1], b[2], b[3]], 8333),
+            services: 0,
+            ntime: NOW,
+        }
+    }
+
+    /// The table is walked once per batch of victims, not once per address
+    /// learned. A reply to our own GETADDR is a thousand addresses and is not
+    /// rate limited, so one walk each meant a thousand walks of up to two
+    /// million entries, on the task that also starts every dial.
+    #[test]
+    fn test_eviction_walks_the_table_once_per_batch() {
+        let cap = 20_000;
+        let mut t = Book::new(cap, 1);
+        let bl = empty_banlist();
+
+        let fill: Vec<Gossiped> = (0..cap as u32).map(invented).collect();
+        t.ingest(NOW, &fill, &bl);
+        assert_eq!(t.len(), cap);
+        assert_eq!(t.eviction_passes, 0, "a table with room evicts nothing");
+
+        // A thousand more, as one getaddr reply brings.
+        let more: Vec<Gossiped> = (0..1_000u32).map(|i| invented(100_000 + i)).collect();
+        let added = t.ingest(NOW, &more, &bl);
+        assert_eq!(added, 1_000);
+        assert!(t.len() <= cap, "capacity exceeded: {}", t.len());
+        // One pass freed a batch of 1024 and the thousand inserts fitted in
+        // it. Before this that was a thousand passes.
+        assert_eq!(t.eviction_passes, 1);
+    }
 
     #[test]
     fn test_flood_cannot_grow_the_table_past_capacity() {
