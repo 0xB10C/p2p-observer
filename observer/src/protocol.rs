@@ -70,6 +70,29 @@ pub(crate) fn other_chain_of(err: &common::anyhow::Error) -> Option<&OtherChain>
         .or_else(|| err.chain().find_map(|c| c.downcast_ref::<OtherChain>()))
 }
 
+/// The peer stopped answering pings, see [`PING_TIMEOUT`].
+///
+/// A type rather than a message so that the session end is recognised by what
+/// it is, the way [`crate::transport::Fault`] and [`crate::connection::Stage`]
+/// are: the alternative is matching on prose.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PingTimeout {
+    /// How long we had been waiting for an answer.
+    pub(crate) waited: Duration,
+}
+
+impl std::fmt::Display for PingTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "no pong in {} seconds, with a ping outstanding",
+            self.waited.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for PingTimeout {}
+
 pub(crate) const USER_AGENT: &str = "/p2p-observer:0.1.0/";
 
 /// Maximum time allowed for the version handshake once the transport is up.
@@ -138,6 +161,16 @@ const MAX_HEADERS_ANNOUNCED: usize = 8;
 /// which an answer is treated as one we never asked for.
 const OUTSTANDING_PINGS: usize = 10;
 
+/// How long a ping may go unanswered before the session is over.
+///
+/// Nothing else ends a session with a peer that acknowledges our packets and
+/// answers none of them. TCP_USER_TIMEOUT only fires on data a peer leaves
+/// unacknowledged, so to the kernel such a connection is in perfect health,
+/// and the task holds its socket, its buffers and the address's slot in the
+/// active set for as long as the process runs. Bitcoin Core gives a peer the
+/// same twenty minutes (its TIMEOUT_INTERVAL) before dropping it.
+const PING_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
 /// Distinct commands counted per session.
 ///
 /// The command string comes off the wire, so the key space belongs to the
@@ -153,6 +186,13 @@ struct ConnectionStats {
     outstanding_pings: VecDeque<u64>,
     /// Pongs carrying a nonce we never sent.
     unsolicited_pongs: u32,
+    /// When the peer last answered a ping, or the handshake if it never has.
+    ///
+    /// The deadline runs from here rather than from the oldest outstanding
+    /// ping, because [`OUTSTANDING_PINGS`] forgets the oldest once the queue
+    /// is full: at a short ping interval the front of that queue is never more
+    /// than a few minutes old, however long the peer has been quiet.
+    last_pong: Instant,
     /// Messages received from the peer, by command.
     messages_by_command: BTreeMap<String, u32>,
     /// Messages received whose command did not fit the cap.
@@ -165,6 +205,7 @@ impl ConnectionStats {
             rtt_history: VecDeque::new(),
             outstanding_pings: VecDeque::new(),
             unsolicited_pongs: 0,
+            last_pong: Instant::now(),
             messages_by_command: BTreeMap::new(),
             messages_other: 0,
         }
@@ -188,6 +229,7 @@ impl ConnectionStats {
         match self.outstanding_pings.iter().position(|n| *n == nonce) {
             Some(i) => {
                 self.outstanding_pings.remove(i);
+                self.last_pong = Instant::now();
                 true
             }
             None => {
@@ -195,6 +237,16 @@ impl ConnectionStats {
                 false
             }
         }
+    }
+
+    /// How long the peer has owed us an answer, once that is too long.
+    ///
+    /// `None` while nothing is outstanding: a peer we have not pinged owes us
+    /// nothing, and silence on its own is not something to disconnect over --
+    /// a peer that only listens is still a peer worth observing.
+    fn ping_timed_out(&self, now: Instant) -> Option<Duration> {
+        let waited = now.saturating_duration_since(self.last_pong);
+        (!self.outstanding_pings.is_empty() && waited >= PING_TIMEOUT).then_some(waited)
     }
 
     /// Count one received message against its command.
@@ -576,10 +628,27 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         // state across cancellations, so the ping timer can fire without losing bytes.
         loop {
             tokio::select! {
-                _ = ping_timer.tick() => self.send_ping().await?,
+                _ = ping_timer.tick() => self.ping_tick().await?,
                 msg = self.reader.recv() => self.handle_message(msg?).await?,
             }
         }
+    }
+
+    /// The ping timer fired: either the peer has owed us an answer for too
+    /// long, or it gets another ping.
+    ///
+    /// Checked here rather than on its own timer: the deadline is twenty
+    /// minutes and the interval is minutes, so the tick is a fine enough
+    /// grain, and one timer is one place where the session can end.
+    async fn ping_tick(&mut self) -> Result<()> {
+        if let Some(waited) = self.stats.ping_timed_out(Instant::now()) {
+            tracing::debug!(target: TARGET,
+                waited_secs = waited.as_secs(),
+                "peer stopped answering pings"
+            );
+            return Err(PingTimeout { waited }.into());
+        }
+        self.send_ping().await
     }
 
     async fn send_ping(&mut self) -> Result<()> {
@@ -1736,6 +1805,38 @@ mod tests {
         assert!(!stats.claim_pong(2));
         assert!(stats.claim_pong(3));
         assert_eq!(stats.unsolicited_pongs, 2);
+    }
+
+    #[test]
+    fn test_a_peer_that_stops_answering_pings_runs_out_of_time() {
+        let mut stats = ConnectionStats::new();
+        let handshake = stats.last_pong;
+
+        // Nothing outstanding: a peer that only listens owes us nothing,
+        // however long it has been quiet.
+        assert!(stats.ping_timed_out(handshake + PING_TIMEOUT * 2).is_none());
+
+        stats.record_ping(1);
+        assert!(stats.ping_timed_out(handshake + PING_TIMEOUT / 2).is_none());
+        let waited = stats
+            .ping_timed_out(handshake + PING_TIMEOUT)
+            .expect("the deadline has passed with a ping outstanding");
+        assert!(waited >= PING_TIMEOUT, "{waited:?}");
+
+        // Filling the queue past what it remembers must not reset the clock:
+        // the deadline runs from the last answer, not from the oldest ping
+        // still in the queue.
+        for nonce in 2..(OUTSTANDING_PINGS as u64 + 4) {
+            stats.record_ping(nonce);
+        }
+        assert!(stats.ping_timed_out(handshake + PING_TIMEOUT).is_some());
+
+        // An answer puts the deadline off, from the moment it arrived.
+        assert!(stats.claim_pong(5));
+        let answered = stats.last_pong;
+        assert!(answered >= handshake);
+        assert!(stats.ping_timed_out(answered + PING_TIMEOUT / 2).is_none());
+        assert!(stats.ping_timed_out(answered + PING_TIMEOUT).is_some());
     }
 
     #[test]

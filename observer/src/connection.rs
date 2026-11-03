@@ -202,6 +202,12 @@ fn classify_session_end(err: Option<&anyhow::Error>) -> common::events::Disconne
         };
     }
 
+    // Our own deadline rather than anything the transport saw, so it is read
+    // from the type the message loop ended with.
+    if err.downcast_ref::<crate::protocol::PingTimeout>().is_some() {
+        return R::PingTimeout;
+    }
+
     if has_kind(err, std::io::ErrorKind::ConnectionReset)
         || has_kind(err, std::io::ErrorKind::BrokenPipe)
         || has_kind(err, std::io::ErrorKind::ConnectionAborted)
