@@ -196,6 +196,7 @@ fn classify_session_end(err: Option<&anyhow::Error>) -> common::events::Disconne
             Fault::PeerClosed => R::PeerClosed,
             Fault::Truncated => R::Truncated,
             Fault::Decode => R::DecodeError,
+            Fault::Oversized => R::OversizedMessage,
             Fault::V2Decrypt => R::V2DecryptError,
             Fault::Write => R::WriteError,
         };
@@ -1086,6 +1087,7 @@ mod tests {
             (Fault::PeerClosed, R::PeerClosed),
             (Fault::Truncated, R::Truncated),
             (Fault::Decode, R::DecodeError),
+            (Fault::Oversized, R::OversizedMessage),
             (Fault::V2Decrypt, R::V2DecryptError),
             (Fault::Write, R::WriteError),
         ] {

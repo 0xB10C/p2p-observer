@@ -293,6 +293,10 @@ enum DisconnectReason {
   // the archive says what the peer was following when we dropped it. Its
   // address is then left alone for a day.
   DISCONNECT_REASON_OTHER_CHAIN = 8;
+  // A v1 header declared a payload longer than any message that could be
+  // decoded. Told apart from DECODE_ERROR because nothing was decoded: the
+  // message never arrived, only a claim about its size.
+  DISCONNECT_REASON_OVERSIZED_MESSAGE = 9;
 }
 
 // Why an attempt never reached a session.
