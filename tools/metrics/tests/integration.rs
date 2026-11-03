@@ -300,6 +300,7 @@ async fn test_events_become_metrics() {
             messages_other: 0,
             unsolicited_pongs: 0,
             undecodable: 0,
+            getheaders_ignored: 0,
         })),
     };
     h.publish(

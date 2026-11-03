@@ -1122,6 +1122,7 @@ mod tests {
                 messages_other: 4,
                 unsolicited_pongs: 1,
                 undecodable: 0,
+                getheaders_ignored: 0,
             })),
         };
         // A peer that completed the handshake, said nothing for a minute and

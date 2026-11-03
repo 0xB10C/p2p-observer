@@ -206,6 +206,33 @@ const OUTSTANDING_PINGS: usize = 10;
 /// same twenty minutes (its TIMEOUT_INTERVAL) before dropping it.
 const PING_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
+/// Tokens for answering a GETHEADERS, and how fast they come back.
+///
+/// The one request a peer can make of us that is cheap to send and expensive
+/// to answer: a locator is a few hundred bytes, the reply is up to two
+/// thousand headers -- a hundred and sixty kilobytes -- copied out of the tree
+/// under its read lock, which every connection inserting a header then waits
+/// for. Nothing stopped a peer asking in a loop.
+///
+/// A peer asks once when the session opens, and again only if it announces a
+/// block whose parent it thinks we lack. We announce nothing, so that is rare:
+/// four to start with and one every thirty seconds is far more than any
+/// implementation uses, and it holds what one peer can draw out of us to a
+/// reply every thirty seconds.
+///
+/// Not a reflection -- TCP cannot be reflected, so a peer asking has to take
+/// the bytes itself. What the limit protects is the uplink, which is finite
+/// and shared with the job of reaching every other peer, against an asker
+/// spending a hundred bytes per request in the direction that is cheap for
+/// them.
+///
+/// Over the limit the request is dropped rather than answered late or
+/// answered empty. An empty HEADERS means "I have nothing after your
+/// locator", which is a claim about the chain and not about our patience, and
+/// a peer that believes it may stop asking the one question we want asked.
+const GETHEADERS_BURST: f64 = 4.0;
+const GETHEADERS_RATE_PER_SEC: f64 = 1.0 / 30.0;
+
 /// Distinct commands counted per session.
 ///
 /// The command string comes off the wire, so the key space belongs to the
@@ -221,6 +248,8 @@ struct ConnectionStats {
     outstanding_pings: VecDeque<u64>,
     /// Pongs carrying a nonce we never sent.
     unsolicited_pongs: u32,
+    /// GETHEADERS we did not answer, having run out of tokens.
+    getheaders_ignored: u32,
     /// When the peer last answered a ping, or the handshake if it never has.
     ///
     /// The deadline runs from here rather than from the oldest outstanding
@@ -240,6 +269,7 @@ impl ConnectionStats {
             rtt_history: VecDeque::new(),
             outstanding_pings: VecDeque::new(),
             unsolicited_pongs: 0,
+            getheaders_ignored: 0,
             last_pong: Instant::now(),
             messages_by_command: BTreeMap::new(),
             messages_other: 0,
@@ -348,6 +378,8 @@ pub(crate) struct SessionEnd {
     pub(crate) unsolicited_pongs: u32,
     /// Messages skipped because their payload would not deserialize.
     pub(crate) undecodable: u32,
+    /// GETHEADERS left unanswered by the rate limit.
+    pub(crate) getheaders_ignored: u32,
 }
 
 impl SessionEnd {
@@ -368,6 +400,9 @@ struct Connection<R: TransportReader, W: TransportWriter> {
     /// as fast as it can send.
     addr_tokens: f64,
     addr_tokens_updated: Instant,
+    /// The same, over answering GETHEADERS, see [`GETHEADERS_BURST`].
+    getheaders_tokens: f64,
+    getheaders_tokens_updated: Instant,
     /// Set while we are expecting the reply to our own GETADDR. That reply is
     /// solicited, so it is not charged against the bucket. Taken by the first
     /// addr message that is not the peer's own self-announcement.
@@ -462,6 +497,8 @@ pub(crate) async fn run_session(
         addrman: addrman.clone(),
         addr_tokens: policy::ADDR_BURST,
         addr_tokens_updated: Instant::now(),
+        getheaders_tokens: GETHEADERS_BURST,
+        getheaders_tokens_updated: Instant::now(),
         getaddr_outstanding: false,
         handshake_info: info,
         stats: ConnectionStats::new(),
@@ -499,6 +536,7 @@ pub(crate) async fn run_session(
         messages_other: conn.stats.messages_other,
         unsolicited_pongs: conn.stats.unsolicited_pongs,
         undecodable: conn.reader.undecodable(),
+        getheaders_ignored: conn.stats.getheaders_ignored,
     })
 }
 
@@ -1266,7 +1304,32 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         ));
     }
 
+    /// Whether this GETHEADERS gets an answer, spending a token if it does.
+    ///
+    /// The same token bucket as gossiped addresses, refilled on read so there
+    /// is no timer to keep: see [`GETHEADERS_BURST`].
+    fn may_answer_getheaders(&mut self) -> bool {
+        let elapsed = self.getheaders_tokens_updated.elapsed().as_secs_f64();
+        self.getheaders_tokens_updated = Instant::now();
+        self.getheaders_tokens =
+            (self.getheaders_tokens + elapsed * GETHEADERS_RATE_PER_SEC).min(GETHEADERS_BURST);
+        if self.getheaders_tokens < 1.0 {
+            return false;
+        }
+        self.getheaders_tokens -= 1.0;
+        true
+    }
+
     async fn handle_get_headers(&mut self, msg: GetHeadersMessage) -> Result<()> {
+        if !self.may_answer_getheaders() {
+            self.stats.getheaders_ignored = self.stats.getheaders_ignored.saturating_add(1);
+            tracing::debug!(target: TARGET,
+                locator_len = msg.locator_hashes.len(),
+                ignored = self.stats.getheaders_ignored,
+                "not answering getheaders: out of tokens"
+            );
+            return Ok(());
+        }
         let headers = self
             .header_tree
             .read()
@@ -1504,6 +1567,8 @@ mod tests {
             addrman,
             addr_tokens: policy::ADDR_BURST,
             addr_tokens_updated: Instant::now(),
+            getheaders_tokens: GETHEADERS_BURST,
+            getheaders_tokens_updated: Instant::now(),
             getaddr_outstanding: false,
             handshake_info: HandshakeInfo {
                 version,
@@ -1543,6 +1608,12 @@ mod tests {
         }
     }
 
+    fn headers_sent(w: &Captured) -> usize {
+        w.0.iter()
+            .filter(|m| matches!(m, NetworkMessage::Headers(_)))
+            .count()
+    }
+
     fn getheaders_sent(w: &Captured) -> usize {
         w.0.iter()
             .filter(|m| matches!(m, NetworkMessage::GetHeaders(_)))
@@ -1559,6 +1630,45 @@ mod tests {
         let second = nonce(build_version(USER_AGENT, 0));
         assert_ne!(first, 0);
         assert_ne!(first, second);
+    }
+
+    /// A peer may ask for headers faster than we are willing to answer: the
+    /// first few asks get a reply, the rest are dropped and counted. The reply
+    /// is up to two thousand headers for a locator of a few hundred bytes,
+    /// which is the whole reason this is metered.
+    #[tokio::test]
+    async fn test_getheaders_is_answered_only_so_often() {
+        use crate::headertree::testing::{mine_header, regtest_params};
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let (genesis, _) = tree.read().unwrap().tip();
+        let h1 = mine_header(genesis, 1_700_000_000, 1);
+        tree.write().unwrap().insert_batch(&[h1]);
+        let mut h = harness(tree);
+        let ask = GetHeadersMessage {
+            version: ProtocolVersion::WTXID_RELAY_VERSION,
+            locator_hashes: vec![genesis],
+            stop_hash: BlockHash::from_byte_array([0; 32]),
+        };
+
+        let burst = GETHEADERS_BURST as usize;
+        for _ in 0..burst + 3 {
+            h.conn.handle_get_headers(ask.clone()).await.unwrap();
+        }
+        // Answered while there were tokens, counted after that, and the
+        // session stays up either way: asking often is not a protocol
+        // violation, and hanging up would change what we are here to watch.
+        assert_eq!(headers_sent(&h.conn.writer), burst);
+        assert_eq!(h.conn.stats.getheaders_ignored, 3);
+
+        // Tokens come back with time.
+        h.conn.getheaders_tokens_updated = h
+            .conn
+            .getheaders_tokens_updated
+            .checked_sub(Duration::from_secs(60))
+            .expect("a monotonic clock older than a minute");
+        h.conn.handle_get_headers(ask).await.unwrap();
+        assert_eq!(headers_sent(&h.conn.writer), burst + 1);
+        assert_eq!(h.conn.stats.getheaders_ignored, 3);
     }
 
     #[test]
