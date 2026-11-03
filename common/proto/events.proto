@@ -297,6 +297,11 @@ enum DisconnectReason {
   // decoded. Told apart from DECODE_ERROR because nothing was decoded: the
   // message never arrived, only a claim about its size.
   DISCONNECT_REASON_OVERSIZED_MESSAGE = 9;
+  // The peer owed us an answer to a ping for twenty minutes. Our own
+  // deadline, not something the peer did: it kept acknowledging packets at
+  // the TCP level and answering nothing above it, which no socket timeout
+  // notices.
+  DISCONNECT_REASON_PING_TIMEOUT = 10;
 }
 
 // Why an attempt never reached a session.
