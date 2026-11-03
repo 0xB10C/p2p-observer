@@ -235,6 +235,12 @@ message ConnectionResult {
     // session with DISCONNECT_REASON_DECODE_ERROR, which is how every session
     // with a btcd peer ended -- on its addrv2 reply to our getaddr.
     uint32 undecodable = 7;
+    // GETHEADERS from this peer that went unanswered because it asked faster
+    // than the observer is willing to reply. Our own limit rather than
+    // anything the peer did wrong -- one request of a few hundred bytes is
+    // answered with up to two thousand headers -- and on the event because
+    // nothing else in the stream would say the reply never went out.
+    uint32 getheaders_ignored = 8;
   }
 
   // Never reached a session.

@@ -167,6 +167,7 @@ fn disconnected_result(
             messages_other: end.messages_other,
             unsolicited_pongs: end.unsolicited_pongs,
             undecodable: end.undecodable,
+            getheaders_ignored: end.getheaders_ignored,
         },
     )
 }
