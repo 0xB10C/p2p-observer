@@ -302,6 +302,9 @@ enum DisconnectReason {
   // the TCP level and answering nothing above it, which no socket timeout
   // notices.
   DISCONNECT_REASON_PING_TIMEOUT = 10;
+  // The peer went outside a protocol limit -- an INV above MAX_INV_SIZE, say
+  // -- which is not something an implementation does by accident.
+  DISCONNECT_REASON_PROTOCOL_VIOLATION = 11;
 }
 
 // Why an attempt never reached a session.
@@ -396,13 +399,16 @@ message BlockAnnouncement {
   // OS-level TCP statistics, sampled as the announcement arrived rather than
   // at the last ping, so the path state is contemporaneous with the block.
   optional TcpStats tcp_stats = 4;
-  // How many headers the message carrying this announcement held: 1 for an
-  // inv or a compact block, up to 8 for a HEADERS message, where more than
-  // one means the peer was catching us up rather than announcing one block.
+  // How many blocks the message carrying this announcement held: 1 for a
+  // compact block, the block items of an inv, the header count of a HEADERS
+  // message. More than one means the peer was catching us up rather than
+  // announcing one block.
   //
-  // A HEADERS message above that limit is a reply to our own getheaders and
-  // produces no announcements at all. One such reply used to appear as a
-  // thousand peers announcing a thousand new blocks.
+  // A HEADERS message above 8 is a reply to our own getheaders and produces
+  // no announcements at all. One such reply used to appear as a thousand peers
+  // announcing a thousand new blocks. An inv above that limit still announces,
+  // but only its first few items -- this count is where the size of the rest
+  // survives.
   uint32 batch_size = 5;
   // The block's height, when the tree can place it: always once a header has
   // been accepted, never for a hash the tree has not seen -- an inv for an

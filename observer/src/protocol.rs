@@ -93,6 +93,21 @@ impl std::fmt::Display for PingTimeout {
 
 impl std::error::Error for PingTimeout {}
 
+/// The peer went outside a protocol limit, so the session is over.
+///
+/// Carries its own description because there is nothing else to read it from:
+/// the limit that was broken is the observation.
+#[derive(Debug, Clone)]
+pub(crate) struct ProtocolViolation(pub(crate) String);
+
+impl std::fmt::Display for ProtocolViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProtocolViolation {}
+
 pub(crate) const USER_AGENT: &str = "/p2p-observer:0.1.0/";
 
 /// Maximum time allowed for the version handshake once the transport is up.
@@ -151,6 +166,26 @@ fn cap_user_agent(ua: &str) -> String {
 /// about a block -- and emitting one announcement per header turned a single
 /// reply into a thousand events that read as a thousand new blocks.
 const MAX_HEADERS_ANNOUNCED: usize = 8;
+
+/// The most blocks one INV may announce before the rest are only counted.
+///
+/// The same reasoning as [`MAX_HEADERS_ANNOUNCED`], and the same number: more
+/// block items than Core would ever announce at once is not a peer telling us
+/// about blocks. We never send getblocks either, so nothing we asked for comes
+/// back this way.
+///
+/// Past the cap the items are not acted on at all, rather than emitted and
+/// discarded later: every one of them costs a lookup in the header tree, an
+/// event, a log line and -- for a block the tree lacks -- a turn through the
+/// recovery throttle, which takes the tree's write lock. An INV is one message
+/// from one peer and must not be able to buy fifty thousand of those.
+const MAX_BLOCK_INVS_ANNOUNCED: usize = MAX_HEADERS_ANNOUNCED;
+
+/// The most items an INV may carry at all, past which the session ends.
+///
+/// The protocol's own limit, which Core disconnects over. Nothing legitimate
+/// comes close: a peer announcing blocks sends a handful.
+const MAX_INV_SIZE: usize = common::p2p::message::MAX_INV_SIZE;
 
 /// How many unanswered pings to remember.
 ///
@@ -687,43 +722,68 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
     }
 
     async fn handle_inv(&mut self, inv: Vec<Inventory>) -> Result<()> {
+        if inv.len() > MAX_INV_SIZE {
+            return Err(ProtocolViolation(format!(
+                "inv of {} items, over the protocol's {MAX_INV_SIZE}",
+                inv.len()
+            ))
+            .into());
+        }
+
+        // Counted before anything is emitted, so each announcement from this
+        // message can report how many blocks it came with -- the same thing
+        // `batch_size` says for a HEADERS announcement, and the only place the
+        // size of a flood survives into the stream.
+        let blocks = inv
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Inventory::Block(_) | Inventory::WitnessBlock(_) | Inventory::CompactBlock(_)
+                )
+            })
+            .count();
         let mut getdata = Vec::new();
+        let mut announced = 0;
 
         for item in inv {
-            match item {
-                Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
-                    tracing::info!(target: TARGET, %hash, "inv: block");
-                    let known = self.header_tree.read().unwrap().seen(&hash);
-                    self.emit_block_announcement(
-                        hash,
-                        common::events::AnnouncementType::Inv,
-                        1,
-                        !known,
-                        None,
-                    );
-                    // An inv carries no header, so a block we do not know is
-                    // only reachable by asking for headers.
-                    if !known {
-                        self.recover_headers(hash, false).await?;
-                    }
-                }
-                Inventory::CompactBlock(hash) => {
-                    tracing::info!(target: TARGET, %hash, "inv: compact block");
-                    let known = self.header_tree.read().unwrap().seen(&hash);
-                    self.emit_block_announcement(
-                        hash,
-                        common::events::AnnouncementType::Inv,
-                        1,
-                        !known,
-                        None,
-                    );
-                    getdata.push(Inventory::CompactBlock(hash));
-                    if !known {
-                        self.recover_headers(hash, false).await?;
-                    }
-                }
-                _ => {}
+            let (hash, compact) = match item {
+                Inventory::Block(hash) | Inventory::WitnessBlock(hash) => (hash, false),
+                Inventory::CompactBlock(hash) => (hash, true),
+                _ => continue,
+            };
+            if announced >= MAX_BLOCK_INVS_ANNOUNCED {
+                // Nothing further in the message is acted on, and the count
+                // above already has its size.
+                break;
             }
+            announced += 1;
+
+            tracing::info!(target: TARGET, %hash, compact, "inv: block");
+            let known = self.header_tree.read().unwrap().seen(&hash);
+            self.emit_block_announcement(
+                hash,
+                common::events::AnnouncementType::Inv,
+                blocks as u32,
+                !known,
+                None,
+            );
+            if compact {
+                getdata.push(Inventory::CompactBlock(hash));
+            }
+            // An inv carries no header, so a block we do not know is only
+            // reachable by asking for headers.
+            if !known {
+                self.recover_headers(hash, false).await?;
+            }
+        }
+
+        if blocks > announced {
+            tracing::debug!(target: TARGET,
+                blocks,
+                announced,
+                "inv announces more blocks than we act on"
+            );
         }
 
         if !getdata.is_empty() {
@@ -1766,6 +1826,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(getheaders_sent(&other.conn.writer), 0);
+    }
+
+    fn block_hashes(n: usize) -> Vec<Inventory> {
+        (0..n)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                Inventory::Block(BlockHash::from_byte_array(bytes))
+            })
+            .collect()
+    }
+
+    /// An inv past the protocol's own limit ends the session. No
+    /// implementation sends one by accident, and the alternative is doing
+    /// fifty thousand lookups because a peer asked us to.
+    #[tokio::test]
+    async fn test_an_inv_over_the_protocol_limit_ends_the_session() {
+        use crate::headertree::testing::regtest_params;
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let mut h = harness(tree);
+
+        let err = h
+            .conn
+            .handle_inv(block_hashes(MAX_INV_SIZE + 1))
+            .await
+            .expect_err("an inv over the limit");
+        assert!(err.downcast_ref::<ProtocolViolation>().is_some(), "{err:#}");
+        assert!(h.events.try_recv().is_err(), "nothing should be announced");
+    }
+
+    /// Under that limit but far above an announcement: the first few blocks
+    /// are announced, the rest are only counted. Without the cap one message
+    /// became tens of thousands of events, which both floods the queue and
+    /// reads back as a block storm that never happened.
+    #[tokio::test]
+    async fn test_an_inv_flood_announces_only_its_first_blocks() {
+        use crate::headertree::testing::regtest_params;
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let mut h = harness(tree);
+
+        let flood = 500;
+        h.conn.handle_inv(block_hashes(flood)).await.unwrap();
+
+        let mut announced = 0;
+        while let Ok(event) = h.events.try_recv() {
+            let Some(common::events::peer_event::Event::BlockAnnouncement(a)) = event.event else {
+                continue;
+            };
+            // Every announcement says how big the message really was, so the
+            // flood is still visible in the stream.
+            assert_eq!(a.batch_size, flood as u32);
+            announced += 1;
+        }
+        assert_eq!(announced, MAX_BLOCK_INVS_ANNOUNCED);
     }
 
     #[test]
