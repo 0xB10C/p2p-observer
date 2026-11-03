@@ -110,6 +110,21 @@ pub trait TransportWriter {
     async fn send(&mut self, msg: NetworkMessage) -> Result<()>;
 }
 
+/// Longest v1 payload we will read, in bytes.
+///
+/// The length is the one header field we have to act on before the message
+/// exists: the payload buffer used to be allocated straight from it, so a
+/// 24-byte header could ask for four gigabytes and the peer then filled it at
+/// whatever rate it liked -- the whole message has to arrive before anything
+/// can reject it, so the claim decided our memory.
+///
+/// Nothing above this would have decoded in any case:
+/// `RawNetworkMessage::consensus_decode` reads through a reader capped at
+/// `MAX_MSG_SIZE`, header included. So the check costs no message we could
+/// have used, and the allocation follows our limit instead of the peer's
+/// number.
+const MAX_V1_PAYLOAD: usize = common::p2p::message::MAX_MSG_SIZE - 24;
+
 /// A transport-level failure worth telling apart from the others.
 ///
 /// Attached as context and recovered by downcasting, the same way
@@ -130,6 +145,8 @@ pub enum Fault {
     /// A frame arrived that could not be read at all. A readable command with
     /// a payload that would not deserialize is not this: see [`undecodable`].
     Decode,
+    /// A v1 header declared a payload longer than [`MAX_V1_PAYLOAD`].
+    Oversized,
     /// A v2 packet would not decrypt, so the channel is out of sync and
     /// nothing further on it means anything.
     V2Decrypt,
@@ -143,6 +160,7 @@ impl std::fmt::Display for Fault {
             Fault::PeerClosed => "peer closed the connection",
             Fault::Truncated => "stream ended mid-message",
             Fault::Decode => "message did not deserialize",
+            Fault::Oversized => "peer declared an oversized message",
             Fault::V2Decrypt => "v2 packet did not decrypt",
             Fault::Write => "send failed",
         };
@@ -325,6 +343,26 @@ where
                     let header = *buf;
                     let payload_len =
                         u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+                    if payload_len > MAX_V1_PAYLOAD {
+                        let cmd = String::from_utf8_lossy(&header[4..16]);
+                        tracing::warn!(target: TARGET,
+                            cmd = %cmd.trim_end_matches('\0'),
+                            payload_len,
+                            limit = MAX_V1_PAYLOAD,
+                            "v1 header declares an oversized payload"
+                        );
+                        // The state is left holding the header just read: the
+                        // payload was never consumed, so there is nothing to
+                        // resynchronise to and a reset would read payload
+                        // bytes as the next header. Another call re-reads this
+                        // header and fails the same way, which is the honest
+                        // answer for a stream that cannot go on.
+                        return Err(common::anyhow::Error::new(Error::new(
+                            ErrorKind::InvalidData,
+                            format!("v1 payload of {payload_len} bytes exceeds {MAX_V1_PAYLOAD}"),
+                        ))
+                        .context(Fault::Oversized));
+                    }
                     let mut payload_buf = vec![0u8; 24 + payload_len];
                     payload_buf[..24].copy_from_slice(&header);
                     self.state = V1ReadState::Payload {
@@ -532,5 +570,52 @@ mod tests {
         // Without this the test would also pass if the decoder stopped
         // answering for anything at all.
         assert_eq!(checked, [1, 6, 7, 11, 13, 14, 15, 17, 28]);
+    }
+
+    /// A v1 header: magic, command, length, checksum. Only the length is read
+    /// before the payload, which is what these tests are about.
+    fn header_declaring(payload_len: u32) -> Vec<u8> {
+        let mut h = vec![0u8; 24];
+        h[4..7].copy_from_slice(b"inv");
+        h[16..20].copy_from_slice(&payload_len.to_le_bytes());
+        h
+    }
+
+    /// The header does not get to choose how much memory we take: a declared
+    /// payload over the limit is refused with nothing of it read, and the
+    /// buffer it asked for is never allocated.
+    #[tokio::test]
+    async fn test_an_oversized_payload_is_refused_before_it_is_allocated() {
+        let bytes = header_declaring(u32::MAX);
+        let mut reader = TransportV1Reader::new(&bytes[..]);
+        let err = reader.recv().await.expect_err("an oversized declaration");
+        assert_eq!(fault_of(&err), Some(Fault::Oversized), "{err:#}");
+    }
+
+    /// And it keeps failing that way. The payload was never consumed, so there
+    /// is no boundary to resynchronise to, and a second call must not start
+    /// reading payload bytes as the next header.
+    #[tokio::test]
+    async fn test_the_oversized_failure_sticks() {
+        let mut bytes = header_declaring(MAX_V1_PAYLOAD as u32 + 1);
+        bytes.extend_from_slice(&[0u8; 64]);
+        let mut reader = TransportV1Reader::new(&bytes[..]);
+        for attempt in 0..3 {
+            let err = reader.recv().await.expect_err("an oversized declaration");
+            assert_eq!(fault_of(&err), Some(Fault::Oversized), "attempt {attempt}");
+        }
+    }
+
+    /// The limit is above every message a peer has reason to send, so an
+    /// ordinary one still reads.
+    #[tokio::test]
+    async fn test_a_message_within_the_limit_still_reads() {
+        let bytes = serialize(&RawNetworkMessage::new(
+            Magic::REGTEST,
+            NetworkMessage::Verack,
+        ));
+        let mut reader = TransportV1Reader::new(&bytes[..]);
+        let msg = reader.recv().await.expect("a verack");
+        assert!(matches!(msg, NetworkMessage::Verack), "{msg:?}");
     }
 }
