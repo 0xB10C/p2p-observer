@@ -240,6 +240,7 @@ fn announcement(hash: &str, new_to_us: bool) -> peer_event::Event {
         height: Some(100),
         new_to_us,
         compact_block: None,
+        unplaced: None,
     })
 }
 
