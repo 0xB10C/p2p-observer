@@ -10,7 +10,10 @@
 //!
 //! Every series is bounded. A label value the peer gets to choose -- a user
 //! agent, a protocol version, a message command -- is normalised and then
-//! capped, so the network cannot grow the registry. The tool keeps nothing
+//! capped, so the network cannot grow the registry. A histogram value the
+//! peer gets to choose is clamped for the same reason: a `_sum` is cumulative
+//! and unbounded, so one invented number moves that histogram's mean for as
+//! long as the process runs. See `metrics::peer_chosen`. The tool keeps nothing
 //! per connection: each event is a counter increment or a histogram sample
 //! on its own. The only memory between events is per network, and small:
 //! which observer run is sending, the best height announced, and the first
@@ -39,6 +42,7 @@ pub mod server;
 
 use labels::{Bounded, OTHER};
 pub use metrics::Metrics;
+use metrics::peer_chosen;
 
 pub const TARGET: &str = "metrics";
 
@@ -301,7 +305,10 @@ pub fn observe(
             metrics
                 .fee_filter_sat_per_kvb
                 .with_label_values(&[network])
-                .observe(f.feerate_sat_per_kvb as f64);
+                .observe(peer_chosen(
+                    f.feerate_sat_per_kvb as f64,
+                    metrics::FEE_FILTER,
+                ));
         }
         Some(peer_event::Event::SendCmpct(sc)) => observe_send_cmpct(network, sc, metrics),
         None => {}
@@ -415,12 +422,18 @@ fn observe_handshake(
     metrics
         .handshake_clock_skew_seconds
         .with_label_values(&[network])
-        .observe(hs.peer_timestamp as f64 - (event.timestamp_ms / 1000) as f64);
+        .observe(peer_chosen(
+            hs.peer_timestamp as f64 - (event.timestamp_ms / 1000) as f64,
+            metrics::SKEW,
+        ));
     if let Some(best) = net.best_height {
         metrics
             .handshake_height_delta
             .with_label_values(&[network])
-            .observe(hs.start_height as f64 - best as f64);
+            .observe(peer_chosen(
+                hs.start_height as f64 - best as f64,
+                metrics::HEIGHT_DELTA,
+            ));
     }
 }
 
@@ -674,7 +687,10 @@ fn observe_address_announcement(
         for bit in labels::service_bits(entry.services) {
             *by_service.entry(bit).or_default() += 1;
         }
-        age.observe(now_s - entry.ntime as f64);
+        age.observe(peer_chosen(
+            now_s - entry.ntime as f64,
+            metrics::ADDRESS_AGE,
+        ));
     }
     for (net, count) in by_net {
         metrics
@@ -1382,5 +1398,134 @@ mod tests {
         observe("mainnet", &first, &m, &mut state, 0);
         assert_eq!(counter(&m.observer_restarts_total, &[NET]), 1);
         assert_eq!(counter(&m.observer_restarts_total, &["mainnet"]), 0);
+    }
+
+    // ── Numbers the peer chose ───────────────────────────────────────────────
+    //
+    // A histogram's `_sum` is cumulative and unbounded, so a single invented
+    // value moves that histogram's mean for the lifetime of the process while
+    // every bucket still looks normal -- an average clock skew of 1e18
+    // seconds, and nothing to say which handshake did it. Labels in this tool
+    // are bounded for the same reason; a value is no more trustworthy than a
+    // label for having come from a peer.
+
+    #[test]
+    fn test_an_invented_clock_cannot_move_the_skew_sum() {
+        let m = Metrics::new().unwrap();
+        let mut state = State::default();
+        for extreme in [i64::MIN, i64::MAX] {
+            let hs = Handshake {
+                peer_timestamp: extreme,
+                ..handshake()
+            };
+            observe(
+                NET,
+                &event(1, 1_000_000_000, peer_event::Event::Handshake(hs)),
+                &m,
+                &mut state,
+                0,
+            );
+        }
+        assert_eq!(histogram_count(&m.handshake_clock_skew_seconds, &[NET]), 2);
+        assert!(
+            histogram_sum(&m.handshake_clock_skew_seconds, &[NET]).abs() <= 2.0 * metrics::SKEW,
+            "sum was {}",
+            histogram_sum(&m.handshake_clock_skew_seconds, &[NET])
+        );
+    }
+
+    #[test]
+    fn test_an_invented_start_height_cannot_move_the_delta_sum() {
+        let m = Metrics::new().unwrap();
+        let mut state = State::default();
+        observe(
+            NET,
+            &event(
+                1,
+                0,
+                peer_event::Event::BlockAnnouncement(announcement("aa", true, Some(100))),
+            ),
+            &m,
+            &mut state,
+            0,
+        );
+        let hs = Handshake {
+            start_height: i32::MAX,
+            ..handshake()
+        };
+        observe(
+            NET,
+            &event(2, 0, peer_event::Event::Handshake(hs)),
+            &m,
+            &mut state,
+            0,
+        );
+        assert_eq!(histogram_count(&m.handshake_height_delta, &[NET]), 1);
+        assert_eq!(
+            histogram_sum(&m.handshake_height_delta, &[NET]),
+            metrics::HEIGHT_DELTA
+        );
+    }
+
+    #[test]
+    fn test_an_invented_fee_filter_cannot_move_its_sum() {
+        let m = Metrics::new().unwrap();
+        let mut state = State::default();
+        observe(
+            NET,
+            &event(
+                1,
+                0,
+                peer_event::Event::FeeFilter(FeeFilter {
+                    feerate_sat_per_kvb: u64::MAX,
+                }),
+            ),
+            &m,
+            &mut state,
+            0,
+        );
+        assert_eq!(histogram_count(&m.fee_filter_sat_per_kvb, &[NET]), 1);
+        assert_eq!(
+            histogram_sum(&m.fee_filter_sat_per_kvb, &[NET]),
+            metrics::FEE_FILTER
+        );
+    }
+
+    #[test]
+    fn test_an_address_dated_at_the_epoch_cannot_move_the_age_sum() {
+        let m = Metrics::new().unwrap();
+        let mut state = State::default();
+        let ann = AddressAnnouncement {
+            message: AddrMessage::Addrv2 as i32,
+            unparsed: 0,
+            addresses: vec![
+                GossipedAddress {
+                    addr: "1.2.3.4:8333".to_owned(),
+                    services: 0,
+                    ntime: 0,
+                },
+                GossipedAddress {
+                    addr: "5.6.7.8:8333".to_owned(),
+                    services: 0,
+                    ntime: u32::MAX,
+                },
+            ],
+            solicited: false,
+            rate_limited: 0,
+            rate_limit_tokens: 0.0,
+        };
+        observe(
+            NET,
+            &event(
+                1,
+                1_700_000_000_000,
+                peer_event::Event::AddressAnnouncement(ann),
+            ),
+            &m,
+            &mut state,
+            0,
+        );
+        assert_eq!(histogram_count(&m.address_entry_age_seconds, &[NET]), 2);
+        assert_eq!(histogram_sum(&m.address_entry_age_seconds, &[NET]), 0.0);
     }
 }

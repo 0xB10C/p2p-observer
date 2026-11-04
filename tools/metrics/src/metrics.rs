@@ -86,6 +86,41 @@ const ADDRESS_AGE_BUCKETS: &[f64] = &[
 const CWND_BUCKETS: &[f64] = &[1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0];
 /// Buckets for retransmitted segments over a connection's life.
 const RETRANS_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 500.0, 1000.0];
+/// How far outside its buckets a number the peer chose may move a
+/// histogram's sum.
+///
+/// A histogram's `_sum` is cumulative and unbounded, so one value a peer
+/// invented -- a version timestamp of `i64::MIN`, a fee filter of `u64::MAX`,
+/// a gossiped address dated a century out -- moves that histogram's mean for
+/// the lifetime of the process while every bucket still looks perfectly
+/// normal. Labels in this tool are bounded for the same reason, and a value
+/// is no more trustworthy than a label for coming from a peer.
+///
+/// Each limit sits well outside the last bucket, so which bucket an
+/// observation falls in does not change and what lies past the last bucket is
+/// still counted in `+Inf`. Only the sum is held to something worth reading.
+mod peer_limit {
+    /// A peer's clock against ours: a day either way, where the buckets stop
+    /// at an hour.
+    pub(crate) const SKEW: f64 = 86_400.0;
+    /// A claimed start height against the best announced: ten million blocks,
+    /// where the buckets stop at a million -- itself already twice the chain.
+    pub(crate) const HEIGHT_DELTA: f64 = 10_000_000.0;
+    /// A fee filter: a billion sat/kvB, ten whole coins per kvB and four
+    /// orders of magnitude past the last bucket.
+    pub(crate) const FEE_FILTER: f64 = 1e9;
+    /// The age of a gossiped address: a year either way, where the buckets
+    /// stop at the thirty days after which Core calls an entry terrible.
+    pub(crate) const ADDRESS_AGE: f64 = 86_400.0 * 365.0;
+}
+
+pub(crate) use peer_limit::{ADDRESS_AGE, FEE_FILTER, HEIGHT_DELTA, SKEW};
+
+/// Clamps a number the peer chose to one of the limits above.
+pub(crate) fn peer_chosen(value: f64, limit: f64) -> f64 {
+    value.clamp(-limit, limit)
+}
+
 /// Buckets in bytes per second for the kernel's delivery rate estimate.
 const RATE_BUCKETS: &[f64] = &[
     1e3, 1e4, 1e5, 2.5e5, 5e5, 1e6, 2.5e6, 5e6, 1e7, 2.5e7, 5e7, 1e8, 1e9,
@@ -607,5 +642,40 @@ mod tests {
         let b = Metrics::new().unwrap();
         a.fee_filters_total.with_label_values(&["signet"]).inc();
         assert_eq!(b.fee_filters_total.with_label_values(&["signet"]).get(), 0);
+    }
+}
+
+#[cfg(test)]
+mod peer_limit_tests {
+    use super::*;
+
+    /// Each clamp has to sit outside the buckets it guards, which is what
+    /// makes it free: an observation past the last bucket is counted in
+    /// `+Inf` either way, so clamping changes no bucket and only holds the
+    /// sum to something worth reading. A limit that fell inside the buckets
+    /// would quietly move observations between them.
+    #[test]
+    fn test_each_limit_lies_outside_the_buckets_it_guards() {
+        let cases: [(&str, f64, &[f64]); 4] = [
+            ("skew", SKEW, SKEW_BUCKETS),
+            ("height delta", HEIGHT_DELTA, HEIGHT_DELTA_BUCKETS),
+            ("fee filter", FEE_FILTER, FEE_FILTER_BUCKETS),
+            ("address age", ADDRESS_AGE, ADDRESS_AGE_BUCKETS),
+        ];
+        for (name, limit, buckets) in cases {
+            let outermost = buckets.iter().fold(0.0f64, |a, b| a.max(b.abs()));
+            assert!(
+                limit > outermost,
+                "the {name} clamp of {limit} is inside its own buckets, which reach {outermost}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_clamp_leaves_an_ordinary_value_alone() {
+        assert_eq!(peer_chosen(42.0, SKEW), 42.0);
+        assert_eq!(peer_chosen(-42.0, SKEW), -42.0);
+        assert_eq!(peer_chosen(i64::MIN as f64, SKEW), -SKEW);
+        assert_eq!(peer_chosen(u64::MAX as f64, FEE_FILTER), FEE_FILTER);
     }
 }
