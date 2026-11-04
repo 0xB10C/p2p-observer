@@ -1768,6 +1768,112 @@ mod tests {
         assert_eq!(h.conn.stats.getheaders_ignored, 4);
     }
 
+    /// Addresses a peer was not asked for are kept only as fast as the
+    /// bucket allows, a token per address kept, refilling at a rate.
+    ///
+    /// None of that arithmetic was pinned: the refill rate, the count
+    /// allowed, the count refused and the debit were all free, so the limit
+    /// on how fast one peer can fill the address book could have been thirty
+    /// times too generous with nothing failing. The clock is paused so the
+    /// bucket holds exactly what it is given.
+    #[tokio::test]
+    async fn test_gossip_is_kept_only_as_fast_as_the_bucket_allows() {
+        use crate::headertree::testing::regtest_params;
+        tokio::time::pause();
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let mut h = harness(tree);
+        let burst = policy::ADDR_BURST as usize;
+
+        let gossiped = |from: u32, n: u32| -> Vec<Gossiped> {
+            (from..from + n)
+                .map(|v| Gossiped {
+                    addr: PeerAddr::Ipv4(
+                        [
+                            1 + (v >> 24) as u8,
+                            (v >> 16) as u8,
+                            (v >> 8) as u8,
+                            v as u8,
+                        ],
+                        8333,
+                    ),
+                    services: 0,
+                    ntime: 1_700_000_000,
+                })
+                .collect()
+        };
+        let announcement = |h: &mut Harness| {
+            let ev = h.events.try_recv().expect("an announcement");
+            match ev.event {
+                Some(common::events::peer_event::Event::AddressAnnouncement(a)) => a,
+                other => panic!("expected an address announcement, got {other:?}"),
+            }
+        };
+
+        // Fifty past the burst: the burst is kept, the rest refused, and the
+        // event carries every one of them either way -- a flood belongs in
+        // the archive rather than vanishing from it.
+        let flood = gossiped(0, burst as u32 + 50);
+        h.conn
+            .offer_gossip(common::events::AddrMessage::Addrv2, flood.len(), flood);
+        let a = announcement(&mut h);
+        assert_eq!(a.rate_limited, 50);
+        assert_eq!(a.addresses.len(), burst + 50);
+        assert_eq!(
+            h._manager
+                .0
+                .try_recv()
+                .expect("gossip reaches the manager")
+                .len(),
+            burst,
+            "the manager is handed what was kept, not what was announced"
+        );
+
+        // The bucket is empty now, so the next address is refused outright
+        // and nothing reaches the manager at all.
+        let one = gossiped(5_000, 1);
+        h.conn
+            .offer_gossip(common::events::AddrMessage::Addrv2, 1, one);
+        assert_eq!(announcement(&mut h).rate_limited, 1);
+        assert!(h._manager.0.try_recv().is_err());
+
+        // One token's worth of time buys exactly one address, which is the
+        // rate rather than the fact of a refill.
+        tokio::time::advance(Duration::from_secs_f64(1.0 / policy::ADDR_RATE_PER_SEC)).await;
+        let two = gossiped(6_000, 2);
+        h.conn
+            .offer_gossip(common::events::AddrMessage::Addrv2, 2, two);
+        assert_eq!(
+            announcement(&mut h).rate_limited,
+            1,
+            "one token, one address"
+        );
+        assert_eq!(h._manager.0.try_recv().expect("one kept").len(), 1);
+
+        // A reply to our own GETADDR is not charged: we asked for it, and a
+        // thousand addresses is what Core sends back.
+        h.conn.getaddr_outstanding = true;
+        let reply = gossiped(10_000, burst as u32);
+        h.conn
+            .offer_gossip(common::events::AddrMessage::Addrv2, reply.len(), reply);
+        assert_eq!(announcement(&mut h).rate_limited, 0, "a reply we asked for");
+        assert_eq!(h._manager.0.try_recv().expect("all kept").len(), burst);
+    }
+
+    /// A ping is answered. Nothing else in here says so, and a peer that is
+    /// not answered hangs up on us by its own deadline -- which would look
+    /// from this side like the network refusing to stay connected.
+    #[tokio::test]
+    async fn test_a_ping_is_answered() {
+        use crate::headertree::testing::regtest_params;
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let mut h = harness(tree);
+        h.conn.handle_ping(0x1234_5678_9abc_def0).await.unwrap();
+        assert_eq!(
+            h.conn.writer.0,
+            vec![NetworkMessage::Pong(0x1234_5678_9abc_def0)]
+        );
+    }
+
     /// A session that said nothing is silent; one that said anything is not.
     ///
     /// The address manager backs off a peer that keeps producing silent
