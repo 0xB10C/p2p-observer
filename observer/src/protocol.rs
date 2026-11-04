@@ -12,7 +12,7 @@ use common::{
     tokio::{
         self,
         sync::mpsc,
-        time::{Duration, interval, timeout},
+        time::{Duration, Instant, interval, timeout},
     },
     tracing,
     tracing::Instrument,
@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::RawFd;
 use std::sync::{Arc, RwLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::addresses::{Handle, book::Gossiped, peer_addr::PeerAddr, policy};
 use crate::connections::{self, Registry};
@@ -204,7 +204,7 @@ const OUTSTANDING_PINGS: usize = 10;
 /// and the task holds its socket, its buffers and the address's slot in the
 /// active set for as long as the process runs. Bitcoin Core gives a peer the
 /// same twenty minutes (its TIMEOUT_INTERVAL) before dropping it.
-const PING_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+pub(crate) const PING_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 /// Tokens for answering a GETHEADERS, and how fast they come back.
 ///
@@ -1750,12 +1750,11 @@ mod tests {
         assert_eq!(headers_sent(&h.conn.writer), burst);
         assert_eq!(h.conn.stats.getheaders_ignored, 3);
 
-        // Tokens come back with time.
-        h.conn.getheaders_tokens_updated = h
-            .conn
-            .getheaders_tokens_updated
-            .checked_sub(Duration::from_secs(60))
-            .expect("a monotonic clock older than a minute");
+        // Tokens come back with time -- the clock's, not a field rewound to
+        // stand in for it, which could not catch the refill reading a
+        // different one.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60)).await;
         h.conn.handle_get_headers(ask).await.unwrap();
         assert_eq!(headers_sent(&h.conn.writer), burst + 1);
         assert_eq!(h.conn.stats.getheaders_ignored, 3);

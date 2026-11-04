@@ -12,6 +12,7 @@
 //! others not at all.
 
 use bip324::{Role, futures::Protocol};
+use common::tokio::time::Instant;
 use common::{
     anyhow::{self, Context, Result},
     tokio::{
@@ -25,7 +26,6 @@ use common::{
 };
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 use crate::addresses::book::{Dial, TransportHint};
 use crate::addresses::peer_addr::{Net, PeerAddr};

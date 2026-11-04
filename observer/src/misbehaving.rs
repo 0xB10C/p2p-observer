@@ -579,3 +579,49 @@ async fn test_a_peer_cannot_announce_addresses_faster_than_the_bucket() {
     let _ = peer.hang_up_and_drain().await;
     observed.ended().await;
 }
+
+/// A peer that answers the handshake and then stops answering pings is hung
+/// up on, and the reason says it was our deadline rather than its socket.
+///
+/// The deadline is twenty minutes, so the clock is moved rather than waited
+/// out: the wiring from the ping timer, through the deadline check, to the
+/// reason that reaches an operator is otherwise untestable, and the parts on
+/// either side of it being tested does not test the join.
+#[tokio::test]
+async fn test_a_peer_that_stops_answering_pings_is_hung_up_on() {
+    let (peer, mut observed) = meet(1, |_| {}).await;
+
+    // Reads everything and answers nothing. The connection stays open and
+    // every byte is acknowledged, so nothing at the TCP level will notice:
+    // TCP_USER_TIMEOUT only fires on data the peer has not acknowledged.
+    let ignoring = tokio::spawn(async move {
+        let mut peer = peer;
+        while peer.r.recv().await.is_ok() {}
+    });
+
+    // Paused only now, so the dial and the handshake above ran on the real
+    // clock and could not race the connect timeouts.
+    //
+    // Note what pausing does beyond freezing the clock: while nothing is
+    // runnable, tokio jumps straight to the next timer. That is what makes
+    // this test instant, and it is also why the peer above has to be reading
+    // in a loop rather than idling between steps -- a paused runtime with a
+    // live interval timer and nothing to run will keep firing it, and a test
+    // that expected a reply in between gets a session that has already timed
+    // out instead.
+    tokio::time::pause();
+    // Two ping intervals past the deadline: one tick to send a ping, and the
+    // deadline cannot pass until one is outstanding.
+    tokio::time::advance(crate::protocol::PING_TIMEOUT + Duration::from_secs(300)).await;
+    tokio::time::resume();
+
+    let end = observed.disconnected().await;
+    assert_eq!(reason(&end), DisconnectReason::PingTimeout);
+    assert!(
+        end.uptime_ms >= crate::protocol::PING_TIMEOUT.as_millis() as u64,
+        "the session was reported shorter than the deadline it hit: {}ms",
+        end.uptime_ms
+    );
+    observed.ended().await;
+    ignoring.abort();
+}
