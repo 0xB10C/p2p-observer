@@ -16,6 +16,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
+  # A panic in a destructor that runs while another panic is already unwinding
+  # does not unwind again -- it aborts, and an abort prints no test summary
+  # and names no test. A backtrace is the only thing left that says where it
+  # was, and is worth having for an ordinary panic too.
+  RUST_BACKTRACE: 1
 
 jobs:
 
