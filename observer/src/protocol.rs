@@ -250,7 +250,7 @@ const GETHEADERS_RATE_PER_SEC: f64 = 1.0 / 30.0;
 /// The session stays up, where Core's would not, for the reason the rate limit
 /// does not hang up either: a peer sending a locator this long is worth a line
 /// in the log, not worth ending the measurement over.
-const MAX_LOCATOR_SZ: usize = 101;
+pub(crate) const MAX_LOCATOR_SZ: usize = 101;
 
 /// Distinct commands counted per session.
 ///
