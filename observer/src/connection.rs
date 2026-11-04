@@ -853,11 +853,19 @@ mod tests {
                 writer,
             };
             server_handshake(&mut r, &mut w).await;
-            // Respond to the first ping; ignore everything else.
-            loop {
-                if let NetworkMessage::Ping(nonce) = r.recv().await.unwrap() {
-                    w.send(NetworkMessage::Pong(nonce)).await.unwrap();
-                    break;
+            // Answer pings for as long as the client is there, rather than
+            // answering one and dropping the socket. With the interval at
+            // fifty milliseconds the session can write its next ping before
+            // the pong is read, and a peer that has gone turns that write
+            // into an error: the session then ends with WriteError and never
+            // emits the measurement this test is about. Slow execution makes
+            // that the usual outcome rather than the rare one, which is how
+            // coverage instrumentation found it.
+            while let Ok(msg) = r.recv().await {
+                if let NetworkMessage::Ping(nonce) = msg
+                    && w.send(NetworkMessage::Pong(nonce)).await.is_err()
+                {
+                    return;
                 }
             }
         });
@@ -901,7 +909,9 @@ mod tests {
             "expected PingRtt, got: {:?}",
             event.event,
         );
-        server.await.unwrap();
+        // The server now outlives the measurement by design, so it is stopped
+        // rather than waited for.
+        server.abort();
     }
 
     /// A peer that accepts the connection and then never speaks must not hold

@@ -49,14 +49,26 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - uses: ./.github/actions/setup-nix-action
+    # A floor, not a target, and two points below where the workspace stands:
+    # a checkout where nats-server or bitcoind does not start skips the
+    # integration tests and loses a point or two of coverage, and that should
+    # not read as a regression. The job used to upload a report and nothing
+    # else, which meant the number could fall for a year without anyone
+    # noticing; failing here puts the fall on the pull request that caused it.
+    # Raise it deliberately when a stretch of work lifts the number, and lower
+    # it only with a reason in the commit message.
     - name: Run coverage
-      run: nix develop --command cargo tarpaulin --out Lcov --out Html --workspace --all-features
+      run: nix develop --command cargo tarpaulin --engine llvm --out Lcov --out Html --workspace --all-features --fail-under 82
+    # Uploaded even when the gate fails, which is when the report is most worth
+    # reading: it names the lines that stopped being covered.
     - name: Upload HTML coverage report
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: coverage-html
         path: tarpaulin-report.html
     - name: Upload LCOV file
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: coverage-lcov
