@@ -1232,6 +1232,129 @@ mod tests {
         );
     }
 
+    /// The socket options are applied, not merely attempted.
+    ///
+    /// `configure_stream` could return `Ok` having done nothing and no test
+    /// noticed. Neither option is visible afterwards and both matter: nodelay
+    /// decides whether a ping waits on the kernel for an ACK, and
+    /// TCP_USER_TIMEOUT is the only thing that ends a connection whose peer
+    /// has stopped acknowledging -- the handshake timeouts are long gone by
+    /// then, and a peer that acknowledges and then says nothing is the ping
+    /// deadline's business instead.
+    ///
+    /// Nodelay is asserted off first, so the test shows the call changed it
+    /// rather than agreeing with the default.
+    #[tokio::test]
+    async fn test_the_socket_options_are_applied() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let stream = common::tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _server = accept.await.unwrap();
+
+        assert!(
+            !stream.nodelay().unwrap(),
+            "nodelay is off until something sets it"
+        );
+        configure_stream(&stream).unwrap();
+        assert!(stream.nodelay().unwrap(), "nodelay was not set");
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let mut ms: u32 = 0;
+            let mut len = std::mem::size_of::<u32>() as libc::socklen_t;
+            let ret = unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_USER_TIMEOUT,
+                    &mut ms as *mut _ as *mut libc::c_void,
+                    &mut len,
+                )
+            };
+            assert_eq!(ret, 0, "getsockopt: {}", std::io::Error::last_os_error());
+            assert_eq!(
+                ms, 30_000,
+                "TCP_USER_TIMEOUT is what bounds a connection whose peer has gone"
+            );
+        }
+    }
+
+    /// Every TCP-level failure is recognised as one, whichever it was.
+    ///
+    /// This decides whether a failed v2 attempt is retried over v1. A TCP
+    /// failure says nothing about which transport the peer speaks, so the
+    /// attempt ends there -- and if one were not recognised, the fallback
+    /// would run `addrman.v1_only(addr)` first, writing a permanent v1-only
+    /// verdict about a peer we never reached. A transient network failure
+    /// would cost that address its chance at v2 for good.
+    ///
+    /// The chain is four `or`s and only the first was tested, so each of the
+    /// others could have been an `and` -- which, over mutually exclusive error
+    /// kinds, means always false.
+    #[test]
+    fn test_every_tcp_level_failure_is_recognised() {
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::NetworkUnreachable,
+            std::io::ErrorKind::HostUnreachable,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            let err = anyhow::Error::from(std::io::Error::from(kind)).context("TCP connect");
+            assert!(is_tcp_level(&err), "{kind:?} is a TCP-level failure");
+        }
+
+        // And a timeout of our own, however it is expressed.
+        for stage in [
+            Stage::TcpConnectTimeout,
+            Stage::TorProxyTimeout,
+            Stage::V2TransportTimeout,
+            Stage::VersionHandshakeTimeout,
+        ] {
+            let err = anyhow::Error::new(stage).context("dialling");
+            assert!(is_tcp_level(&err), "{stage:?} is a timeout");
+            assert!(is_timed_out(&err), "{stage:?} is a timeout");
+        }
+
+        // What is not: a failure after the connection was up, which is the
+        // case the v1 fallback exists for.
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            let err = anyhow::Error::from(std::io::Error::from(kind)).context("v2 handshake");
+            assert!(
+                !is_tcp_level(&err),
+                "{kind:?} happened after the connection was up"
+            );
+        }
+    }
+
+    /// Every shape of a connection going away under us reads as a reset.
+    ///
+    /// Three error kinds mean it, joined by `or`s, and only the first was
+    /// tested -- so the other two could have fallen through to `OTHER`, which
+    /// is the field an operator reads to tell a peer hanging up from a network
+    /// that broke.
+    #[test]
+    fn test_every_reset_shaped_end_reads_as_a_reset() {
+        use common::events::DisconnectReason as R;
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionAborted,
+        ] {
+            let err = anyhow::Error::from(std::io::Error::from(kind));
+            assert_eq!(
+                classify_session_end(Some(&err)),
+                R::ConnectionReset,
+                "{kind:?}"
+            );
+        }
+    }
+
     /// The four timeouts are told apart, which a single TIMED_OUT could not do.
     #[test]
     fn test_timeouts_are_distinguished() {
