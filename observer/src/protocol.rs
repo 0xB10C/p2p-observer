@@ -230,7 +230,7 @@ const PING_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// answered empty. An empty HEADERS means "I have nothing after your
 /// locator", which is a claim about the chain and not about our patience, and
 /// a peer that believes it may stop asking the one question we want asked.
-const GETHEADERS_BURST: f64 = 4.0;
+pub(crate) const GETHEADERS_BURST: f64 = 4.0;
 const GETHEADERS_RATE_PER_SEC: f64 = 1.0 / 30.0;
 
 /// The longest locator we will walk, in hashes.

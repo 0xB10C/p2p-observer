@@ -15,6 +15,8 @@ mod connections;
 mod emit;
 mod headertree;
 mod logging;
+#[cfg(test)]
+mod misbehaving;
 mod protocol;
 mod publisher;
 mod rpc;
