@@ -1,5 +1,5 @@
 use common::tokio::time::Instant;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use common::{
@@ -42,6 +42,16 @@ const RECOVERY_PEERS: u8 = 3;
 /// -- two thousand headers off a fork below the checkpoint -- was rejected
 /// and forgotten in time for the next block. Bounded because the hashes come
 /// from peers; at a few hundred a day this is weeks of such a chain.
+///
+/// Least recently used, not arrival order. A refusal something has just
+/// inherited from goes to the back, because the root of a refused branch is
+/// the entry every header on that branch is recognised by, and in arrival
+/// order it is the first to be forgotten. That cost nothing while the branch
+/// was a chain -- each header inherits from its parent, refused a moment ago
+/// -- and it cost the classification of a peer that sent this many *direct
+/// children* of one refused header: once the root was gone they read as
+/// headers with no parent, which is a tree that is behind rather than a peer
+/// on another chain. See `test_the_refusals_the_tree_remembers_are_bounded`.
 const REJECTED_REMEMBERED: usize = 8192;
 
 /// How much easier than our own tip's target an unplaceable header's target
@@ -160,10 +170,14 @@ pub struct HeaderTree {
     /// throttle rather than a per-peer courtesy.
     recovery: HashMap<BlockHash, Recovery>,
     /// Headers rejected by validation, or descended from one that was, with
-    /// why. Oldest first in `rejected_order`, which is what bounds it. See
+    /// why and the sequence number that orders them. See
     /// [`REJECTED_REMEMBERED`].
-    rejected: HashMap<BlockHash, HeaderError>,
-    rejected_order: VecDeque<BlockHash>,
+    rejected: HashMap<BlockHash, (HeaderError, u64)>,
+    /// The refusals in the order they will be forgotten, oldest first. One
+    /// entry per refusal, so exactly as long as `rejected` is.
+    rejected_order: BTreeMap<u64, BlockHash>,
+    /// Hands out the next sequence number.
+    rejected_seq: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,7 +278,8 @@ impl HeaderTree {
             pruned: 0,
             recovery: HashMap::new(),
             rejected: HashMap::new(),
-            rejected_order: VecDeque::new(),
+            rejected_order: BTreeMap::new(),
+            rejected_seq: 0,
         }
     }
 
@@ -385,8 +400,15 @@ impl HeaderTree {
             // threw it out, this header goes the same way, for the same
             // reason, and nobody is asked for headers to explain it.
             None => {
-                return Err(match self.rejected.get(&header.prev_blockhash).copied() {
+                let inherited = self
+                    .rejected
+                    .get(&header.prev_blockhash)
+                    .map(|(reason, _)| *reason);
+                return Err(match inherited {
                     Some(reason) => {
+                        // The parent first, so that remembering the child
+                        // cannot be what forgets the parent.
+                        self.touch_rejected(header.prev_blockhash);
                         self.remember_rejected(hash, reason);
                         reason
                     }
@@ -557,7 +579,7 @@ impl HeaderTree {
 
     /// Why the tree rejected a header, if it did and still remembers.
     pub(crate) fn rejection_of(&self, hash: &BlockHash) -> Option<HeaderError> {
-        self.rejected.get(hash).copied()
+        self.rejected.get(hash).map(|(reason, _)| *reason)
     }
 
     /// Whether an unplaceable header's own target is so much easier than our
@@ -589,16 +611,54 @@ impl HeaderTree {
         self.headers.contains_key(hash) || self.rejected.contains_key(hash)
     }
 
+    /// Remember that `hash` was refused, and why.
+    ///
+    /// A refusal already held keeps the place it has: this is about when we
+    /// first learned of it, and learning of it twice is not news.
     fn remember_rejected(&mut self, hash: BlockHash, reason: HeaderError) {
-        if self.rejected.insert(hash, reason).is_some() {
+        if self.rejected.contains_key(&hash) {
             return;
         }
-        self.rejected_order.push_back(hash);
-        while self.rejected_order.len() > REJECTED_REMEMBERED {
-            if let Some(old) = self.rejected_order.pop_front() {
-                self.rejected.remove(&old);
-            }
+        let seq = self.next_rejected_seq();
+        self.rejected.insert(hash, (reason, seq));
+        self.rejected_order.insert(seq, hash);
+        while self.rejected.len() > REJECTED_REMEMBERED {
+            let Some((&oldest, &hash)) = self.rejected_order.iter().next() else {
+                break;
+            };
+            self.rejected_order.remove(&oldest);
+            self.rejected.remove(&hash);
         }
+    }
+
+    /// Move a refusal to the back of the queue, because something has just
+    /// been refused for inheriting it.
+    ///
+    /// The root of a refused branch is the entry every header on that branch
+    /// is recognised by, which makes it the last one worth forgetting -- and
+    /// in arrival order it is the first to go. A peer feeding us direct
+    /// children of one refused header used to reach a cliff at
+    /// [`REJECTED_REMEMBERED`] of them: the root fell out, and from then on
+    /// the rest of the branch arrived as headers with no parent, which
+    /// `accept_headers` reads as the tree being behind. It asked the peer for
+    /// headers and stopped recording it as a peer on another chain, which for
+    /// a tool whose output is what each peer is doing is the part that matters.
+    ///
+    /// So a refusal still being built on is a refusal still in use, and stays.
+    /// Nothing grows: this moves an entry rather than adding one, and the map
+    /// is capped either way.
+    fn touch_rejected(&mut self, hash: BlockHash) {
+        let seq = self.next_rejected_seq();
+        if let Some((_, old)) = self.rejected.get_mut(&hash) {
+            let previous = std::mem::replace(old, seq);
+            self.rejected_order.remove(&previous);
+            self.rejected_order.insert(seq, hash);
+        }
+    }
+
+    fn next_rejected_seq(&mut self) -> u64 {
+        self.rejected_seq = self.rejected_seq.wrapping_add(1);
+        self.rejected_seq
     }
 
     /// Whether a connection that has just found `missing` absent from the tree
@@ -1638,6 +1698,109 @@ mod tests {
         let (_, err) = tree.insert_batch(&[stray]);
         assert_eq!(err, Some(HeaderError::OrphanHeader));
         assert_eq!(tree.rejection_of(&stray.block_hash()), None);
+    }
+
+    /// The refusals the tree remembers are bounded, it forgets the oldest
+    /// first, and what that costs.
+    ///
+    /// Remembering a refusal is what stops the tree asking its peers to
+    /// explain a header it has already thrown out, and what stops a block
+    /// announced by two peers on another chain from counting as two first
+    /// sightings. It is also a map a peer gets to grow: every header built on
+    /// a refused one is refused for the same reason and remembered under its
+    /// own hash, and none of that costs the peer more than the headers
+    /// themselves. [`REJECTED_REMEMBERED`] is the whole of what keeps it from
+    /// being unbounded, and nothing asked whether it works.
+    #[test]
+    fn test_the_refusals_the_tree_remembers_are_bounded() {
+        let genesis = regtest_tree().tip().0;
+        let real = mine_chain(genesis, 1, 0);
+        let mut tree =
+            HeaderTree::with_checkpoints(regtest_params(), vec![checkpoint_at(&real, 1)]);
+
+        // One refusal to build on: a header at the checkpoint height with
+        // another hash.
+        let root = mine_header(genesis, 1296688602, 1);
+        tree.insert_batch(&[root]);
+        assert_eq!(
+            tree.rejection_of(&root.block_hash()),
+            Some(HeaderError::CheckpointMismatch)
+        );
+
+        // And more children of it than fit, each refused for the same reason
+        // and remembered under its own hash.
+        let children: Vec<Header> = (0..REJECTED_REMEMBERED as u32 + 64)
+            .map(|i| mine_header(root.block_hash(), 1296700000 + i, 2))
+            .collect();
+        tree.insert_batch(&children);
+
+        assert_eq!(
+            tree.rejected.len(),
+            REJECTED_REMEMBERED,
+            "the refusals are not bounded"
+        );
+        assert_eq!(tree.rejected_order.len(), REJECTED_REMEMBERED);
+        // Nothing was accepted along the way: the tree is still genesis.
+        assert_eq!(tree.len(), 1);
+        // The root is still here, because it is still being used: every one
+        // of those children was refused by inheriting it, and each inheriting
+        // moved it to the back. In arrival order it was the oldest entry in
+        // the map and would have been the first forgotten -- and it is the one
+        // entry every header on that branch is recognised by.
+        assert_eq!(
+            tree.rejection_of(&root.block_hash()),
+            Some(HeaderError::CheckpointMismatch),
+            "the refusal everything inherited from was forgotten"
+        );
+        // So is the newest child, and so the branch is still being recognised
+        // at both ends.
+        assert_eq!(
+            tree.rejection_of(&children.last().unwrap().block_hash()),
+            Some(HeaderError::CheckpointMismatch),
+            "the most recent refusal was forgotten"
+        );
+        // What went instead: the earliest children, which nothing has
+        // inherited from and nothing has asked about since.
+        assert_eq!(tree.rejection_of(&children[0].block_hash()), None);
+
+        // Which is what keeps the recognition going for as long as the peer
+        // keeps sending. Before this, a peer feeding direct children of one
+        // refused header hit a cliff at REJECTED_REMEMBERED of them: the root
+        // fell out, and from then on the rest arrived as headers with no
+        // parent, which `accept_headers` reads as the tree being behind. It
+        // asked the peer for headers and stopped recording it as a peer on
+        // another chain. A thousand more children, and all of them are still
+        // refused for the reason the root was.
+        let more: Vec<Header> = (0..1_000u32)
+            .map(|i| mine_header(root.block_hash(), 1_297_000_000 + i, 4))
+            .collect();
+        tree.insert_batch(&more);
+        for header in &more {
+            assert_eq!(
+                tree.rejection_of(&header.block_hash()),
+                Some(HeaderError::CheckpointMismatch),
+                "a child of the refused root was not refused"
+            );
+        }
+
+        // And a chain off a refused header, which was never the problem: each
+        // header inherits from its parent, refused a moment ago.
+        let remembered = *more.last().unwrap();
+        let branch = mine_chain(remembered.block_hash(), 50, 3);
+        tree.insert_batch(&branch);
+        for header in &branch {
+            assert_eq!(
+                tree.rejection_of(&header.block_hash()),
+                Some(HeaderError::CheckpointMismatch),
+                "a header on a refused chain was not refused"
+            );
+        }
+
+        // Still bounded, and the order is still exactly as long as the map:
+        // moving an entry is not adding one.
+        assert_eq!(tree.rejected.len(), REJECTED_REMEMBERED, "still bounded");
+        assert_eq!(tree.rejected_order.len(), REJECTED_REMEMBERED);
+        assert_eq!(tree.len(), 1);
     }
 
     #[test]
