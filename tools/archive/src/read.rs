@@ -8,6 +8,27 @@ use std::fs::File;
 use std::io::{self, BufReader, ErrorKind, Read};
 use std::path::Path;
 
+/// The longest record an archive may claim.
+///
+/// A record is one PeerEvent, and the largest the observer produces is an
+/// address announcement: it carries everything a peer announced, before the
+/// rate limit, and a peer can put tens of thousands of entries in one message.
+/// A few megabytes is the ceiling on that; sixteen refuses nothing the
+/// observer can write.
+///
+/// Without a cap the prefix is whatever the file says, and the buffer is sized
+/// to it before a single byte of the record has been read. Five bytes of a
+/// corrupt prefix asked for four gibibytes, zeroed them, and spent eighteen
+/// seconds doing it before reporting that the file was too short -- on a
+/// smaller machine the process is simply killed. Compression makes that worse
+/// rather than better: a few hundred bytes on disk can claim gigabytes.
+///
+/// The same reasoning as the oversized check in the v1 transport, which
+/// refuses a declared length before reserving anything for it. A file is no
+/// more trustworthy than a socket -- archives are passed around, and a
+/// truncated one is a normal thing to find after a crash.
+const MAX_RECORD: usize = 16 << 20;
+
 /// Reads an archive, yielding its events.
 ///
 /// The header is consumed by [`ArchiveReader::new`], so it is available before
@@ -68,6 +89,13 @@ fn read_message<M: Message + Default>(
         None => return Ok(None),
     };
 
+    if len > MAX_RECORD {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("record of {len} bytes claims more than the {MAX_RECORD} allowed"),
+        ));
+    }
+
     buf.clear();
     buf.resize(len, 0);
     reader.read_exact(buf)?;
@@ -116,6 +144,15 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    /// A minimal header, for the archives these tests build by hand.
+    fn header() -> ArchiveHeader {
+        ArchiveHeader {
+            created: 1,
+            network: "signet".to_owned(),
+            events: Vec::new(),
+        }
+    }
+
     /// Yields at most one byte per `read`, so a multi-byte length prefix
     /// arrives split across several reads.
     struct Trickle<R>(R);
@@ -161,5 +198,55 @@ mod tests {
     fn test_empty_file_has_no_header() {
         let err = ArchiveReader::new(Cursor::new(Vec::new())).unwrap_err();
         assert_eq!(err.to_string(), "missing header");
+    }
+
+    /// A record longer than any event can be is refused on the strength of
+    /// the claim, before anything is reserved for it.
+    ///
+    /// Five bytes of prefix asked for four gibibytes, zeroed them, and spent
+    /// eighteen seconds doing it before reporting that the file was too
+    /// short. A smaller machine does not report anything -- the process is
+    /// killed. And compression makes it worse rather than better: a few
+    /// hundred bytes on disk can claim gigabytes, so the cost to whoever
+    /// hands you the archive is nothing.
+    ///
+    /// Archives are passed around, and a truncated one is a normal thing to
+    /// find after a crash. A file is no more trustworthy than a socket.
+    #[test]
+    fn test_a_record_claiming_more_than_an_event_can_be_is_refused() {
+        let mut bytes = header().encode_length_delimited_to_vec();
+        // A varint claiming four gibibytes.
+        bytes.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x0f]);
+
+        let mut reader = ArchiveReader::new(Cursor::new(bytes)).unwrap();
+        let err = reader
+            .next()
+            .expect("a record was claimed")
+            .expect_err("and refused");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("claims more than"),
+            "{err}: the error should say what was refused"
+        );
+    }
+
+    /// And a record at the limit is still read, so the cap refuses nothing
+    /// the observer can write.
+    #[test]
+    fn test_a_record_at_the_limit_still_reads() {
+        // An event whose encoding is large but under the cap: the user agent
+        // is the only free-length field to hand.
+        let big = PeerEvent {
+            peer_addr: "1.2.3.4:8333".to_owned(),
+            user_agent: "x".repeat(MAX_RECORD / 2),
+            ..Default::default()
+        };
+        let mut bytes = header().encode_length_delimited_to_vec();
+        bytes.extend_from_slice(&big.encode_length_delimited_to_vec());
+
+        let mut reader = ArchiveReader::new(Cursor::new(bytes)).unwrap();
+        let read = reader.next().expect("a record").expect("read");
+        assert_eq!(read.user_agent.len(), MAX_RECORD / 2);
+        assert!(reader.next().is_none());
     }
 }
