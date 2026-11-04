@@ -564,6 +564,16 @@ impl Book {
                 entry.last_attempt_failed = false;
                 entry.failures = 0;
             }
+            // It broke the protocol, which says nothing about whether the
+            // address answers -- it answered, and handshook. Treated like a
+            // chain we refuse: nothing counted against it, and the delay
+            // carries the judgement. `short_sessions` is left where it is
+            // rather than reset, so a peer alternating between being evicted
+            // and misbehaving does not wipe its own eviction backoff.
+            Outcome::Violated => {
+                entry.last_attempt_failed = false;
+                entry.failures = 0;
+            }
             Outcome::Disconnected { .. } => {
                 entry.last_attempt_failed = false;
                 entry.failures = 0;
@@ -1224,6 +1234,45 @@ mod tests {
             "the eviction count is not ours to move"
         );
         // It connected, so it is still an address worth keeping.
+        assert_eq!(e.class(), Class::Good);
+    }
+
+    /// A peer that broke a protocol limit is due in an hour rather than in
+    /// five seconds, with nothing counted against the address and its
+    /// eviction count untouched.
+    #[test]
+    fn test_a_violation_is_due_in_an_hour() {
+        let mut t = Book::new(100, 1);
+        let addr = ip(1, 2, 3, 4);
+        insert(&mut t, addr, Class::Unknown);
+        t.record_connected(addr, NOW, 0, 2);
+        // A short session first, so there is a counter to leave alone.
+        t.record_ended(
+            addr,
+            NOW,
+            Outcome::Disconnected {
+                uptime_secs: 2,
+                silent: false,
+            },
+        );
+        assert_eq!(t.entry(&addr).unwrap().short_sessions, 1);
+
+        t.record_ended(addr, NOW, Outcome::Violated);
+        let e = t.entry(&addr).unwrap();
+        let delay = e.next_attempt - NOW;
+        // An hour, give or take the jitter every delay gets.
+        assert!(
+            (3_240..=3_960).contains(&delay),
+            "expected about an hour, got {delay}"
+        );
+        assert_eq!(e.failures, 0);
+        assert!(!e.last_attempt_failed);
+        assert_eq!(
+            e.short_sessions, 1,
+            "the eviction count is not ours to move"
+        );
+        // It connected and it answers: still an address worth keeping, just
+        // not one worth dialling again right away.
         assert_eq!(e.class(), Class::Good);
     }
 

@@ -55,6 +55,26 @@ const MANUAL_RETRY_SECS: u32 = 60;
 /// asked for.
 const OTHER_CHAIN_SECS: u32 = 24 * 60 * 60;
 
+/// How long a peer that broke the protocol is left alone.
+///
+/// A violation says the peer sent something the protocol forbids -- a message
+/// declaring a length above the limit, an INV above the item limit -- which
+/// until now was treated as an ordinary disconnect and redialled in five
+/// seconds. It is not an ordinary disconnect: whatever produced it is a build
+/// or an operator doing it on purpose, and both repeat.
+///
+/// Flat rather than doubling, unlike the eviction and failure backoffs. Those
+/// counters exist to tell a flaky address from a gone one, which is a question
+/// of degree; this is categorical, and a second violation tells us nothing the
+/// first did not. An hour is where the eviction backoff tops out, which is the
+/// same statement -- we have stopped expecting this peer to behave -- and it
+/// still picks up a node that was restarted into a fixed build the same day.
+///
+/// Operator-supplied addresses keep their short interval even so: an operator
+/// who points us at their own node is often pointing us at the build that is
+/// misbehaving, and a backoff would quietly stop honouring that.
+const VIOLATION_SECS: u32 = 60 * 60;
+
 /// Wait after a session that ended having run for a healthy length of time.
 /// Short, because we want to be connected to this peer.
 const STABLE_RECONNECT_SECS: u32 = 5;
@@ -175,6 +195,12 @@ pub enum Outcome {
     /// itself -- so nothing is counted against it; it is simply not a peer on
     /// this network, and a day is how long we take its word for it.
     OtherChain,
+    /// The peer sent something the protocol forbids and we hung up. Like
+    /// `OtherChain` this is a verdict on the peer rather than on the address
+    /// -- it answered and handshook, so it is as reachable as any good
+    /// address -- so no failure is counted and the delay carries the whole
+    /// judgement. See VIOLATION_SECS.
+    Violated,
     /// We could not even make the attempt: no route to that network, the Tor
     /// proxy is down, and so on. Never counted against the address, because it
     /// says nothing about the peer.
@@ -259,6 +285,8 @@ pub fn retry_delay_secs(
     match outcome {
         // Handled above, before the origin check.
         Outcome::OtherChain => OTHER_CHAIN_SECS,
+
+        Outcome::Violated => VIOLATION_SECS,
 
         Outcome::OurFault(reason) => match reason {
             OurFault::ProxyUnreachable => PROXY_UNREACHABLE_SECS,
@@ -526,6 +554,45 @@ mod tests {
         assert!(!Outcome::OtherChain.counts_as_failure());
         // Not an eviction either. We hung up, so the length says nothing.
         assert!(!Outcome::OtherChain.is_short_session());
+    }
+
+    /// A peer that broke a protocol limit waits an hour, which is the whole
+    /// of the judgement: nothing is counted against the address, because the
+    /// address answered and handshook.
+    #[test]
+    fn test_a_violation_waits_an_hour_and_is_not_a_failure() {
+        assert_eq!(
+            retry_delay_secs(&Outcome::Violated, Origin::Gossip, true, 0, 0),
+            60 * 60
+        );
+        // Flat, not doubling: a second violation says nothing the first did
+        // not, so neither counter moves the delay.
+        assert_eq!(
+            retry_delay_secs(&Outcome::Violated, Origin::Gossip, true, 9, 9),
+            VIOLATION_SECS
+        );
+        // An operator who points us at a misbehaving node is usually pointing
+        // us at the build that misbehaves, so their addresses keep the short
+        // interval -- unlike the chain verdict, which outranks it.
+        assert_eq!(
+            retry_delay_secs(&Outcome::Violated, Origin::Manual, true, 0, 0),
+            MANUAL_RETRY_SECS
+        );
+
+        assert!(!Outcome::Violated.counts_as_failure());
+        // Not an eviction either: we hung up, so the length says nothing.
+        assert!(!Outcome::Violated.is_short_session());
+
+        // Far enough from an ordinary disconnect to be worth asserting: that
+        // is the behaviour this replaces.
+        let ordinary = Outcome::Disconnected {
+            uptime_secs: 3600,
+            silent: false,
+        };
+        assert!(
+            retry_delay_secs(&Outcome::Violated, Origin::Gossip, true, 0, 0)
+                > retry_delay_secs(&ordinary, Origin::Gossip, true, 0, 0) * 100
+        );
     }
 
     #[test]
