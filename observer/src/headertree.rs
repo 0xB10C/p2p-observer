@@ -1,6 +1,6 @@
+use common::tokio::time::Instant;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use common::{
     anyhow::{Context, Result},
