@@ -907,6 +907,7 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::{mine_header, regtest_params};
     use super::*;
+    use crate::protocol::MAX_LOCATOR_SZ;
     use bitcoind::client::bitcoin::Address;
 
     // A random regtest address we can mine to.
@@ -1994,5 +1995,157 @@ mod tests {
             assert_eq!(loaded.build_locator(), tree.build_locator(), "seed {seed}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a locator has to get right, and what it is free to choose.
+    ///
+    /// A peer answers from the first hash in the locator that is on the
+    /// peer's own chain, so only two entries matter by their presence: the
+    /// tip, which is what makes a peer that agrees with us send nothing, and
+    /// genesis, which is what keeps a peer that agrees with us about nothing
+    /// from having to guess. Everything in between is a trade -- denser means
+    /// fewer headers re-sent after a fork, longer means a bigger message --
+    /// so the step pattern is deliberately not pinned here. What is pinned is
+    /// that every entry is a block on our chain, in descending order, and
+    /// that there are not too many of them.
+    #[test]
+    fn test_a_locator_names_our_tip_first_and_genesis_last() {
+        let mut tree = regtest_tree();
+        let genesis = tree.tip().0;
+        let chain = mine_chain(genesis, 400, 0);
+        tree.insert_batch(&chain);
+
+        let locator = tree.build_locator();
+        assert_eq!(locator.first(), Some(&tree.tip().0), "the tip comes first");
+        assert_eq!(locator.last(), Some(&genesis), "genesis comes last");
+
+        let mut last_height = None;
+        for hash in &locator {
+            let height = tree
+                .height_of(hash)
+                .unwrap_or_else(|| panic!("a locator hash we do not know: {hash}"));
+            assert_eq!(
+                tree.best_chain[height as usize], *hash,
+                "a locator hash that is not on our best chain: {hash}"
+            );
+            if let Some(last) = last_height {
+                assert!(height < last, "the locator is not descending: {locator:?}");
+            }
+            last_height = Some(height);
+        }
+        assert!(
+            locator.len() <= MAX_LOCATOR_SZ,
+            "a peer disconnects us for a locator this long: {}",
+            locator.len()
+        );
+    }
+
+    /// And still not too many at a height no test can mine to.
+    ///
+    /// The entries grow with the logarithm of the height once the step starts
+    /// doubling, so the limit is never close -- but "never close" is the kind
+    /// of claim that stops being true when someone changes the step. The tree
+    /// is handed a chain rather than mining one: all `build_locator` reads is
+    /// the best chain and the tip height, and mining a million regtest headers
+    /// to test an index walk would take minutes.
+    #[test]
+    fn test_a_locator_stays_short_at_mainnet_scale() {
+        let mut tree = regtest_tree();
+        let genesis = tree.tip().0;
+        tree.best_chain = (0..5_000_000u32)
+            .map(|i| {
+                if i == 0 {
+                    genesis
+                } else {
+                    let mut bytes = [0u8; 32];
+                    bytes[..4].copy_from_slice(&i.to_le_bytes());
+                    BlockHash::from_byte_array(bytes)
+                }
+            })
+            .collect();
+        tree.tip_height = tree.best_chain.len() as u32 - 1;
+
+        let locator = tree.build_locator();
+        assert_eq!(
+            locator.first(),
+            Some(&tree.best_chain[tree.tip_height as usize])
+        );
+        assert_eq!(locator.last(), Some(&genesis));
+        assert!(
+            locator.len() <= MAX_LOCATOR_SZ,
+            "a locator of {} at height {}",
+            locator.len(),
+            tree.tip_height
+        );
+    }
+
+    /// The locator and the answer to it, together, against a peer on another
+    /// chain.
+    ///
+    /// Each half is only as useful as the other: a locator that named nothing
+    /// the peer had would be answered from height 1, and an answer that
+    /// started above our fork would not connect to anything we hold. So this
+    /// takes our locator, has a peer's tree answer it, and feeds the answer
+    /// back -- which is the whole exchange, and the only thing that proves
+    /// the two agree.
+    #[test]
+    fn test_a_peer_answers_our_locator_with_headers_that_connect() {
+        let genesis = regtest_tree().tip().0;
+        let common = mine_chain(genesis, 280, 0);
+        let ours = mine_chain(common[279].block_hash(), 20, 1);
+        let theirs = mine_chain(common[279].block_hash(), 70, 2);
+
+        let mut us = regtest_tree();
+        us.insert_batch(&common);
+        us.insert_batch(&ours);
+        assert_eq!(us.tip().1, 300);
+
+        let mut peer = regtest_tree();
+        peer.insert_batch(&common);
+        peer.insert_batch(&theirs);
+        assert_eq!(peer.tip().1, 350);
+
+        let answer =
+            peer.get_headers_from_locator(&us.build_locator(), BlockHash::from_byte_array([0; 32]));
+        assert!(!answer.is_empty(), "the peer answered nothing");
+        assert!(
+            us.height_of(&answer[0].prev_blockhash).is_some(),
+            "the answer starts at a block whose parent we do not have"
+        );
+        assert_eq!(
+            answer.last().unwrap().block_hash(),
+            peer.tip().0,
+            "the answer stops short of the peer's tip"
+        );
+
+        // And it does not start far below the fork. This is what the dense
+        // run of entries nearest the tip is for, and it is the only
+        // measurable thing about the step pattern: a locator of just the tip
+        // and genesis is a valid locator, and a peer would answer it by
+        // re-sending our whole chain. Twenty blocks past the fork, a peer
+        // should be re-sending us a handful of headers, not hundreds.
+        let already_had = answer
+            .iter()
+            .filter(|h| us.height_of(&h.block_hash()).is_some())
+            .count();
+        assert!(
+            already_had < 32,
+            "the peer re-sent {already_had} headers we already had"
+        );
+
+        // Every one of them places, and we end up on the peer's chain: that
+        // is what the exchange was for.
+        us.insert_batch(&answer);
+        assert_eq!(us.tip().0, peer.tip().0);
+        assert_eq!(us.tip().1, 350);
+        // Our own fork is still there, as a stale tip rather than a gap.
+        assert_eq!(us.chain_tips().len(), 2);
+
+        // And now that we agree, our locator asks for nothing.
+        assert!(
+            peer.get_headers_from_locator(&us.build_locator(), BlockHash::from_byte_array([0; 32]))
+                .is_empty(),
+            "the peer re-sent headers we already have"
+        );
     }
 }
