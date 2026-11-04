@@ -24,6 +24,7 @@
               pkgs.rustfmt
               pkgs.rust-analyzer
               pkgs.cargo-tarpaulin
+              pkgs.cargo-mutants
 
               pkgs.protobuf
 

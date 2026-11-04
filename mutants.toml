@@ -1,0 +1,32 @@
+# cargo-mutants: how much of the behaviour the tests pin, rather than how much
+# of the code they run.
+#
+# A mutant is a small edit to the source -- a comparison flipped, a return
+# value replaced, an operator swapped. One that survives the suite is a
+# behaviour no test pins, which is a sharper question than whether a line was
+# executed, and the two answers differ: the first pass over policy.rs left
+# eleven mutants alive at ninety-eight percent line coverage. Every backoff cap
+# was among them, because each assertion compared a delay against the same
+# constant that produced it, so mutating the constant moved both sides.
+#
+# Run it by hand. A full pass over the workspace is hours, since every mutant
+# is its own build and test run, so in practice it goes at what just changed:
+#
+#     cargo mutants --file observer/src/addresses/policy.rs
+#     cargo mutants --in-diff changes.diff
+
+# The tests that need a bitcoind or a nats-server take seconds to set up, which
+# is unaffordable several hundred times over; the unit tests are what does
+# nearly all of the catching anyway. Worth remembering when reading a result:
+# a mutant in a path only the integration tests reach survives here for want of
+# being tested rather than for want of a test.
+additional_cargo_test_args = ["--lib", "--bins"]
+
+exclude_globs = [
+    # Argument parsing over a call to run(). There is no behaviour of its own
+    # to pin, and every mutant in it is unviable or uncatchable.
+    "*/src/main.rs",
+    "tools/archive/src/bin/*.rs",
+    # Formatting of log fields for people to read.
+    "observer/src/logging.rs",
+]
