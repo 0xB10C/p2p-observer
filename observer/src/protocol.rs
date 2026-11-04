@@ -2127,6 +2127,138 @@ mod tests {
         assert_eq!(announced, MAX_BLOCK_INVS_ANNOUNCED);
     }
 
+    /// A chain of `n` headers on top of `prev`, each a valid regtest header.
+    fn chain_on(prev: BlockHash, n: usize) -> Vec<common::bitcoin::block::Header> {
+        use crate::headertree::testing::mine_header;
+        let mut out = Vec::with_capacity(n);
+        let mut prev = prev;
+        for i in 0..n {
+            let h = mine_header(prev, 1_700_000_000 + i as u32, 9);
+            prev = h.block_hash();
+            out.push(h);
+        }
+        out
+    }
+
+    /// The block announcements a message produced.
+    fn announcements(
+        events: &mut mpsc::Receiver<common::events::PeerEvent>,
+    ) -> Vec<common::events::BlockAnnouncement> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|e| match e.event {
+                Some(common::events::peer_event::Event::BlockAnnouncement(a)) => Some(a),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Exactly as many headers as Core announces at once is an announcement;
+    /// one more is a sync response.
+    ///
+    /// The distinction is the whole reason a headers message produces events
+    /// at all, and the boundary is the part worth pinning: Core's
+    /// MAX_BLOCKS_TO_ANNOUNCE is eight, so eight is a legitimate announcement
+    /// of eight blocks and has to be reported as eight. Off by one in the
+    /// strict direction and a real announcement of exactly eight blocks
+    /// vanishes from the stream; off by one the other way and one reply to our
+    /// own getheaders arrives as nine first sightings.
+    #[tokio::test]
+    async fn test_exactly_the_announcement_limit_is_still_an_announcement() {
+        use crate::headertree::testing::regtest_params;
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let (genesis, _) = tree.read().unwrap().tip();
+        let mut h = harness(tree);
+
+        let announced = chain_on(genesis, MAX_HEADERS_ANNOUNCED);
+        h.conn.handle_headers(announced.clone()).await.unwrap();
+        let events = announcements(&mut h.events);
+        assert_eq!(
+            events.len(),
+            MAX_HEADERS_ANNOUNCED,
+            "a message of exactly the limit was not announced"
+        );
+        for (event, header) in events.iter().zip(&announced) {
+            assert_eq!(event.block_hash, header.block_hash().to_string());
+            assert_eq!(event.batch_size, MAX_HEADERS_ANNOUNCED as u32);
+        }
+
+        // One more than the limit is our own request coming back, and
+        // announcing it would turn one reply into nine first sightings.
+        let tip = announced.last().unwrap().block_hash();
+        h.conn
+            .handle_headers(chain_on(tip, MAX_HEADERS_ANNOUNCED + 1))
+            .await
+            .unwrap();
+        assert!(
+            announcements(&mut h.events).is_empty(),
+            "a sync response was announced"
+        );
+    }
+
+    /// An announcement says which of the blocks were new to us.
+    ///
+    /// `new_to_us` is what an archive counts first sightings by, and nothing was
+    /// checking which way round it is: a flag inverted here would turn every
+    /// block the tool has already seen into a sighting and every genuinely new
+    /// one into a repeat, which is wrong in a way that reads as plausible for
+    /// as long as nobody checks it against the tree.
+    #[tokio::test]
+    async fn test_an_announcement_says_which_blocks_were_new() {
+        use crate::headertree::testing::regtest_params;
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let (genesis, _) = tree.read().unwrap().tip();
+        let chain = chain_on(genesis, 2);
+        // The first one is already ours; the second has never been seen.
+        tree.write().unwrap().insert_batch(&chain[..1]);
+        let mut h = harness(tree);
+
+        h.conn.handle_headers(chain.clone()).await.unwrap();
+        let events = announcements(&mut h.events);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].block_hash, chain[0].block_hash().to_string());
+        assert!(!events[0].new_to_us, "a header we already had read as new");
+        assert_eq!(events[1].block_hash, chain[1].block_hash().to_string());
+        assert!(
+            events[1].new_to_us,
+            "a header we had never seen read as old"
+        );
+    }
+
+    /// A sync asks for more only when the last answer taught it something.
+    ///
+    /// This is the sync's termination condition. Asking again regardless is
+    /// not a slow sync, it is a loop: a peer whose answer we already hold
+    /// would be asked the same question for as long as the session lasted.
+    /// And the condition belongs to the sync alone -- an ordinary session
+    /// chases what it is missing through the recovery throttle, which is what
+    /// stops one announcement from becoming one getheaders per peer per
+    /// block.
+    #[tokio::test]
+    async fn test_a_sync_asks_again_only_when_it_learned_something() {
+        use crate::headertree::testing::regtest_params;
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let (genesis, _) = tree.read().unwrap().tip();
+        let chain = chain_on(genesis, 3);
+        let mut h = harness(tree);
+        h.conn.sync_headers = true;
+
+        // New headers: the sync asks for the next batch.
+        h.conn.handle_headers(chain.clone()).await.unwrap();
+        assert_eq!(
+            getheaders_sent(&h.conn.writer),
+            1,
+            "a sync that learned something did not ask for more"
+        );
+
+        // The same headers again teach it nothing, and it must not ask again.
+        h.conn.handle_headers(chain.clone()).await.unwrap();
+        assert_eq!(
+            getheaders_sent(&h.conn.writer),
+            1,
+            "a sync asked again for headers it already had"
+        );
+    }
+
     /// A compact-block inv is announced, and asked for as a compact block.
     ///
     /// This is how a high-bandwidth BIP152 peer says it has a block, and it is
