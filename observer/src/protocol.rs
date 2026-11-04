@@ -233,6 +233,25 @@ const PING_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const GETHEADERS_BURST: f64 = 4.0;
 const GETHEADERS_RATE_PER_SEC: f64 = 1.0 / 30.0;
 
+/// The longest locator we will walk, in hashes.
+///
+/// A locator is a tip-first list of block hashes, each about twice as far back
+/// as the one before, so no implementation builds one longer than roughly
+/// `log2(height) + 10` entries. Bitcoin Core accepts a hundred and one and
+/// disconnects a peer that sends more -- its MAX_LOCATOR_SZ, which this is.
+///
+/// Nothing bounds the field on the wire below the message limit, which leaves
+/// room for some hundred and fifty thousand hashes: a lookup each, under the
+/// read lock on the header tree that every connection shares. One message must
+/// not buy that much work. The hashes past the cap are the oldest ones, so
+/// they are the least likely to be on our chain, and a locator any
+/// implementation would build is answered exactly as before.
+///
+/// The session stays up, where Core's would not, for the reason the rate limit
+/// does not hang up either: a peer sending a locator this long is worth a line
+/// in the log, not worth ending the measurement over.
+const MAX_LOCATOR_SZ: usize = 101;
+
 /// Distinct commands counted per session.
 ///
 /// The command string comes off the wire, so the key space belongs to the
@@ -1330,11 +1349,19 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
             );
             return Ok(());
         }
+        let walked = msg.locator_hashes.len().min(MAX_LOCATOR_SZ);
+        if walked < msg.locator_hashes.len() {
+            tracing::debug!(target: TARGET,
+                locator_len = msg.locator_hashes.len(),
+                walked,
+                "overlong getheaders locator: walking the newest hashes only"
+            );
+        }
         let headers = self
             .header_tree
             .read()
             .unwrap()
-            .get_headers_from_locator(&msg.locator_hashes, msg.stop_hash);
+            .get_headers_from_locator(&msg.locator_hashes[..walked], msg.stop_hash);
         tracing::debug!(target: TARGET, count = headers.len(), "responding to getheaders");
         self.writer
             .send(NetworkMessage::Headers(
@@ -1614,6 +1641,14 @@ mod tests {
             .count()
     }
 
+    /// How many headers the HEADERS message we sent last carries.
+    fn headers_in_reply(w: &Captured) -> usize {
+        match w.0.last().expect("a message was sent") {
+            NetworkMessage::Headers(h) => h.0.len(),
+            _ => panic!("the last message sent was not a HEADERS"),
+        }
+    }
+
     fn getheaders_sent(w: &Captured) -> usize {
         w.0.iter()
             .filter(|m| matches!(m, NetworkMessage::GetHeaders(_)))
@@ -1669,6 +1704,52 @@ mod tests {
         h.conn.handle_get_headers(ask).await.unwrap();
         assert_eq!(headers_sent(&h.conn.writer), burst + 1);
         assert_eq!(h.conn.stats.getheaders_ignored, 3);
+    }
+
+    /// A locator longer than any implementation builds is walked only as far
+    /// as the cap, and a hash sitting past it does not place the answer.
+    ///
+    /// Asserted through the reply rather than on the slice: a match found at
+    /// height one starts the answer at height two, and no match at all starts
+    /// it after genesis -- so the number of headers that come back says which
+    /// of the two happened.
+    #[tokio::test]
+    async fn test_an_overlong_getheaders_locator_is_walked_only_so_far() {
+        use crate::headertree::testing::{mine_header, regtest_params};
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let (genesis, _) = tree.read().unwrap().tip();
+        let h1 = mine_header(genesis, 1_700_000_000, 1);
+        let h2 = mine_header(h1.block_hash(), 1_700_000_001, 2);
+        tree.write().unwrap().insert_batch(&[h1, h2]);
+        let mut h = harness(tree);
+
+        let ask = |locator: Vec<BlockHash>| GetHeadersMessage {
+            version: ProtocolVersion::WTXID_RELAY_VERSION,
+            locator_hashes: locator,
+            stop_hash: BlockHash::from_byte_array([0; 32]),
+        };
+        // Hashes we have never heard of, to pad a locator with.
+        let padding = |n: u8| (0..n).map(|i| BlockHash::from_byte_array([i + 1; 32]));
+
+        // Within the cap the real hash is found: the answer starts above it.
+        let mut locator: Vec<BlockHash> = padding(99).collect();
+        locator.push(h1.block_hash());
+        h.conn.handle_get_headers(ask(locator)).await.unwrap();
+        assert_eq!(headers_in_reply(&h.conn.writer), 1);
+
+        // One hash further out and it is never looked at, so the answer comes
+        // from after genesis instead -- the same as a locator that matches
+        // nothing, which is what an unwalked hash amounts to.
+        let mut locator: Vec<BlockHash> = padding(MAX_LOCATOR_SZ as u8).collect();
+        locator.push(h1.block_hash());
+        assert!(locator.len() > MAX_LOCATOR_SZ);
+        h.conn.handle_get_headers(ask(locator)).await.unwrap();
+        assert_eq!(headers_in_reply(&h.conn.writer), 2);
+
+        // Both were answered: the cap shortens the walk, it does not withhold
+        // the reply.
+        assert_eq!(headers_sent(&h.conn.writer), 2);
+        assert_eq!(h.conn.stats.getheaders_ignored, 0);
     }
 
     #[test]
