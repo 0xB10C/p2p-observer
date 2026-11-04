@@ -639,4 +639,79 @@ mod tests {
         // cannot keep dead entries resident by re-gossiping them.
         assert!(should_forget(now, Origin::Gossip, 0, now, 5));
     }
+
+    /// The windows, in seconds, as the comments above describe them.
+    ///
+    /// Everything else here asserts a delay against the constant that
+    /// produced it, so the constant and the assertion move together and an
+    /// edit to either is invisible: `WAS_GOOD_CAP_SECS` could become six
+    /// minutes and `retry_delay_secs(..) == WAS_GOOD_CAP_SECS` would still
+    /// hold. These are the crawler's operating policy -- how long a dead
+    /// address is left alone, when one is given up on -- and they are worth
+    /// stating once in the units the comments use.
+    ///
+    /// Mutation testing is what found this: turning `6 * 60 * 60` into
+    /// `6 + 60 + 60` in each of these left the suite green.
+    #[test]
+    fn test_the_windows_are_the_lengths_the_comments_describe() {
+        const MINUTE: u32 = 60;
+        const HOUR: u32 = 60 * MINUTE;
+        const DAY: u32 = 24 * HOUR;
+
+        assert_eq!(SHORT_SESSION_SECS, 31, "half a minute and a second");
+        assert_eq!(STABLE_RECONNECT_SECS, 5);
+        assert_eq!(MANUAL_RETRY_SECS, MINUTE);
+        assert_eq!(VIOLATION_SECS, HOUR);
+        assert_eq!(OTHER_CHAIN_SECS, DAY);
+
+        assert_eq!(PROXY_UNREACHABLE_SECS, 30);
+        assert_eq!(NETWORK_UNREACHABLE_SECS, HOUR);
+        assert_eq!(NETWORK_DISABLED_SECS, DAY);
+
+        assert_eq!(EVICTION_BASE_SECS, MINUTE);
+        assert_eq!(EVICTION_CAP_SECS, HOUR);
+        assert_eq!(WAS_GOOD_BASE_SECS, MINUTE);
+        assert_eq!(WAS_GOOD_CAP_SECS, 6 * HOUR);
+        assert_eq!(BAD_BASE_SECS, HOUR);
+        assert_eq!(BAD_CAP_SECS, 7 * DAY);
+
+        assert_eq!(WAS_GOOD_FORGET_AFTER_SECS, 30 * DAY);
+        assert_eq!(BAD_ANNOUNCE_GRACE_SECS, 30 * DAY);
+        assert_eq!(BAD_FORGET_FAILURES_IF_STALE, 3);
+        assert_eq!(BAD_FORGET_FAILURES_ALWAYS, 5);
+    }
+
+    /// Both forget windows are exclusive: an address is kept at the window and
+    /// dropped a second past it.
+    ///
+    /// Which way the boundary falls decides nothing on its own, but it being
+    /// unpinned means a later edit from `>` to `>=` reads as a no-op when it
+    /// is a change in behaviour. Mutation testing found both.
+    #[test]
+    fn test_the_forget_windows_are_exclusive() {
+        let now = 100 * DAY;
+
+        // Connected before, and the success is exactly as old as the window.
+        let at = now - WAS_GOOD_FORGET_AFTER_SECS;
+        assert!(!should_forget(now, Origin::Gossip, at, 0, 50));
+        assert!(should_forget(now, Origin::Gossip, at - 1, 0, 50));
+
+        // Never connected, failing, and last announced exactly a grace window
+        // ago.
+        let at = now - BAD_ANNOUNCE_GRACE_SECS;
+        assert!(!should_forget(
+            now,
+            Origin::Gossip,
+            0,
+            at,
+            BAD_FORGET_FAILURES_IF_STALE
+        ));
+        assert!(should_forget(
+            now,
+            Origin::Gossip,
+            0,
+            at - 1,
+            BAD_FORGET_FAILURES_IF_STALE
+        ));
+    }
 }

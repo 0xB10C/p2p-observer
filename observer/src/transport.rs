@@ -903,4 +903,32 @@ mod tests {
         let err = reader.recv().await.unwrap_err();
         assert_eq!(fault_of(&err), Some(Fault::Oversized));
     }
+    /// A v2 failure is named by what it was, so that a peer closing on us is
+    /// not reported as a decryption failure or the other way round.
+    ///
+    /// Each arm is one line of a match with a guard on it, and a guard is
+    /// exactly the sort of thing that reads as obviously right and is not
+    /// covered by anything: mutation testing had this one both always true
+    /// and always false with nothing failing.
+    #[test]
+    fn test_a_v2_failure_is_named_by_what_it_was() {
+        use bip324::io::ProtocolError;
+
+        // A peer that hangs up rather than speak v2. The kind is what says so,
+        // and it is the kind the mapping turns on.
+        let aborted = ProtocolError::from(Error::new(ErrorKind::ConnectionAborted, "closed"));
+        assert_eq!(fault_of(&v2_fault(aborted)), Some(Fault::PeerClosed));
+
+        // Any other transport failure is not that, and claiming it was would
+        // put a peer's hang-up in the count of our own broken sockets.
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::TimedOut,
+            ErrorKind::BrokenPipe,
+        ] {
+            let other = ProtocolError::from(Error::new(kind, "something else"));
+            assert_eq!(fault_of(&v2_fault(other)), None, "{kind:?}");
+        }
+    }
 }
