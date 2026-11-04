@@ -78,6 +78,7 @@ name = "archive"
 version = "0.1.0"
 dependencies = [
  "common",
+ "testsupport",
  "time",
  "zstd",
 ]

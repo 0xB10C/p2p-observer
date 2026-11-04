@@ -7,3 +7,6 @@ edition = "2024"
 common = { path = "../../common" }
 time = { version = "0.3", features = ["formatting", "macros"] }
 zstd = "0.14"
+
+[dev-dependencies]
+testsupport = { path = "../../testsupport" }

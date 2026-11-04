@@ -99,12 +99,14 @@ pub fn load(path: &Path) -> HashMap<PeerAddr, Entry> {
 mod tests {
     use super::*;
     use crate::addresses::policy::Origin;
+    use testsupport::TempDir;
 
-    fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("p2p-observer-snap-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A directory of its own, removed when the test drops it.
+    ///
+    /// Cleaning up by hand at the end of a test leaks the directory whenever
+    /// the test does not reach the end.
+    fn tmp_dir(tag: &str) -> TempDir {
+        TempDir::new(&format!("p2p-observer-snap-{tag}"))
     }
 
     fn sample() -> HashMap<PeerAddr, Entry> {
@@ -125,7 +127,7 @@ mod tests {
     #[test]
     fn test_round_trip() {
         let dir = tmp_dir("rt");
-        let path = dir.join("addresses.bin");
+        let path = dir.path().join("addresses.bin");
         let entries = sample();
 
         let written = save(&path, entries.iter()).unwrap();
@@ -146,21 +148,18 @@ mod tests {
         }
         // Onion addresses survive as their 32 raw bytes, not as a hostname string.
         assert!(loaded.contains_key(&PeerAddr::TorV3([7u8; 32], 8333)));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_missing_file_is_an_empty_table() {
         let dir = tmp_dir("missing");
-        assert!(load(&dir.join("nope.bin")).is_empty());
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(load(&dir.path().join("nope.bin")).is_empty());
     }
 
     #[test]
     fn test_corrupt_file_is_an_empty_table_not_a_panic() {
         let dir = tmp_dir("corrupt");
-        let path = dir.join("addresses.bin");
+        let path = dir.path().join("addresses.bin");
 
         // Truncated, as a crash mid-write would leave it.
         let entries = sample();
@@ -172,14 +171,12 @@ mod tests {
         // Outright garbage.
         std::fs::write(&path, b"not a snapshot at all").unwrap();
         assert!(load(&path).is_empty());
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_other_format_version_is_discarded() {
         let dir = tmp_dir("version");
-        let path = dir.join("addresses.bin");
+        let path = dir.path().join("addresses.bin");
 
         let snapshot = Snapshot {
             version: FORMAT_VERSION + 1,
@@ -190,8 +187,6 @@ mod tests {
         // Discarded rather than guessed at. Relearning is cheap; misreading
         // the fields of a layout we don't know is not.
         assert!(load(&path).is_empty());
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The reason for postcard over JSON.
