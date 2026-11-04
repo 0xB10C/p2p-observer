@@ -148,6 +148,9 @@ pub enum Fault {
     Decode,
     /// A v1 header declared a payload longer than [`MAX_V1_PAYLOAD`].
     Oversized,
+    /// A v1 header did not carry this network's magic, so the stream is
+    /// either out of step with the framing or not this network's at all.
+    WrongMagic,
     /// A v2 packet would not decrypt, so the channel is out of sync and
     /// nothing further on it means anything.
     V2Decrypt,
@@ -162,6 +165,7 @@ impl std::fmt::Display for Fault {
             Fault::Truncated => "stream ended mid-message",
             Fault::Decode => "message did not deserialize",
             Fault::Oversized => "peer declared an oversized message",
+            Fault::WrongMagic => "header carried another network's magic",
             Fault::V2Decrypt => "v2 packet did not decrypt",
             Fault::Write => "send failed",
         };
@@ -283,6 +287,9 @@ pub struct TransportV1Reader<R> {
     reader: R,
     state: V1ReadState,
     undecodable: u32,
+    /// What every header has to open with, kept as the four bytes rather than
+    /// as a `Magic` so the comparison is against the wire form.
+    magic: [u8; 4],
 }
 
 enum V1ReadState {
@@ -297,7 +304,7 @@ enum V1ReadState {
 }
 
 impl<R> TransportV1Reader<R> {
-    pub fn new(reader: R) -> Self {
+    pub fn new(reader: R, magic: Magic) -> Self {
         Self {
             reader,
             state: V1ReadState::Header {
@@ -305,6 +312,7 @@ impl<R> TransportV1Reader<R> {
                 pos: 0,
             },
             undecodable: 0,
+            magic: magic.to_bytes(),
         }
     }
 }
@@ -342,6 +350,25 @@ where
                         *pos += n;
                     }
                     let header = *buf;
+                    // Before the length, because a header that is not ours
+                    // says nothing reliable about what follows it.
+                    if header[..4] != self.magic {
+                        tracing::warn!(target: TARGET,
+                            got = %header[..4].iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                            want = %self.magic.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                            "v1 header carried another network's magic"
+                        );
+                        // The state keeps the header, as with an oversized
+                        // declaration: nothing has been consumed past it, and
+                        // a reset would read the body as the next header. The
+                        // next call fails the same way, which is the honest
+                        // answer for a stream we cannot follow.
+                        return Err(common::anyhow::Error::new(Error::new(
+                            ErrorKind::InvalidData,
+                            "v1 header did not carry this network's magic",
+                        ))
+                        .context(Fault::WrongMagic));
+                    }
                     let payload_len =
                         u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
                     if payload_len > MAX_V1_PAYLOAD {
@@ -513,7 +540,7 @@ mod tests {
             Magic::REGTEST,
             NetworkMessage::Ping(7),
         )));
-        let mut reader = TransportV1Reader::new(&stream[..]);
+        let mut reader = TransportV1Reader::new(&stream[..], Magic::REGTEST);
 
         match reader.recv().await.unwrap() {
             NetworkMessage::Unknown { command, payload } => {
@@ -562,7 +589,7 @@ mod tests {
     #[tokio::test]
     async fn test_v1_unreadable_command_is_a_decode_fault() {
         let stream = frame(b"\xff\xfe{versio\0\0\0", &[0xff]);
-        let mut reader = TransportV1Reader::new(&stream[..]);
+        let mut reader = TransportV1Reader::new(&stream[..], Magic::REGTEST);
 
         let err = reader.recv().await.unwrap_err();
         assert_eq!(fault_of(&err), Some(Fault::Decode));
@@ -629,10 +656,12 @@ mod tests {
         assert_eq!(checked, [1, 6, 7, 11, 13, 14, 15, 17, 28]);
     }
 
-    /// A v1 header: magic, command, length, checksum. Only the length is read
-    /// before the payload, which is what these tests are about.
+    /// A v1 header: magic, command, length, checksum. The magic and the length
+    /// are the two fields read before the payload, which is what these tests
+    /// are about; the checksum is not looked at until the body is in.
     fn header_declaring(payload_len: u32) -> Vec<u8> {
         let mut h = vec![0u8; 24];
+        h[..4].copy_from_slice(&Magic::REGTEST.to_bytes());
         h[4..7].copy_from_slice(b"inv");
         h[16..20].copy_from_slice(&payload_len.to_le_bytes());
         h
@@ -644,7 +673,7 @@ mod tests {
     #[tokio::test]
     async fn test_an_oversized_payload_is_refused_before_it_is_allocated() {
         let bytes = header_declaring(u32::MAX);
-        let mut reader = TransportV1Reader::new(&bytes[..]);
+        let mut reader = TransportV1Reader::new(&bytes[..], Magic::REGTEST);
         let err = reader.recv().await.expect_err("an oversized declaration");
         assert_eq!(fault_of(&err), Some(Fault::Oversized), "{err:#}");
     }
@@ -656,11 +685,43 @@ mod tests {
     async fn test_the_oversized_failure_sticks() {
         let mut bytes = header_declaring(MAX_V1_PAYLOAD as u32 + 1);
         bytes.extend_from_slice(&[0u8; 64]);
-        let mut reader = TransportV1Reader::new(&bytes[..]);
+        let mut reader = TransportV1Reader::new(&bytes[..], Magic::REGTEST);
         for attempt in 0..3 {
             let err = reader.recv().await.expect_err("an oversized declaration");
             assert_eq!(fault_of(&err), Some(Fault::Oversized), "attempt {attempt}");
         }
+    }
+
+    /// A header that does not open with our magic ends the stream, whatever
+    /// else it says. Nothing is decoded and the declared length is not even
+    /// read: the bytes were never ours to read.
+    #[tokio::test]
+    async fn test_a_header_with_another_networks_magic_is_refused() {
+        let mut bytes = header_declaring(32);
+        bytes[..4].copy_from_slice(&Magic::BITCOIN.to_bytes());
+        bytes.extend_from_slice(&[0u8; 32]);
+        let mut reader = TransportV1Reader::new(&bytes[..], Magic::REGTEST);
+        let err = reader.recv().await.expect_err("another network's magic");
+        assert_eq!(fault_of(&err), Some(Fault::WrongMagic), "{err:#}");
+
+        // And it keeps failing that way, for the reason an oversized header
+        // does: the frame was never consumed, so there is nothing to
+        // resynchronise to.
+        for attempt in 0..2 {
+            let err = reader.recv().await.expect_err("another network's magic");
+            assert_eq!(fault_of(&err), Some(Fault::WrongMagic), "attempt {attempt}");
+        }
+    }
+
+    /// The magic is checked before the length, so a frame that is wrong in
+    /// both ways is reported as the one that makes the other meaningless.
+    #[tokio::test]
+    async fn test_the_magic_is_read_before_the_declared_length() {
+        let mut bytes = header_declaring(u32::MAX);
+        bytes[..4].copy_from_slice(&Magic::SIGNET.to_bytes());
+        let mut reader = TransportV1Reader::new(&bytes[..], Magic::REGTEST);
+        let err = reader.recv().await.expect_err("a header wrong twice over");
+        assert_eq!(fault_of(&err), Some(Fault::WrongMagic), "{err:#}");
     }
 
     /// The limit is above every message a peer has reason to send, so an
@@ -671,7 +732,7 @@ mod tests {
             Magic::REGTEST,
             NetworkMessage::Verack,
         ));
-        let mut reader = TransportV1Reader::new(&bytes[..]);
+        let mut reader = TransportV1Reader::new(&bytes[..], Magic::REGTEST);
         let msg = reader.recv().await.expect("a verack");
         assert!(matches!(msg, NetworkMessage::Verack), "{msg:?}");
     }

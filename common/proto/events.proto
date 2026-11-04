@@ -313,6 +313,13 @@ enum DisconnectReason {
   // The peer went outside a protocol limit -- an INV above MAX_INV_SIZE, say
   // -- which is not something an implementation does by accident.
   DISCONNECT_REASON_PROTOCOL_VIOLATION = 11;
+  // A v1 header did not start with this network's magic. Either the stream
+  // is no longer aligned to the framing, or the peer is speaking another
+  // network at us -- and a v1 stream has no way to tell those apart, nor any
+  // resynchronisation point other than the magic itself. Worth its own
+  // reason rather than DECODE_ERROR: it says the bytes were not ours to read
+  // in the first place, which is the one thing a decode failure does not.
+  DISCONNECT_REASON_WRONG_MAGIC = 12;
 }
 
 // Why an attempt never reached a session.

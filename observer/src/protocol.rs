@@ -2179,7 +2179,7 @@ mod tests {
 
         let stream = TcpStream::connect(addr).await.unwrap();
         let (reader, writer) = stream.into_split();
-        let mut r = TransportV1Reader::new(BufReader::new(reader));
+        let mut r = TransportV1Reader::new(BufReader::new(reader), Magic::REGTEST);
         let mut w = TransportV1Writer {
             magic: Magic::REGTEST,
             writer,
