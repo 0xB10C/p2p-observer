@@ -324,8 +324,17 @@ impl HeaderTree {
         let before = self.headers.len();
         self.headers
             .retain(|hash, entry| entry.height > reached || keep.contains(hash));
-        // What was built on a pruned header is now an orphan; in height order
-        // so a parent is settled before its children.
+        // What was built on a pruned header would now be an orphan; walked in
+        // height order so a parent is settled before its children.
+        //
+        // Nothing reaches this today. A branch cannot cross a checkpoint
+        // height -- the header at that height is refused by hash and its
+        // descendants inherit the refusal -- and `note_checkpoint` only fires
+        // on the insert of the checkpoint block itself, so nothing taller is
+        // in the tree when this runs. See
+        // `test_a_stray_branch_stops_at_the_checkpoint_height`. It stays
+        // because a header with no parent panics `chain_tips`, and this is
+        // where that is prevented rather than where it is discovered.
         let mut above: Vec<(u32, BlockHash)> = self
             .headers
             .iter()
@@ -1693,6 +1702,81 @@ mod tests {
         assert_eq!(tree.tip().0, real[2].block_hash());
         assert_eq!(tree.len(), 4);
         assert_eq!(tree.chain_tips().len(), 1);
+    }
+
+    /// A stray branch cannot cross the checkpoint height, and that is what
+    /// keeps the tree's parents whole.
+    ///
+    /// Before a checkpoint is reached a fork below it is allowed in, so a peer
+    /// can hand us a long branch off genesis while we are still syncing. The
+    /// question this answers is how far it gets: the header at the checkpoint
+    /// height is refused by hash, and every header built on that one inherits
+    /// the refusal -- so the branch stops one short of the checkpoint, and the
+    /// tree never holds a header *above* a checkpoint whose ancestry is about
+    /// to be pruned.
+    ///
+    /// Which is why the second pass of `prune_below_checkpoint` -- the one
+    /// that drops what was built on a pruned header -- has nothing to do, on
+    /// this path or any other: `note_checkpoint` only fires on the insert of
+    /// the checkpoint block itself, and nothing taller than it is in the tree
+    /// at that moment. Worth knowing rather than worth removing. A header
+    /// left with no parent would not merely be stale: `chain_tips` walks
+    /// parents by indexing into the map, so the next `headertree.tips` RPC
+    /// would panic on it. This test is what says the guard is a guard.
+    #[test]
+    fn test_a_stray_branch_stops_at_the_checkpoint_height() {
+        let genesis = regtest_tree().tip().0;
+        let real = mine_chain(genesis, 100, 0);
+        let stray = mine_chain(genesis, 150, 1);
+
+        let mut tree =
+            HeaderTree::with_checkpoints(regtest_params(), vec![checkpoint_at(&real, 100)]);
+        let (accepted, _) = tree.insert_batch(&stray);
+
+        // Ninety-nine of the hundred and fifty, and the tip is the last one
+        // below the checkpoint height.
+        assert_eq!(accepted, 99);
+        assert_eq!(tree.tip().1, 99);
+        assert_eq!(
+            tree.rejection_of(&stray[99].block_hash()),
+            Some(HeaderError::CheckpointMismatch),
+            "the header at the checkpoint height was not refused by hash"
+        );
+        assert_eq!(
+            tree.rejection_of(&stray[149].block_hash()),
+            Some(HeaderError::CheckpointMismatch),
+            "a header fifty blocks above it did not inherit the refusal"
+        );
+        assert_eq!(tree.reached_checkpoint(), None);
+
+        // The real chain arrives and takes the whole stray branch with it.
+        tree.insert_batch(&real);
+        assert_eq!(tree.reached_checkpoint(), Some(100));
+        assert_eq!(tree.len(), 101, "genesis and the hundred real headers");
+        assert_eq!(tree.tip().0, real[99].block_hash());
+        for header in &stray {
+            assert!(
+                tree.height_of(&header.block_hash()).is_none(),
+                "a stray header survived the checkpoint"
+            );
+        }
+
+        // The invariant the rest of the tree reads as given.
+        for (hash, entry) in &tree.headers {
+            if entry.height == 0 {
+                continue;
+            }
+            assert!(
+                tree.headers.contains_key(&entry.header.prev_blockhash),
+                "{hash} at height {} has no parent",
+                entry.height
+            );
+        }
+        // And the RPC that walks those parents answers.
+        let tips = tree.chain_tips();
+        assert_eq!(tips.len(), 1);
+        assert_eq!(tips[0].branch_len, 0);
+        assert_eq!(tips[0].status, ChainTipStatus::Active);
     }
 
     #[test]
