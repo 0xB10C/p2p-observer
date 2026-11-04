@@ -3068,4 +3068,150 @@ mod tests {
         }
         assert!(h.events.try_recv().is_err());
     }
+
+    // ── The lenient addrv2 parser, against arbitrary input ──────────────────
+    //
+    // It exists because the canonical decoder refuses a whole message over one
+    // entry it dislikes, which btcd produces on every connection. A second
+    // implementation of a wire format is a second place to be wrong, and this
+    // one walks peer-controlled lengths by hand, so what it must never do is
+    // disagree with the decoder about a message the decoder accepts.
+
+    /// A valid addrv2 entry of a random kind.
+    fn any_entry(rng: &mut testsupport::Rng) -> AddrV2Message {
+        let addr = match rng.below(6) {
+            0 => address::AddrV2::Ipv4(Ipv4Addr::from(rng.next_u64() as u32)),
+            1 => address::AddrV2::Ipv6(std::net::Ipv6Addr::from(
+                u128::from(rng.next_u64()) << 64 | u128::from(rng.next_u64()),
+            )),
+            2 => {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&rng.bytes(32));
+                address::AddrV2::TorV3(key)
+            }
+            3 => {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&rng.bytes(32));
+                address::AddrV2::I2p(key)
+            }
+            4 => address::AddrV2::Cjdns(std::net::Ipv6Addr::from(
+                u128::from(0xfc00u16) << 112 | u128::from(rng.next_u64()),
+            )),
+            // A network id this build has no name for, which is the case the
+            // decoder is strict about and a peer is free to send. Seven and up,
+            // because the ids below it are the ones with names -- and an
+            // `Unknown(1, [a, b, c, d])` comes back from the decoder as the
+            // Ipv4 it is, which is right and is not what this test is about.
+            _ => {
+                let id = 7 + rng.below(249) as u8;
+                let n = rng.below(40);
+                address::AddrV2::Unknown(id, rng.bytes(n))
+            }
+        };
+        AddrV2Message {
+            time: rng.next_u64() as u32,
+            services: ServiceFlags::from(rng.next_u64()),
+            addr,
+            port: rng.next_u64() as u16,
+        }
+    }
+
+    /// A message the canonical encoder produced, which the decoder therefore
+    /// accepts.
+    fn canonical_addrv2(rng: &mut testsupport::Rng) -> (Vec<u8>, Vec<AddrV2Message>) {
+        use common::bitcoin::consensus::serialize;
+        let entries: Vec<AddrV2Message> = (0..rng.below(8)).map(|_| any_entry(rng)).collect();
+        let payload = serialize(&common::p2p::message::AddrV2Payload(entries.clone()));
+        (payload, entries)
+    }
+
+    /// On a message the decoder accepts, the lenient parser agrees with it
+    /// exactly.
+    ///
+    /// This is the property worth having. Being more tolerant than the decoder
+    /// is the whole point; being *different* from it on a message it accepts
+    /// would mean the observer records addresses nobody sent, or drops ones
+    /// somebody did, and no error would be raised either way.
+    #[test]
+    fn test_the_lenient_parser_agrees_with_the_decoder() {
+        use common::bitcoin::consensus::deserialize;
+        for seed in 0..2_000u64 {
+            let mut rng = testsupport::Rng::new(seed);
+            let (payload, entries) = canonical_addrv2(&mut rng);
+
+            // The decoder accepts it, or the comparison is about nothing.
+            let strict: common::p2p::message::AddrV2Payload = deserialize(&payload)
+                .unwrap_or_else(|e| panic!("seed {seed}: canonical bytes refused: {e}"));
+            assert_eq!(strict.0, entries, "seed {seed}");
+
+            let (received, lenient) = parse_addrv2_leniently(&payload);
+            assert_eq!(received, entries.len(), "seed {seed}: declared count");
+            assert_eq!(lenient, entries, "seed {seed}: entries");
+        }
+    }
+
+    /// Corrupted and truncated messages keep the parser's promises.
+    ///
+    /// Whatever arrives, it reports no more entries than it declared, declares
+    /// no more than the payload could hold, returns only entries it actually
+    /// read, and comes back.
+    #[test]
+    fn test_the_lenient_parser_survives_corruption() {
+        let mut kept_something = 0;
+        for seed in 0..20_000u64 {
+            let mut rng = testsupport::Rng::new(seed);
+            let (mut payload, _) = canonical_addrv2(&mut rng);
+
+            match rng.below(4) {
+                // A byte flipped somewhere, which is what a peer sending its
+                // own idea of the format looks like.
+                0 if !payload.is_empty() => {
+                    let at = rng.below(payload.len());
+                    payload[at] ^= 1 << rng.below(8);
+                }
+                // Cut short, which is what a truncated read looks like.
+                1 if !payload.is_empty() => payload.truncate(rng.below(payload.len())),
+                // A count that claims far more than follows.
+                2 if !payload.is_empty() => payload[0] = 0xfc,
+                _ => {
+                    let n = rng.below(32);
+                    payload.extend(rng.bytes(n));
+                }
+            }
+
+            let (received, entries) = parse_addrv2_leniently(&payload);
+            assert!(
+                entries.len() <= received,
+                "seed {seed}: {} entries from a declared {received}",
+                entries.len()
+            );
+            assert!(
+                received <= payload.len() / 9,
+                "seed {seed}: declared {received} from {} bytes, and an entry \
+                 cannot be shorter than nine",
+                payload.len()
+            );
+            if !entries.is_empty() {
+                kept_something += 1;
+            }
+        }
+        // Or the invariants above are all about empty results.
+        assert!(
+            kept_something > 1_000,
+            "only {kept_something} of 20000 corrupted messages kept an entry"
+        );
+    }
+
+    /// Bytes that were never a message at all.
+    #[test]
+    fn test_the_lenient_parser_takes_arbitrary_bytes() {
+        for seed in 0..20_000u64 {
+            let mut rng = testsupport::Rng::new(seed ^ 0xabcd);
+            let len = rng.below(96);
+            let payload = rng.bytes(len);
+            let (received, entries) = parse_addrv2_leniently(&payload);
+            assert!(entries.len() <= received, "seed {seed}");
+            assert!(received <= payload.len() / 9, "seed {seed}");
+        }
+    }
 }

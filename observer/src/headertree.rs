@@ -2378,4 +2378,86 @@ mod tests {
             "the peer re-sent headers we already have"
         );
     }
+
+    /// Any locator at all gets an answer that is a piece of our best chain.
+    ///
+    /// The locator is a peer's to compose: any hashes, in any order, including
+    /// ones from a branch we know but are not on. The walk takes the first
+    /// hash that is on the best chain, starts after it, and copies up to two
+    /// thousand headers -- and the length it reserves for them is a
+    /// subtraction between two heights, which is the shape that underflows if
+    /// the two ever get out of order.
+    ///
+    /// What has to hold: no more than the cap, every header actually ours, and
+    /// each one built on the last -- an answer that is not a run of the chain
+    /// is one the peer cannot use.
+    #[test]
+    fn test_any_locator_is_answered_with_a_run_of_our_chain() {
+        // A chain with side branches, so a locator can hold a hash we know at
+        // a height we are not on -- the case a flat chain cannot produce.
+        let mut tree = regtest_tree();
+        let (genesis, _) = tree.tip();
+        let mut known = vec![genesis];
+        let mut rng = testsupport::Rng::new(7);
+        for i in 0..120u32 {
+            let parent = known[rng.below(known.len())];
+            let header = mine_header(parent, 1_700_000_000 + i, (i % 251) as u8 + 1);
+            tree.insert_batch(&[header]);
+            known.push(header.block_hash());
+        }
+        let (tip, tip_height) = tree.tip();
+        assert!(tip_height > 1, "the shape is not a chain");
+
+        let zero = BlockHash::from_byte_array([0; 32]);
+        for seed in 0..20_000u64 {
+            let mut rng = testsupport::Rng::new(seed);
+            let locator: Vec<BlockHash> = (0..rng.below(8))
+                .map(|_| match rng.below(4) {
+                    // A hash we know, on or off the best chain.
+                    0 | 1 => known[rng.below(known.len())],
+                    2 => tip,
+                    // One we have never seen.
+                    _ => {
+                        let mut bytes = [0u8; 32];
+                        bytes.copy_from_slice(&rng.bytes(32));
+                        BlockHash::from_byte_array(bytes)
+                    }
+                })
+                .collect();
+            let stop = if rng.one_in(4) {
+                known[rng.below(known.len())]
+            } else {
+                zero
+            };
+
+            let answer = tree.get_headers_from_locator(&locator, stop);
+            assert!(
+                answer.len() <= 2000,
+                "seed {seed}: {} headers",
+                answer.len()
+            );
+
+            for pair in answer.windows(2) {
+                assert_eq!(
+                    pair[1].prev_blockhash,
+                    pair[0].block_hash(),
+                    "seed {seed}: the answer is not a run of one chain"
+                );
+            }
+            for header in &answer {
+                let hash = header.block_hash();
+                let height = tree.height_of(&hash).unwrap_or_else(|| {
+                    panic!("seed {seed}: answered with a header we do not hold")
+                });
+                assert_eq!(
+                    tree.best_chain[height as usize], hash,
+                    "seed {seed}: answered with a header off our best chain"
+                );
+            }
+        }
+
+        // And the one case worth naming: a peer already at our tip is told
+        // nothing, which is the answer that costs nothing to give.
+        assert!(tree.get_headers_from_locator(&[tip], zero).is_empty());
+    }
 }
