@@ -28,3 +28,8 @@ testsupport = { path = "../testsupport" }
 bench = []
 
 
+
+[[bench]]
+name = "addressbook"
+harness = false
+required-features = ["bench"]
