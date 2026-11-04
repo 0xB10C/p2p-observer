@@ -304,6 +304,7 @@ mod tests {
     use crate::addresses::{self, Dialer, book::Dial};
     use common::bitcoin::{Network, network::Params};
     use common::tokio;
+    use testsupport::TempDir;
 
     /// The handler is exercised against a real manager task rather than a
     /// stub, so the command channel is part of what is under test.
@@ -322,20 +323,17 @@ mod tests {
     struct TestManager {
         task: tokio::task::JoinHandle<()>,
         _shutdown: tokio::sync::oneshot::Sender<()>,
-        dir: std::path::PathBuf,
+        _dir: TempDir,
     }
 
     impl Drop for TestManager {
         fn drop(&mut self) {
             self.task.abort();
-            std::fs::remove_dir_all(&self.dir).ok();
         }
     }
 
     fn handler_with_manager(tag: &str) -> (Handler, TestManager) {
-        let dir =
-            std::env::temp_dir().join(format!("p2p-observer-rpc-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new(&format!("p2p-observer-rpc-{tag}"));
 
         let (handle, gossip_rx, life_rx, cmd_rx) = addresses::channels();
         let mut manager = addresses::Manager::new(
@@ -345,8 +343,8 @@ mod tests {
                 max_dialing: 0,
                 capacity: 1000,
                 nets: EnabledNets::all(),
-                snapshot_path: dir.join("addresses.bin"),
-                banlist_path: dir.join("banlist.json"),
+                snapshot_path: dir.path().join("addresses.bin"),
+                banlist_path: dir.path().join("banlist.json"),
             },
             NullDialer,
         )
@@ -381,7 +379,7 @@ mod tests {
             TestManager {
                 task,
                 _shutdown: shutdown_tx,
-                dir,
+                _dir: dir,
             },
         )
     }

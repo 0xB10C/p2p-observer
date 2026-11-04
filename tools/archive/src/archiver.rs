@@ -514,6 +514,7 @@ mod tests {
     use super::*;
     use crate::read::ArchiveReader;
     use common::events::{BlockAnnouncement, Handshake, PingRtt};
+    use testsupport::TempDir;
 
     fn args(flags: &[&str]) -> Args {
         let mut argv = vec![
@@ -586,11 +587,12 @@ mod tests {
         }
     }
 
-    fn tmp_dir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("p2p-observer-archive-{tag}-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A directory of its own, removed when the test drops it.
+    ///
+    /// Cleaning up by hand at the end of a test leaks the directory whenever
+    /// the test does not reach the end, and these tests write megabytes.
+    fn tmp_dir(tag: &str) -> TempDir {
+        TempDir::new(&format!("p2p-observer-archive-{tag}"))
     }
 
     #[test]
@@ -662,7 +664,7 @@ mod tests {
             };
             let written = [ping(1), block(), ping(2)];
 
-            let mut file = ArchiveFile::create(&dir, "test", level, &header).unwrap();
+            let mut file = ArchiveFile::create(dir.path(), "test", level, &header).unwrap();
             for event in &written {
                 file.write_record(&event.encode_to_vec()).unwrap();
             }
@@ -697,7 +699,7 @@ mod tests {
             events: Filter::from(&args(&["--address-announcements"])).kinds(),
         };
 
-        let file = ArchiveFile::create(&dir, "empty", 18, &header).unwrap();
+        let file = ArchiveFile::create(dir.path(), "empty", 18, &header).unwrap();
         let path = file.path.clone();
         file.finalize().unwrap();
 
@@ -719,7 +721,7 @@ mod tests {
 
         // Uncompressed: the record bytes are the bytes on disk, so the limit
         // bites as soon as they pass it.
-        let mut file = ArchiveFile::create(&dir, "plain", 0, &header).unwrap();
+        let mut file = ArchiveFile::create(dir.path(), "plain", 0, &header).unwrap();
         assert!(!file.needs_rotation(1024));
         while !file.needs_rotation(1024) {
             file.write_record(&ping(1).encode_to_vec()).unwrap();
@@ -733,7 +735,7 @@ mod tests {
         // Compressed: these events are near-identical, so zstd shrinks them by
         // far more than an order of magnitude. Rotation must follow the
         // compressed size, not the uncompressed one.
-        let mut file = ArchiveFile::create(&dir, "zstd", 18, &header).unwrap();
+        let mut file = ArchiveFile::create(dir.path(), "zstd", 18, &header).unwrap();
         for _ in 0..2000 {
             file.write_record(&ping(1).encode_to_vec()).unwrap();
         }

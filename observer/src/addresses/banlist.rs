@@ -234,6 +234,7 @@ impl Banlist {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use testsupport::TempDir;
 
     fn ban(nets: &[&str]) -> BanEntry {
         BanEntry {
@@ -324,9 +325,8 @@ mod tests {
 
     #[test]
     fn test_save_load_round_trip() {
-        let dir = std::env::temp_dir().join(format!("p2p-observer-ban-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("banlist.json");
+        let dir = TempDir::new("p2p-observer-ban");
+        let path = dir.path().join("banlist.json");
 
         let mut list = Banlist::load(&path).unwrap();
         assert!(list.is_empty(), "a missing file is an empty list");
@@ -343,20 +343,15 @@ mod tests {
         assert_eq!(reloaded.entries()[0].comment.as_deref(), Some("bad ASN"));
         assert!(reloaded.contains(&PeerAddr::parse_ip("10.1.1.1:8333").unwrap()));
         assert!(reloaded.contains(&PeerAddr::TorV3([9u8; 32], 8333)));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Operator intent must not be silently discarded.
     #[test]
     fn test_malformed_file_is_an_error() {
-        let dir = std::env::temp_dir().join(format!("p2p-observer-ban-bad-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("banlist.json");
+        let dir = TempDir::new("p2p-observer-ban-bad");
+        let path = dir.path().join("banlist.json");
         std::fs::write(&path, "{ not a list }").unwrap();
 
         assert!(Banlist::load(&path).is_err());
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

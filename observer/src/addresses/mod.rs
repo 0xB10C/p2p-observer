@@ -489,6 +489,7 @@ mod tests {
     use super::*;
     use book::{Phase, TransportHint};
     use std::sync::{Arc, Mutex};
+    use testsupport::TempDir;
 
     const NOW: u32 = 1_000_000;
 
@@ -507,22 +508,23 @@ mod tests {
         }
     }
 
-    fn tmp_dir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("p2p-observer-mgr-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A directory of its own, removed when the test drops it.
+    ///
+    /// Cleaning up by hand at the end of a test leaks the directory whenever
+    /// the test does not reach the end.
+    fn tmp_dir(tag: &str) -> TempDir {
+        TempDir::new(&format!("p2p-observer-mgr-{tag}"))
     }
 
-    fn manager(tag: &str, dialer: RecordingDialer) -> (Manager<RecordingDialer>, PathBuf) {
+    fn manager(tag: &str, dialer: RecordingDialer) -> (Manager<RecordingDialer>, TempDir) {
         let dir = tmp_dir(tag);
         let cfg = Config {
             dials_per_tick: 10,
             max_dialing: 100,
             capacity: 1000,
             nets: EnabledNets::all(),
-            snapshot_path: dir.join("addresses.bin"),
-            banlist_path: dir.join("banlist.json"),
+            snapshot_path: dir.path().join("addresses.bin"),
+            banlist_path: dir.path().join("banlist.json"),
         };
         (Manager::new(cfg, dialer).unwrap(), dir)
     }
@@ -538,7 +540,7 @@ mod tests {
     #[test]
     fn test_tick_dials_ingested_addresses() {
         let dialer = RecordingDialer::default();
-        let (mut m, dir) = manager("dial", dialer.clone());
+        let (mut m, _dir) = manager("dial", dialer.clone());
 
         let addrs: Vec<Gossiped> = (0..50).map(gossiped).collect();
         assert_eq!(m.ingest(NOW, &addrs), 50);
@@ -546,14 +548,12 @@ mod tests {
         // Only the per-tick budget goes out at once.
         assert_eq!(m.tick(NOW), 10);
         assert_eq!(dialer.taken().len(), 10);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_in_flight_ceiling_is_respected() {
         let dialer = RecordingDialer::default();
-        let (mut m, dir) = manager("ceiling", dialer.clone());
+        let (mut m, _dir) = manager("ceiling", dialer.clone());
         m.cfg.max_dialing = 12;
 
         let addrs: Vec<Gossiped> = (0..100).map(gossiped).collect();
@@ -579,14 +579,12 @@ mod tests {
         }
         assert_eq!(m.book.dialing_count(), 7);
         assert_eq!(m.tick(NOW + 60), 5);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_lifecycle_updates_the_table() {
         let dialer = RecordingDialer::default();
-        let (mut m, dir) = manager("life", dialer.clone());
+        let (mut m, _dir) = manager("life", dialer.clone());
         let addr = gossiped(1).addr;
 
         m.ingest(NOW, &[gossiped(1)]);
@@ -619,8 +617,6 @@ mod tests {
         let s = m.book.stats();
         assert_eq!(s.connected, 0);
         assert_eq!(s.good, 1);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -717,16 +713,14 @@ mod tests {
         );
 
         // And the ban survives a restart.
-        let reloaded = Banlist::load(&dir.join("banlist.json")).unwrap();
+        let reloaded = Banlist::load(&dir.path().join("banlist.json")).unwrap();
         assert_eq!(reloaded.len(), 1);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_stats_and_inspect_commands() {
         let dialer = RecordingDialer::default();
-        let (mut m, dir) = manager("stats", dialer.clone());
+        let (mut m, _dir) = manager("stats", dialer.clone());
         m.ingest(NOW, &[gossiped(1), gossiped(2)]);
 
         let (tx, rx) = oneshot::channel();
@@ -754,14 +748,12 @@ mod tests {
             NOW,
         );
         assert!(rx.blocking_recv().unwrap().is_none());
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_manual_addresses_are_dialled_first() {
         let dialer = RecordingDialer::default();
-        let (mut m, dir) = manager("manual", dialer.clone());
+        let (mut m, _dir) = manager("manual", dialer.clone());
         m.cfg.dials_per_tick = 1;
 
         let addrs: Vec<Gossiped> = (0..50).map(gossiped).collect();
@@ -776,8 +768,6 @@ mod tests {
             dialled.iter().any(|d| d.addr == manual),
             "the operator's address was not dialled first"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -789,8 +779,8 @@ mod tests {
             max_dialing: 100,
             capacity: 1000,
             nets: EnabledNets::all(),
-            snapshot_path: dir.join("addresses.bin"),
-            banlist_path: dir.join("banlist.json"),
+            snapshot_path: dir.path().join("addresses.bin"),
+            banlist_path: dir.path().join("banlist.json"),
         };
 
         let mut m = Manager::new(cfg, dialer.clone()).unwrap();
@@ -811,8 +801,8 @@ mod tests {
             max_dialing: 100,
             capacity: 1000,
             nets: EnabledNets::all(),
-            snapshot_path: dir.join("addresses.bin"),
-            banlist_path: dir.join("banlist.json"),
+            snapshot_path: dir.path().join("addresses.bin"),
+            banlist_path: dir.path().join("banlist.json"),
         };
         let m2 = Manager::new(cfg2, dialer).unwrap();
         assert_eq!(m2.book.len(), 20);
@@ -820,8 +810,6 @@ mod tests {
         assert_eq!(m2.book.stats().connected, 0);
         assert_eq!(m2.book.stats().dialing, 0);
         assert_eq!(m2.book.entry(&gossiped(0).addr).unwrap().services, 9);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Active state is deliberately not persisted: after a restart there are
@@ -855,7 +843,7 @@ mod tests {
     #[test]
     fn test_phase_is_tracked() {
         let dialer = RecordingDialer::default();
-        let (mut m, dir) = manager("phase", dialer.clone());
+        let (mut m, _dir) = manager("phase", dialer.clone());
         let addr = gossiped(1).addr;
         m.ingest(NOW, &[gossiped(1)]);
 
@@ -873,7 +861,5 @@ mod tests {
         assert_eq!(s.dialing, 0);
         assert_eq!(s.connected, 1);
         let _ = Phase::Dialing;
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
