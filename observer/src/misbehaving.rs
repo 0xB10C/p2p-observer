@@ -36,6 +36,7 @@ use common::tokio::{
 
 use crate::addresses::book::{Dial, TransportHint};
 use crate::addresses::peer_addr::PeerAddr;
+use crate::addresses::policy;
 use crate::connection::attempt;
 use crate::headertree::HeaderTree;
 use crate::headertree::testing::{mine_header, regtest_params};
@@ -251,6 +252,32 @@ impl Observed {
             .expect("the session did not end")
             .expect("the session task panicked");
     }
+
+    /// The next `n` address announcements the session published.
+    ///
+    /// What the limiter did is visible nowhere else: an addr message is
+    /// answered with nothing, and what survives the limiter goes to the
+    /// address manager, which these tests do not hold.
+    async fn announcements(&mut self, n: usize) -> Vec<common::events::AddressAnnouncement> {
+        let events = &mut self.events;
+        timeout(WAIT, async move {
+            let mut found = Vec::new();
+            while let Some(event) = events.recv().await {
+                if let Some(peer_event::Event::AddressAnnouncement(a)) = event.event {
+                    found.push(a);
+                    if found.len() == n {
+                        return found;
+                    }
+                }
+            }
+            panic!(
+                "the event channel closed after {} of {n} announcements",
+                found.len()
+            );
+        })
+        .await
+        .unwrap_or_else(|_| panic!("fewer than {n} address announcements arrived"))
+    }
 }
 
 /// Reads the reason off a session report.
@@ -436,5 +463,119 @@ async fn test_a_replayed_version_does_not_change_what_was_published() {
     let end = observed.disconnected().await;
     assert_eq!(reason(&end), DisconnectReason::PeerClosed);
     assert_eq!(end.messages_by_command.get("version"), Some(&1));
+    observed.ended().await;
+}
+
+/// `count` gossiped addresses, all of them parseable and distinct.
+///
+/// 198.18.0.0/15 is the benchmarking range: reserved, so nothing here names a
+/// host anyone runs.
+fn gossip(count: usize) -> Vec<(u32, common::p2p::address::Address)> {
+    use common::p2p::address::Address;
+    (0..count)
+        .map(|i| {
+            let addr = std::net::SocketAddr::from((
+                std::net::Ipv4Addr::new(198, 18 + (i >> 8) as u8, (i & 0xff) as u8, 1),
+                8333,
+            ));
+            (
+                1_700_000_000,
+                Address::new(&addr, common::p2p::ServiceFlags::NETWORK),
+            )
+        })
+        .collect()
+}
+
+/// A peer's ping is answered, with the nonce the peer chose.
+///
+/// The one reply in the protocol that a peer draws its own conclusion from:
+/// Core disconnects a peer that has not ponged within twenty minutes, and a
+/// pong carrying the wrong nonce is not an answer. So an observer that stopped
+/// ponging, or ponged with a nonce of its own, would be dropped by everything
+/// it connects to -- and nothing in the process would say why, because from
+/// here it looks like peers hanging up for their own reasons.
+#[tokio::test]
+async fn test_a_ping_is_answered_with_the_nonce_the_peer_chose() {
+    let (mut peer, observed) = meet(1, |_| {}).await;
+    const NONCE: u64 = 0x0123_4567_89ab_cdef;
+    peer.send(NetworkMessage::Ping(NONCE)).await;
+    let replies = peer.hang_up_and_drain().await;
+    assert!(
+        replies
+            .iter()
+            .any(|m| matches!(m, NetworkMessage::Pong(n) if *n == NONCE)),
+        "no pong carrying our nonce came back: {replies:?}"
+    );
+    observed.ended().await;
+}
+
+/// A peer cannot make us learn addresses faster than the bucket allows.
+///
+/// Nothing caps how many addresses an addr message may carry, so the token
+/// bucket is the whole of what stands between a peer and an address book of
+/// its choosing. Three messages is what it takes to see it work, because the
+/// first one is free on purpose: it is the reply to our own getaddr, and
+/// charging the reply to a question we asked would drain the bucket for the
+/// rest of the session.
+///
+/// Asserted on the published event rather than on the address book, because
+/// the event is where the limiter's account of itself lives -- what it
+/// discarded, and the bucket it discarded it against -- and an archive is the
+/// only place that can be read back later.
+#[tokio::test]
+async fn test_a_peer_cannot_announce_addresses_faster_than_the_bucket() {
+    let (mut peer, mut observed) = meet(1, |_| {}).await;
+    let burst = policy::ADDR_BURST as usize;
+
+    for _ in 0..3 {
+        peer.send(NetworkMessage::Addr(common::p2p::message::AddrPayload(
+            gossip(burst),
+        )))
+        .await;
+    }
+    let announced = observed.announcements(3).await;
+    for (i, a) in announced.iter().enumerate() {
+        assert_eq!(a.addresses.len(), burst, "message {i}");
+        assert_eq!(a.unparsed, 0, "the test's addresses did not parse");
+    }
+
+    // The reply to our getaddr: taken in full and charged nothing.
+    assert!(announced[0].solicited);
+    assert_eq!(announced[0].rate_limited, 0);
+    assert_eq!(announced[0].rate_limit_tokens, policy::ADDR_BURST);
+
+    // The next thousand are unsolicited and fit in the burst. The level is
+    // reported before this message is charged, which is why it still reads
+    // full.
+    assert!(!announced[1].solicited, "only the first reply is solicited");
+    assert_eq!(
+        announced[1].rate_limited, 0,
+        "the burst is meant to be free"
+    );
+    assert_eq!(
+        announced[1].rate_limit_tokens,
+        policy::ADDR_BURST,
+        "the getaddr reply was charged against the bucket"
+    );
+
+    // And the thousand after that meet an empty bucket. The refill is a tenth
+    // of an address a second, so a test that takes a moment has not earned
+    // one.
+    assert!(!announced[2].solicited);
+    assert_eq!(
+        announced[2].rate_limited, burst as u32,
+        "the third thousand was not shed; the bucket held {}",
+        announced[2].rate_limit_tokens
+    );
+    assert!(
+        announced[2].rate_limit_tokens < 1.0,
+        "the bucket refilled during the test: {}",
+        announced[2].rate_limit_tokens
+    );
+    // Still reported in full: what the limiter dropped is said in
+    // `rate_limited`, not by leaving the addresses out of the archive.
+    assert_eq!(announced[2].addresses.len(), burst);
+
+    let _ = peer.hang_up_and_drain().await;
     observed.ended().await;
 }
