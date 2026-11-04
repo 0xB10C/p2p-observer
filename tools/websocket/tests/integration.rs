@@ -5,7 +5,9 @@
 //! shell sets it); without it the test is skipped.
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use common::events::{Handshake, PeerEvent, PingRtt, peer_event};
 use common::futures_util::{SinkExt, StreamExt};
@@ -303,4 +305,81 @@ async fn test_a_client_that_asked_for_nothing_gets_nothing() {
     )
     .await;
     expect_silence(&mut ws).await;
+}
+
+/// A client cannot drive the status poll in a loop.
+///
+/// The on-demand poll is there so a page asking for the status does not wait
+/// out the interval -- which the operator may have set to an hour -- and it
+/// lets an unauthenticated client decide when an observer is asked. Nothing
+/// above it limits how often: the read loop takes subscription messages for as
+/// long as a client sends them, and each one that cannot be answered from the
+/// cache puts an RPC request per network on the wire.
+///
+/// The cache is what normally closes that door, after the first answer. It is
+/// empty exactly when no observer is answering -- which is when a relay asking
+/// faster is the last thing anyone wants. So this test keeps it empty, the way
+/// an observer in trouble would, and counts.
+#[tokio::test]
+async fn test_a_client_cannot_drive_the_status_poll_in_a_loop() {
+    let Some(h) = Harness::start().await else {
+        eprintln!("skipping: NATS_SERVER_BINARY is not set");
+        return;
+    };
+
+    // An observer that answers by refusing. A refusal is not cached, so every
+    // ask reaches here -- and counting is the point.
+    let asked = Arc::new(AtomicUsize::new(0));
+    let mut requests = h
+        .publisher
+        .subscribe("p2p-observer.*.rpc.connections.list")
+        .await
+        .unwrap();
+    let replier = h.publisher.clone();
+    let counted = Arc::clone(&asked);
+    let answering = tokio::spawn(async move {
+        while let Some(msg) = requests.next().await {
+            counted.fetch_add(1, Ordering::Relaxed);
+            if let Some(reply_to) = msg.reply {
+                let _ = replier
+                    .publish(reply_to, br#"{"error":"not today"}"#.to_vec().into())
+                    .await;
+            }
+        }
+    });
+
+    // One event, so the relay knows of a network to ask about at all.
+    h.publish(
+        "signet",
+        "ping_rtt",
+        &event(
+            1,
+            "1.2.3.4:38333",
+            peer_event::Event::PingRtt(PingRtt {
+                rtt_ms: 5,
+                tcp_stats: None,
+            }),
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut ws = h.client(r#"{"connection_status":true}"#).await;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut sent = 0u32;
+    while Instant::now() < deadline {
+        ws.send(WsMessage::text(r#"{"connection_status":true}"#))
+            .await
+            .unwrap();
+        sent += 1;
+    }
+    // Let anything already in flight land before counting.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let asked = asked.load(Ordering::Relaxed);
+    assert!(
+        asked <= 2,
+        "{sent} subscription messages drew {asked} requests out of the relay"
+    );
+    answering.abort();
 }
