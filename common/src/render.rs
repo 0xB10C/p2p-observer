@@ -9,8 +9,35 @@
 //! replaying — so the caller supplies it.
 
 use crate::events::{
-    AddrMessage, AnnouncementType, DisconnectReason, PeerEvent, ProbeStage, TcpStats, peer_event,
+    AddrMessage, AnnouncementType, DisconnectReason, PeerEvent, ProbeStage, TcpStats, Unplaced,
+    peer_event,
 };
+
+/// A counter worth a word only when it is not zero, which for every counter
+/// it is used on is the exception rather than the rule.
+fn counted(name: &str, n: u32) -> String {
+    if n == 0 {
+        String::new()
+    } else {
+        format!(" {name}={n}")
+    }
+}
+
+/// An enum value as a name, or as the number it arrived as when this build
+/// has no name for it.
+///
+/// `Unknown` is a real value of each of these enums -- zero, meaning the
+/// sender did not set one -- so printing it for a number this build simply
+/// does not know would say the wrong thing, and would throw away the only
+/// thing that could identify the value. An archive outlives the binary that
+/// wrote it, so a replayer is the normal place to meet a value from a later
+/// one.
+fn named<T: std::fmt::Debug, E>(raw: i32, parsed: Result<T, E>) -> String {
+    match parsed {
+        Ok(value) => format!("{value:?}"),
+        Err(_) => format!("unknown({raw})"),
+    }
+}
 
 /// Renders the transport version. Absent means the attempt failed while still
 /// detecting, so no version was ever settled on.
@@ -78,7 +105,12 @@ pub fn event_line(event: &PeerEvent) -> String {
                 hs.relay,
                 // The peer's clock against ours, which is what anyone reading
                 // the raw pair would work out first.
-                hs.peer_timestamp - (event.timestamp_ms / 1000) as i64,
+                // Saturating because the peer chose this number and nothing
+                // checks it: a version carrying i64::MIN would otherwise
+                // overflow here, and the archive would keep a line that
+                // panics every reader of it from then on.
+                hs.peer_timestamp
+                    .saturating_sub((event.timestamp_ms / 1000) as i64),
                 hs.sendaddrv2,
                 hs.wtxid_relay,
                 event.timestamp_ms,
@@ -95,8 +127,10 @@ pub fn event_line(event: &PeerEvent) -> String {
             event.timestamp_ms,
         ),
         Some(peer_event::Event::BlockAnnouncement(blk)) => {
-            let atype = AnnouncementType::try_from(blk.announcement_type)
-                .unwrap_or(AnnouncementType::Unknown);
+            let atype = named(
+                blk.announcement_type,
+                AnnouncementType::try_from(blk.announcement_type),
+            );
             // Shown only when it says something: a batch of one is the norm.
             let batch = if blk.batch_size > 1 {
                 format!(" batch={}", blk.batch_size)
@@ -107,6 +141,14 @@ pub fn event_line(event: &PeerEvent) -> String {
                 .height
                 .map(|h| format!(" height={h}"))
                 .unwrap_or_default();
+            // Only on a block with no height: it is there to say why there is
+            // none, and the difference it draws -- a tree that is behind, or a
+            // peer announcing a chain that fails this network's rules -- is
+            // not recoverable from anything else on the line.
+            let unplaced = blk
+                .unplaced
+                .map(|u| format!(" unplaced={}", named(u, Unplaced::try_from(u))))
+                .unwrap_or_default();
             let new = if blk.new_to_us { " new" } else { "" };
             let shape = blk
                 .compact_block
@@ -114,23 +156,21 @@ pub fn event_line(event: &PeerEvent) -> String {
                 .map(|c| format!(" shortids={} prefilled={}", c.short_ids, c.prefilled_txs))
                 .unwrap_or_default();
             format!(
-                "conn={} peer={} block={} type={:?}{height}{new}{batch}{shape}{} ts={}",
+                "conn={} peer={} block={} type={atype}{height}{unplaced}{new}{batch}{shape}{} ts={}",
                 event.connection_id,
                 event.peer_addr,
                 blk.block_hash,
-                atype,
                 tcp(blk.tcp_stats.as_ref()),
                 event.timestamp_ms,
             )
         }
         Some(peer_event::Event::CompactBlockProbe(probe)) => {
-            let stage = ProbeStage::try_from(probe.stage).unwrap_or(ProbeStage::Unknown);
+            let stage = named(probe.stage, ProbeStage::try_from(probe.stage));
             format!(
-                "conn={} peer={} block={} probe={:?}{} ts={}",
+                "conn={} peer={} block={} probe={stage}{} ts={}",
                 event.connection_id,
                 event.peer_addr,
                 probe.block_hash,
-                stage,
                 tcp(probe.tcp_stats.as_ref()),
                 event.timestamp_ms,
             )
@@ -156,9 +196,9 @@ pub fn event_line(event: &PeerEvent) -> String {
             } else {
                 String::new()
             };
-            let message = AddrMessage::try_from(ann.message).unwrap_or(AddrMessage::Unknown);
+            let message = named(ann.message, AddrMessage::try_from(ann.message));
             format!(
-                "conn={} peer={} message={message:?} addresses={} solicited={}{limited}{unparsed} \
+                "conn={} peer={} message={message} addresses={} solicited={}{limited}{unparsed} \
                  tokens={:.1} ts={}",
                 event.connection_id,
                 event.peer_addr,
@@ -176,8 +216,7 @@ pub fn event_line(event: &PeerEvent) -> String {
             // reason hanging off a success.
             let detail = match &res.result {
                 Some(R::Disconnected(d)) => {
-                    let reason =
-                        DisconnectReason::try_from(d.reason).unwrap_or(DisconnectReason::Unknown);
+                    let reason = named(d.reason, DisconnectReason::try_from(d.reason));
                     // Ordered by count so the line opens with what the session
                     // was mostly doing; the full map is in the archive.
                     let mut by_command: Vec<_> = d.messages_by_command.iter().collect();
@@ -187,27 +226,33 @@ pub fn event_line(event: &PeerEvent) -> String {
                         .take(5)
                         .map(|(cmd, n)| format!("{cmd}={n}"))
                         .collect();
-                    let unsolicited = if d.unsolicited_pongs > 0 {
-                        format!(" unsolicited_pongs={}", d.unsolicited_pongs)
-                    } else {
-                        String::new()
-                    };
+                    // The session's own counters, each shown only when it has
+                    // something to say -- which for all four is the exception.
+                    // `undecodable` and `getheaders_ignored` in particular
+                    // exist because nothing else in the stream reports them,
+                    // so leaving them off the line defeated the point of
+                    // recording them.
+                    let counters = [
+                        counted("unsolicited_pongs", d.unsolicited_pongs),
+                        counted("undecodable", d.undecodable),
+                        counted("getheaders_ignored", d.getheaders_ignored),
+                        counted("msgs_other", d.messages_other),
+                    ]
+                    .concat();
                     format!(
-                        "result=disconnected reason={reason:?} setup={}ms uptime={}ms{unsolicited} msgs=[{}]",
+                        "result=disconnected reason={reason} setup={}ms uptime={}ms{counters} msgs=[{}]",
                         d.setup_ms,
                         d.uptime_ms,
                         messages.join(" "),
                     )
                 }
                 Some(R::Failed(f)) => {
-                    let reason =
-                        FailureReason::try_from(f.reason).unwrap_or(FailureReason::Unknown);
-                    format!("result=failed reason={reason:?} setup={}ms", f.setup_ms)
+                    let reason = named(f.reason, FailureReason::try_from(f.reason));
+                    format!("result=failed reason={reason} setup={}ms", f.setup_ms)
                 }
                 Some(R::OurFault(o)) => {
-                    let reason =
-                        OurFaultReason::try_from(o.reason).unwrap_or(OurFaultReason::Unknown);
-                    format!("result=our_fault reason={reason:?} setup={}ms", o.setup_ms)
+                    let reason = named(o.reason, OurFaultReason::try_from(o.reason));
+                    format!("result=our_fault reason={reason} setup={}ms", o.setup_ms)
                 }
                 None => "result=unset".to_owned(),
             };
@@ -257,5 +302,378 @@ pub fn event_line(event: &PeerEvent) -> String {
         format!("{line} dropped={}{by_kind}", event.dropped_events)
     } else {
         line
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::connection_result::{Disconnected, Failed, OurFault, Result as R};
+    use crate::events::{
+        AddressAnnouncement, BlockAnnouncement, CompactBlockProbe, CompactBlockShape,
+        ConnectionResult, DroppedEvents, FailureReason, FeeFilter, GossipedAddress, Handshake,
+        OurFaultReason, PingRtt, SendCmpct,
+    };
+    use std::collections::BTreeMap;
+
+    const NOW_MS: u64 = 1_700_000_000_000;
+
+    /// The envelope every line starts from, so that a test says only what it
+    /// is about.
+    fn event(inner: peer_event::Event) -> PeerEvent {
+        PeerEvent {
+            peer_addr: "1.2.3.4:8333".to_owned(),
+            connection_id: 42,
+            user_agent: "/Satoshi:29.0.0/".to_owned(),
+            transport_version: Some(2),
+            timestamp_ms: NOW_MS,
+            instance_id: 7,
+            event: Some(inner),
+            ..Default::default()
+        }
+    }
+
+    fn tcp_stats() -> TcpStats {
+        TcpStats {
+            srtt_us: 12_000,
+            rttvar_us: 3_000,
+            total_retrans: 2,
+            snd_cwnd: 10,
+            min_rtt_us: Some(11_000),
+            lost: Some(1),
+            reordering: Some(3),
+            delivery_rate: Some(1_250_000),
+            bytes_received: Some(4_096),
+        }
+    }
+
+    fn handshake() -> Handshake {
+        Handshake {
+            protocol_version: 70016,
+            services: 0x409,
+            start_height: 870_000,
+            relay: true,
+            peer_timestamp: 1_700_000_042,
+            addr_recv: "5.6.7.8:1234".to_owned(),
+            sendaddrv2: true,
+            wtxid_relay: true,
+            user_agent: "/Satoshi:29.0.0/".to_owned(),
+            nonce: 99,
+        }
+    }
+
+    fn announcement() -> BlockAnnouncement {
+        BlockAnnouncement {
+            block_hash: "00000000000000000001".to_owned(),
+            announcement_type: AnnouncementType::CompactBlock as i32,
+            tcp_stats: None,
+            batch_size: 3,
+            height: None,
+            new_to_us: true,
+            compact_block: Some(CompactBlockShape {
+                short_ids: 2_500,
+                prefilled_txs: 1,
+            }),
+            unplaced: Some(Unplaced::WeakerChain as i32),
+        }
+    }
+
+    fn disconnected() -> Disconnected {
+        Disconnected {
+            setup_ms: 120,
+            uptime_ms: 60_000,
+            reason: DisconnectReason::PingTimeout as i32,
+            messages_by_command: BTreeMap::from([("inv".to_owned(), 9), ("ping".to_owned(), 2)])
+                .into_iter()
+                .collect(),
+            messages_other: 1,
+            unsolicited_pongs: 3,
+            undecodable: 1,
+            getheaders_ignored: 4,
+        }
+    }
+
+    fn line(inner: peer_event::Event) -> String {
+        event_line(&event(inner))
+    }
+
+    #[test]
+    fn test_a_handshake_line() {
+        assert_eq!(
+            line(peer_event::Event::Handshake(handshake())),
+            "conn=42 peer=1.2.3.4:8333 ua=\"/Satoshi:29.0.0/\" transport=v2 version=70016 \
+             services=0x409 height=870000 relay=true skew=42s addrv2=true wtxidrelay=true \
+             sees_us=5.6.7.8:1234 ts=1700000000000"
+        );
+    }
+
+    /// A peer chooses its own timestamp and nothing checks it, so the skew is
+    /// worked out saturating: before it was, a version carrying `i64::MIN`
+    /// overflowed here, and because the number was archived first, the line
+    /// went on panicking every reader of that archive afterwards.
+    #[test]
+    fn test_a_peer_timestamp_at_the_edge_does_not_overflow() {
+        for extreme in [i64::MIN, i64::MAX] {
+            let hs = Handshake {
+                peer_timestamp: extreme,
+                ..handshake()
+            };
+            let rendered = line(peer_event::Event::Handshake(hs));
+            let expected = extreme.saturating_sub((NOW_MS / 1000) as i64);
+            assert!(
+                rendered.contains(&format!("skew={expected}s")),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_ping_line_carries_the_tcp_samples() {
+        assert_eq!(
+            line(peer_event::Event::PingRtt(PingRtt {
+                rtt_ms: 37,
+                tcp_stats: Some(tcp_stats()),
+            })),
+            "conn=42 peer=1.2.3.4:8333 ua=\"/Satoshi:29.0.0/\" transport=v2 rtt=37ms \
+             srtt=12000µs rttvar=3000µs retrans=2 cwnd=10 minrtt=11000µs lost=1 reorder=3 \
+             rate=1250000B/s rx=4096B ts=1700000000000"
+        );
+    }
+
+    /// Where the platform reports nothing, nothing is claimed: a zero srtt is
+    /// a measurement and an absent one is not, which is why these are options
+    /// and not defaults.
+    #[test]
+    fn test_a_ping_line_without_samples_claims_none() {
+        assert_eq!(
+            line(peer_event::Event::PingRtt(PingRtt {
+                rtt_ms: 37,
+                tcp_stats: None,
+            })),
+            "conn=42 peer=1.2.3.4:8333 ua=\"/Satoshi:29.0.0/\" transport=v2 rtt=37ms \
+             ts=1700000000000"
+        );
+    }
+
+    /// An announced block with no height says why it has none.
+    ///
+    /// Without it a tree that is merely behind and a peer announcing a chain
+    /// that fails this network's rules render identically, which is the one
+    /// distinction the field was added to draw.
+    #[test]
+    fn test_a_block_announcement_says_why_it_has_no_height() {
+        assert_eq!(
+            line(peer_event::Event::BlockAnnouncement(announcement())),
+            "conn=42 peer=1.2.3.4:8333 block=00000000000000000001 type=CompactBlock \
+             unplaced=WeakerChain new batch=3 shortids=2500 prefilled=1 ts=1700000000000"
+        );
+    }
+
+    #[test]
+    fn test_a_placed_block_says_nothing_about_being_unplaced() {
+        let rendered = line(peer_event::Event::BlockAnnouncement(BlockAnnouncement {
+            height: Some(870_001),
+            unplaced: None,
+            batch_size: 1,
+            new_to_us: false,
+            compact_block: None,
+            ..announcement()
+        }));
+        assert_eq!(
+            rendered,
+            "conn=42 peer=1.2.3.4:8333 block=00000000000000000001 type=CompactBlock \
+             height=870001 ts=1700000000000"
+        );
+    }
+
+    #[test]
+    fn test_the_short_lines() {
+        assert_eq!(
+            line(peer_event::Event::CompactBlockProbe(CompactBlockProbe {
+                block_hash: "00000000000000000002".to_owned(),
+                stage: ProbeStage::Answered as i32,
+                tcp_stats: None,
+            })),
+            "conn=42 peer=1.2.3.4:8333 block=00000000000000000002 probe=Answered \
+             ts=1700000000000"
+        );
+        assert_eq!(
+            line(peer_event::Event::FeeFilter(FeeFilter {
+                feerate_sat_per_kvb: 1_000,
+            })),
+            "conn=42 peer=1.2.3.4:8333 feefilter=1000sat/kvB ts=1700000000000"
+        );
+        assert_eq!(
+            line(peer_event::Event::SendCmpct(SendCmpct {
+                high_bandwidth: true,
+                version: 2,
+            })),
+            "conn=42 peer=1.2.3.4:8333 sendcmpct hb=true version=2 ts=1700000000000"
+        );
+    }
+
+    #[test]
+    fn test_an_address_announcement_line() {
+        assert_eq!(
+            line(peer_event::Event::AddressAnnouncement(
+                AddressAnnouncement {
+                    message: AddrMessage::Addrv2 as i32,
+                    unparsed: 2,
+                    addresses: vec![GossipedAddress {
+                        addr: "9.9.9.9:8333".to_owned(),
+                        services: 1,
+                        ntime: 1_700_000_000,
+                    }],
+                    solicited: true,
+                    rate_limited: 5,
+                    rate_limit_tokens: 0.25,
+                }
+            )),
+            "conn=42 peer=1.2.3.4:8333 message=Addrv2 addresses=1 solicited=true \
+             rate_limited=5 unparsed=2 tokens=0.2 ts=1700000000000"
+        );
+    }
+
+    /// Every counter the session kept reaches the line.
+    ///
+    /// `undecodable` and `getheaders_ignored` especially: both exist because
+    /// nothing else in the stream reports them -- a skipped frame and a reply
+    /// that never went out leave no other trace -- and neither was printed.
+    #[test]
+    fn test_a_disconnected_line_carries_every_counter() {
+        assert_eq!(
+            line(peer_event::Event::ConnectionResult(ConnectionResult {
+                result: Some(R::Disconnected(disconnected())),
+            })),
+            "conn=42 peer=1.2.3.4:8333 ua=\"/Satoshi:29.0.0/\" result=disconnected \
+             reason=PingTimeout setup=120ms uptime=60000ms unsolicited_pongs=3 undecodable=1 \
+             getheaders_ignored=4 msgs_other=1 msgs=[inv=9 ping=2] transport=v2 \
+             ts=1700000000000"
+        );
+    }
+
+    /// A session where none of that happened says none of it, which is the
+    /// usual line.
+    #[test]
+    fn test_a_quiet_session_mentions_no_counters() {
+        assert_eq!(
+            line(peer_event::Event::ConnectionResult(ConnectionResult {
+                result: Some(R::Disconnected(Disconnected {
+                    messages_other: 0,
+                    unsolicited_pongs: 0,
+                    undecodable: 0,
+                    getheaders_ignored: 0,
+                    ..disconnected()
+                })),
+            })),
+            "conn=42 peer=1.2.3.4:8333 ua=\"/Satoshi:29.0.0/\" result=disconnected \
+             reason=PingTimeout setup=120ms uptime=60000ms msgs=[inv=9 ping=2] transport=v2 \
+             ts=1700000000000"
+        );
+    }
+
+    #[test]
+    fn test_the_other_two_results() {
+        assert_eq!(
+            line(peer_event::Event::ConnectionResult(ConnectionResult {
+                result: Some(R::Failed(Failed {
+                    reason: FailureReason::ConnectionRefused as i32,
+                    setup_ms: 10,
+                })),
+            })),
+            "conn=42 peer=1.2.3.4:8333 ua=\"/Satoshi:29.0.0/\" result=failed \
+             reason=ConnectionRefused setup=10ms transport=v2 ts=1700000000000"
+        );
+        assert_eq!(
+            line(peer_event::Event::ConnectionResult(ConnectionResult {
+                result: Some(R::OurFault(OurFault {
+                    reason: OurFaultReason::NetworkUnreachable as i32,
+                    setup_ms: 0,
+                })),
+            })),
+            "conn=42 peer=1.2.3.4:8333 ua=\"/Satoshi:29.0.0/\" result=our_fault \
+             reason=NetworkUnreachable setup=0ms transport=v2 ts=1700000000000"
+        );
+    }
+
+    /// A value this build has no name for keeps its number.
+    ///
+    /// `Unknown` is a real value of each of these enums -- zero, the sender
+    /// did not set one -- so printing it for a number from a later build said
+    /// something false and threw away the only identifying thing about it. An
+    /// archive outlives the binary that wrote it, which makes a replayer the
+    /// ordinary place to meet one.
+    #[test]
+    fn test_an_enum_value_this_build_does_not_know_keeps_its_number() {
+        let rendered = line(peer_event::Event::ConnectionResult(ConnectionResult {
+            result: Some(R::Disconnected(Disconnected {
+                reason: 999,
+                ..disconnected()
+            })),
+        }));
+        assert!(rendered.contains("reason=unknown(999)"), "{rendered}");
+
+        let rendered = line(peer_event::Event::BlockAnnouncement(BlockAnnouncement {
+            announcement_type: 998,
+            unplaced: Some(997),
+            ..announcement()
+        }));
+        assert!(rendered.contains("type=unknown(998)"), "{rendered}");
+        assert!(rendered.contains("unplaced=unknown(997)"), "{rendered}");
+
+        // And zero still reads as what it means.
+        let rendered = line(peer_event::Event::ConnectionResult(ConnectionResult {
+            result: Some(R::Disconnected(Disconnected {
+                reason: 0,
+                ..disconnected()
+            })),
+        }));
+        assert!(rendered.contains("reason=Unknown"), "{rendered}");
+    }
+
+    /// The loss is reported on whatever event happens to be carrying the
+    /// count, so it has to show on every kind of line.
+    #[test]
+    fn test_dropped_events_are_named_by_kind() {
+        let mut dropped = event(peer_event::Event::FeeFilter(FeeFilter {
+            feerate_sat_per_kvb: 1,
+        }));
+        dropped.dropped_events = 12;
+        dropped.dropped_by_kind = Some(DroppedEvents {
+            ping_rtt: 10,
+            address_announcement: 2,
+            ..Default::default()
+        });
+        assert_eq!(
+            event_line(&dropped),
+            "conn=42 peer=1.2.3.4:8333 feefilter=1sat/kvB ts=1700000000000 dropped=12 \
+             [ping_rtt=10 address_announcement=2]"
+        );
+    }
+
+    /// An event whose oneof is unset, or one carrying a variant this build
+    /// does not know: there is nothing to render but the envelope, and
+    /// saying so is better than an empty line.
+    #[test]
+    fn test_an_unset_event_renders_the_envelope() {
+        let mut unset = event(peer_event::Event::FeeFilter(FeeFilter {
+            feerate_sat_per_kvb: 1,
+        }));
+        unset.event = None;
+        assert_eq!(event_line(&unset), "unknown event from 1.2.3.4:8333");
+    }
+
+    /// A transport that was never settled on, because the attempt failed
+    /// while still detecting.
+    #[test]
+    fn test_an_undetected_transport() {
+        let mut event = event(peer_event::Event::ConnectionResult(ConnectionResult {
+            result: Some(R::Failed(Failed {
+                reason: FailureReason::ConnectionRefused as i32,
+                setup_ms: 10,
+            })),
+        }));
+        event.transport_version = None;
+        assert!(event_line(&event).contains("transport=detecting"));
     }
 }
