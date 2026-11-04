@@ -1092,4 +1092,45 @@ mod tests {
             .expect_err("a corrupted frame was read as a message");
         assert_eq!(fault_of(&err), Some(Fault::V2Decrypt), "{err:#}");
     }
+
+    /// The v2 fallback takes arbitrary packet contents.
+    ///
+    /// A BIP324 packet that decrypts is ours by definition -- the peer could
+    /// not have produced it otherwise -- so the bytes here are not a stranger's
+    /// in the way a v1 frame's are. But what is inside one is still whatever
+    /// the peer put there, and this reads a command out of it by hand: a short
+    /// id looked up in a table, or a twelve-byte name spelled out. Two indexes
+    /// and a slice, over a length the peer chose.
+    #[tokio::test]
+    async fn test_v2_contents_of_any_shape_are_read_or_refused() {
+        let mut named = 0;
+        for seed in 0..20_000u64 {
+            let mut rng = testsupport::Rng::new(seed);
+            // Mostly short, because the interesting lengths are the ones around
+            // the one-byte id and the twelve-byte name.
+            let len = if rng.one_in(4) {
+                rng.below(80)
+            } else {
+                rng.below(16)
+            };
+            let contents = rng.bytes(len);
+
+            match v2_undecodable(&contents) {
+                Some(NetworkMessage::Unknown { command, payload }) => {
+                    named += 1;
+                    // Whatever was read as a name has to be a name, and the
+                    // payload has to be bytes that were actually there.
+                    assert!(command.as_ref().len() <= 12, "seed {seed}");
+                    assert!(payload.len() <= contents.len(), "seed {seed}");
+                }
+                Some(other) => panic!("seed {seed}: expected Unknown, got {other:?}"),
+                None => {}
+            }
+        }
+        // Or the assertions above never ran.
+        assert!(
+            named > 1_000,
+            "only {named} of 20000 inputs produced a command name"
+        );
+    }
 }
