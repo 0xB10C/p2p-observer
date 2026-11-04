@@ -127,7 +127,7 @@ pub async fn run(cfg: Config, shutdown: impl Future<Output = ()>) {
     let bootstrap: Vec<PeerAddr> = cfg
         .bootstrap_addrs
         .iter()
-        .filter_map(|s| match PeerAddr::parse_ip(s) {
+        .filter_map(|s| match PeerAddr::parse(s) {
             Some(addr) => Some(addr),
             None => {
                 tracing::warn!(target: TARGET_MAIN, addr = %s, "ignoring unparseable bootstrap address");

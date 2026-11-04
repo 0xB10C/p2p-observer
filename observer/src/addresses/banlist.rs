@@ -286,9 +286,9 @@ mod tests {
     #[test]
     fn test_contains_address() {
         let list = Banlist::from_entries(vec![ban(&["10.0.0.0/8", "2001:db8::/32"])]);
-        assert!(list.contains(&PeerAddr::parse_ip("10.1.1.1:8333").unwrap()));
-        assert!(list.contains(&PeerAddr::parse_ip("[2001:db8::5]:8333").unwrap()));
-        assert!(!list.contains(&PeerAddr::parse_ip("1.2.3.4:8333").unwrap()));
+        assert!(list.contains(&PeerAddr::parse("10.1.1.1:8333").unwrap()));
+        assert!(list.contains(&PeerAddr::parse("[2001:db8::5]:8333").unwrap()));
+        assert!(!list.contains(&PeerAddr::parse("1.2.3.4:8333").unwrap()));
     }
 
     #[test]
@@ -341,7 +341,7 @@ mod tests {
         let reloaded = Banlist::load(&path).unwrap();
         assert_eq!(reloaded.len(), 2);
         assert_eq!(reloaded.entries()[0].comment.as_deref(), Some("bad ASN"));
-        assert!(reloaded.contains(&PeerAddr::parse_ip("10.1.1.1:8333").unwrap()));
+        assert!(reloaded.contains(&PeerAddr::parse("10.1.1.1:8333").unwrap()));
         assert!(reloaded.contains(&PeerAddr::TorV3([9u8; 32], 8333)));
 
         std::fs::remove_dir_all(&dir).ok();
