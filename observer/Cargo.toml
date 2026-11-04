@@ -2,6 +2,10 @@
 name = "observer"
 version = "0.1.0"
 edition = "2024"
+# Only the benchmarks named below are targets. Without this the shared
+# harness in benches/ is discovered as a benchmark of its own, and its
+# helpers then read as dead code.
+autobenches = false
 
 [dependencies]
 common = { path = "../common" }
@@ -17,3 +21,10 @@ libc = "0.2"
 bitcoind = { package = "corepc-node", git = "https://github.com/rust-bitcoin/corepc", rev = "0b8bea91181c5ab5b6c3f81fea66a51eff15b92b", features = ["30_2", "download"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }
 testsupport = { path = "../testsupport" }
+
+[features]
+# Exposes the internals the benchmarks measure. Off in an ordinary build, so
+# nothing is public that does not need to be.
+bench = []
+
+

@@ -138,7 +138,7 @@ struct HeaderEntry {
     chain_work: Work,
 }
 
-pub(crate) struct HeaderTree {
+pub struct HeaderTree {
     headers: HashMap<BlockHash, HeaderEntry>,
     /// best_chain[height] = block hash on the current best chain.
     best_chain: Vec<BlockHash>,
@@ -167,7 +167,7 @@ pub(crate) struct HeaderTree {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HeaderError {
+pub enum HeaderError {
     OrphanHeader,
     /// The parent is unknown and the header's own target is far easier than
     /// our chain's, so whatever chain it belongs to is weaker than ours.
@@ -236,7 +236,7 @@ impl std::fmt::Display for HeaderError {
 }
 
 impl HeaderTree {
-    pub(crate) fn new(params: common::bitcoin::network::Params) -> Self {
+    pub fn new(params: common::bitcoin::network::Params) -> Self {
         let genesis = *genesis_block(&params).header();
         let hash = genesis.block_hash();
         let work = genesis.work();
@@ -441,7 +441,7 @@ impl HeaderTree {
     }
 
     /// Insert a batch of headers. Returns count of accepted headers and first error if any.
-    pub(crate) fn insert_batch(&mut self, headers: &[Header]) -> (usize, Option<HeaderError>) {
+    pub fn insert_batch(&mut self, headers: &[Header]) -> (usize, Option<HeaderError>) {
         let old_tip = self.tip;
         let mut accepted = 0;
         let mut err = None;
@@ -543,7 +543,7 @@ impl HeaderTree {
         self.best_chain = chain;
     }
 
-    pub(crate) fn tip(&self) -> (BlockHash, u32) {
+    pub fn tip(&self) -> (BlockHash, u32) {
         (self.tip, self.tip_height)
     }
 
@@ -637,7 +637,7 @@ impl HeaderTree {
     }
 
     /// Build a block locator: exponential backoff from tip.
-    pub(crate) fn build_locator(&self) -> Vec<BlockHash> {
+    pub fn build_locator(&self) -> Vec<BlockHash> {
         let mut locator = Vec::new();
         let mut height = self.tip_height as i64;
         let mut step: i64 = 1;
@@ -670,7 +670,7 @@ impl HeaderTree {
 
     /// Respond to a getheaders request: find first locator on best chain,
     /// return up to 2000 headers from the next block.
-    pub(crate) fn get_headers_from_locator(
+    pub fn get_headers_from_locator(
         &self,
         locator: &[BlockHash],
         stop_hash: BlockHash,
@@ -868,19 +868,19 @@ pub(crate) async fn persist_task(
     }
 }
 
-#[cfg(test)]
-pub(crate) mod testing {
+#[cfg(any(test, feature = "bench"))]
+pub mod testing {
     use super::*;
     use common::bitcoin::{Network, network::Params};
 
-    pub(crate) fn regtest_params() -> Params {
+    pub fn regtest_params() -> Params {
         Params::new(Network::Regtest)
     }
 
     /// Mine a valid regtest header. Regtest uses bits=0x207fffff which gives a
     /// target so easy that nonce=0 always satisfies PoW. A unique `seed` byte in
     /// the merkle root lets callers produce different blocks at the same height.
-    pub(crate) fn mine_header(prev_hash: BlockHash, time: u32, seed: u8) -> Header {
+    pub fn mine_header(prev_hash: BlockHash, time: u32, seed: u8) -> Header {
         use common::bitcoin::{
             CompactTarget, TxMerkleNode, blockdata::block::Version, time::BlockTime,
         };
