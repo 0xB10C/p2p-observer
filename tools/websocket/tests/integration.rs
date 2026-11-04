@@ -5,17 +5,17 @@
 //! shell sets it); without it the test is skipped.
 
 use std::net::SocketAddr;
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use common::events::{Handshake, PeerEvent, PingRtt, peer_event};
 use common::futures_util::{SinkExt, StreamExt};
 use common::prost::Message;
 use common::serde_json::{self, Value};
-use common::tokio::net::{TcpListener, TcpStream};
+use common::tokio::net::TcpStream;
 use common::tokio::sync::{oneshot, watch};
 use common::tokio::time::timeout;
 use common::{async_nats, tokio};
+use testsupport::NatsServer;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use websocket::{Args, run};
@@ -23,51 +23,6 @@ use websocket::{Args, run};
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const WAIT: Duration = Duration::from_secs(5);
-
-struct NatsServer {
-    child: Child,
-    url: String,
-}
-
-impl NatsServer {
-    async fn start() -> Option<Self> {
-        let binary = std::env::var("NATS_SERVER_BINARY").ok()?;
-        // Take a free port; the small window until nats-server binds it is
-        // fine for a test.
-        let port = TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let child = Command::new(binary)
-            .args(["-a", "127.0.0.1", "-p", &port.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawning nats-server");
-        // Wrapped first so the process is killed on every path, including
-        // the panic below.
-        let server = NatsServer {
-            child,
-            url: format!("nats://127.0.0.1:{port}"),
-        };
-        for _ in 0..50 {
-            if async_nats::connect(&server.url).await.is_ok() {
-                return Some(server);
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        panic!("nats-server did not come up on {}", server.url);
-    }
-}
-
-impl Drop for NatsServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 struct Harness {
     _nats: NatsServer,
@@ -83,9 +38,9 @@ impl Harness {
             .with_test_writer()
             .try_init();
         let nats = NatsServer::start().await?;
-        let publisher = async_nats::connect(&nats.url).await.unwrap();
+        let publisher = nats.client().await;
         let args = Args {
-            nats_url: nats.url.clone(),
+            nats_url: nats.url().to_owned(),
             network: None,
             listen: "127.0.0.1:0".to_owned(),
             asmap: Some(format!("{}/tests/fixtures/asmap.raw", env!("CARGO_MANIFEST_DIR")).into()),

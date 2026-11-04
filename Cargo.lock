@@ -1474,6 +1474,7 @@ dependencies = [
  "clap",
  "common",
  "prometheus",
+ "testsupport",
  "tokio",
 ]
 
@@ -1553,6 +1554,7 @@ dependencies = [
  "libc",
  "rand 0.10.3",
  "sha3",
+ "testsupport",
  "tokio",
  "tokio-socks",
 ]
@@ -2500,6 +2502,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "testsupport"
+version = "0.1.0"
+dependencies = [
+ "common",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2972,6 +2981,7 @@ dependencies = [
  "asmap",
  "clap",
  "common",
+ "testsupport",
  "tokio",
  "tokio-tungstenite",
 ]
