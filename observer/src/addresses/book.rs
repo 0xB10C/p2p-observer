@@ -1529,6 +1529,230 @@ mod tests {
         assert_eq!(rng.below(0), 0, "below(0) must not divide by zero");
     }
 
+    /// Gossip that does not advertise v2 leaves a v1-only verdict where it
+    /// is, even when it changes the services.
+    ///
+    /// Only the positive case was tested. Loosening the condition to an `or`
+    /// -- which no test noticed -- makes any re-announcement of a v1-only
+    /// peer clear the verdict, so every address gossip refreshes goes back to
+    /// being tried over BIP324 first: a handshake that is known to fail,
+    /// followed by the v1 retry, on every peer we have already learned this
+    /// about.
+    #[test]
+    fn test_gossip_without_v2_leaves_a_v1only_verdict_alone() {
+        let mut t = Book::new(100, 1);
+        let bl = empty_banlist();
+        let addr = ip(1, 2, 3, 4);
+
+        t.ingest(
+            NOW,
+            &[Gossiped {
+                addr,
+                services: 0,
+                ntime: NOW,
+            }],
+            &bl,
+        );
+        t.record_v1_only(addr);
+        assert_eq!(t.entry(&addr).unwrap().transport, TransportHint::V1Only);
+
+        // Services changed, so the branch is entered, but none of the new ones
+        // is the v2 bit: NODE_NETWORK and NODE_WITNESS.
+        t.ingest(
+            NOW,
+            &[Gossiped {
+                addr,
+                services: 0b1001,
+                ntime: NOW,
+            }],
+            &bl,
+        );
+        assert_eq!(
+            t.entry(&addr).unwrap().transport,
+            TransportHint::V1Only,
+            "a refresh that says nothing about v2 undid what we had learned"
+        );
+        assert_eq!(
+            t.entry(&addr).unwrap().services,
+            0b1001,
+            "services still update"
+        );
+    }
+
+    /// An address that has connected before is retried on the schedule for
+    /// one that has, which is sixty times sooner than the one for an address
+    /// that never answered.
+    ///
+    /// The policy knows the difference and is tested on both sides of it. What
+    /// was not tested is that the book tells it the truth: `connected_before`
+    /// could be pinned to either answer with nothing failing, and a false one
+    /// would put every peer that had ever worked onto the hour-and-doubling
+    /// schedule meant for addresses that have never answered at all.
+    #[test]
+    fn test_a_peer_that_connected_before_is_retried_sooner() {
+        let mut t = Book::new(100, 1);
+
+        let worked = ip(1, 2, 3, 4);
+        insert(&mut t, worked, Class::Unknown);
+        t.record_connected(worked, NOW, 0, 1);
+        t.record_ended(worked, NOW, Outcome::Failed(Reason::ConnectionRefused));
+        let due = t.entry(&worked).unwrap().next_attempt - NOW;
+        assert!(
+            (54..=66).contains(&due),
+            "a peer that had connected waits {due}s, not about a minute"
+        );
+
+        let never = ip(1, 2, 3, 5);
+        insert(&mut t, never, Class::Unknown);
+        t.record_ended(never, NOW, Outcome::Failed(Reason::ConnectionRefused));
+        let due = t.entry(&never).unwrap().next_attempt - NOW;
+        assert!(
+            (3_240..=3_960).contains(&due),
+            "an address that never answered waits {due}s, not about an hour"
+        );
+    }
+
+    /// An address the book already holds, handed to us by an operator, is
+    /// promoted and counted as added.
+    ///
+    /// The count is what the RPC reports back, and the promotion is what
+    /// makes the address exempt from forgetting and first in line to be
+    /// dialled, so an operator adding one the crawl had already found gets a
+    /// different address afterwards. Neither was tested: every test added
+    /// addresses the book had never seen. Mutation testing found it -- the
+    /// counter on that branch could be decremented instead of incremented
+    /// without any test running the line.
+    #[test]
+    fn test_adding_an_address_the_book_already_has_promotes_it() {
+        let mut t = Book::new(100, 1);
+        let bl = empty_banlist();
+        let addr = ip(100, 1, 0, 1);
+        t.ingest(
+            NOW,
+            &[Gossiped {
+                addr,
+                services: 0,
+                ntime: NOW,
+            }],
+            &bl,
+        );
+        assert_eq!(t.entries[&addr].origin, Origin::Gossip);
+
+        assert_eq!(
+            t.insert_manual(NOW, &[addr]),
+            1,
+            "a promotion is an addition"
+        );
+        assert_eq!(t.entries[&addr].origin, Origin::Manual);
+        assert_eq!(t.len(), 1, "promoting must not add a second entry");
+
+        // And again is no longer a change.
+        assert_eq!(t.insert_manual(NOW, &[addr]), 0);
+    }
+
+    /// Eviction drops what the forget rule has given up on before it touches
+    /// anything else.
+    ///
+    /// That is the whole point of the order -- a table full of entries worth
+    /// keeping should lose as little as possible -- and the forget pass inside
+    /// eviction had never run in a test: every eviction test filled the table
+    /// with fresh unknowns, which nothing has given up on, so the trim always
+    /// came from the reservoir instead. Mutation testing found it the same
+    /// way, by a counter in that loop nothing ever reached.
+    #[test]
+    fn test_eviction_drops_what_the_forget_rule_gave_up_on_first() {
+        let cap = 100;
+        let mut t = Book::new(cap, 1);
+        let bl = empty_banlist();
+
+        // Never connected, failed five times: given up on however recently
+        // somebody announced them.
+        let given_up: Vec<PeerAddr> = (0..5).map(|i| ip(100, 1, 0, i)).collect();
+        for addr in &given_up {
+            let mut e = Entry::new(NOW, 0, Origin::Gossip);
+            e.last_attempt = NOW;
+            e.last_attempt_failed = true;
+            e.failures = 5;
+            t.entries.insert(*addr, e);
+        }
+        // Push past capacity, which is what runs the eviction.
+        let flood: Vec<Gossiped> = (0..200u32)
+            .map(|i| Gossiped {
+                addr: PeerAddr::Ipv4([100, 0, (i / 256) as u8, (i % 256) as u8], 8333),
+                services: 0,
+                ntime: NOW,
+            })
+            .collect();
+        t.ingest(NOW, &flood, &bl);
+
+        assert!(t.len() <= cap);
+        for addr in &given_up {
+            assert!(
+                !t.entries.contains_key(addr),
+                "{addr} was given up on and survived the eviction"
+            );
+        }
+    }
+
+    /// The draws have to spread, not merely land in range.
+    ///
+    /// Everything about which addresses get dialled rests on this. The
+    /// reservoir keeps a uniform sample only if the draws are uniform, and
+    /// the class credit is then spent on whatever the reservoir kept. A
+    /// generator that has collapsed fails nothing loudly: it dials the same
+    /// addresses forever, and the crawl quietly stops being a sample of the
+    /// network at all.
+    ///
+    /// Mutation testing asked for this one. xorshift with `^=` turned into
+    /// `|=` saturates the state to all ones and returns the same number for
+    /// ever after, and the test above was happy -- one number, in range,
+    /// ten thousand times.
+    #[test]
+    fn test_the_draws_spread_and_not_merely_land_in_range() {
+        const N: usize = 10_000;
+        let mut rng = Rng::new(0x1234_5678);
+        let mut eighths = [0usize; 8];
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..N {
+            let f = rng.next_f32();
+            assert!((0.0..1.0).contains(&f), "{f} is not in [0, 1)");
+            eighths[(f * 8.0) as usize] += 1;
+            distinct.insert(f.to_bits());
+        }
+        assert!(
+            distinct.len() > N / 2,
+            "only {} distinct draws in {N}",
+            distinct.len()
+        );
+        // Generous bounds: this is a test of spread, not of the generator's
+        // pedigree. An eighth that takes less than a sixteenth or more than a
+        // quarter is not spreading.
+        for (i, n) in eighths.iter().enumerate() {
+            assert!((N / 16..N / 4).contains(n), "eighth {i} took {n} of {N}");
+        }
+
+        // And the integer draw covers its range rather than favouring an end.
+        let mut hits = [0usize; 10];
+        for _ in 0..N {
+            hits[rng.below(10)] += 1;
+        }
+        for (i, n) in hits.iter().enumerate() {
+            assert!(*n > N / 20, "below(10) returned {i} only {n} times");
+        }
+    }
+
+    /// Zero is a fixed point for xorshift, so the seed is forced odd. A
+    /// generator seeded from a zeroed field would otherwise return zero for
+    /// ever, which is in range and not random.
+    #[test]
+    fn test_a_zero_seed_still_moves() {
+        let mut rng = Rng::new(0);
+        let first = rng.next_u64();
+        let second = rng.next_u64();
+        assert_ne!(first, 0);
+        assert_ne!(first, second);
+    }
+
     #[test]
     fn test_reservoir_keeps_k_items() {
         let mut rng = Rng::new(9);
