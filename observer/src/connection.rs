@@ -97,26 +97,10 @@ pub(crate) async fn attempt(dial: Dial, cfg: Config, addrman: Handle) {
                     // hidden inside one "duration".
                     let setup = started.elapsed().saturating_sub(uptime);
                     let result = disconnected_result(setup, uptime, reason, &end);
-                    // The handshake completed, so this is known -- and the
-                    // result event is the only event a session that sent
-                    // nothing else produces.
-                    let silent = end.silent();
-                    // We hung up on a peer following another chain. Not a
-                    // disconnect to judge by its length: the length is ours.
-                    let other_chain = end
-                        .error
-                        .as_ref()
-                        .is_some_and(|e| crate::protocol::other_chain_of(e).is_some());
+                    let outcome = session_outcome(&end, uptime.as_secs() as u32);
                     user_agent = end.user_agent;
                     (
-                        if other_chain {
-                            Outcome::OtherChain
-                        } else {
-                            Outcome::Disconnected {
-                                uptime_secs: uptime.as_secs() as u32,
-                                silent,
-                            }
-                        },
+                        outcome,
                         // The session ran, so the transport is settled whatever
                         // the hint said going in.
                         Some(u32::from(version)),
@@ -170,6 +154,43 @@ fn disconnected_result(
             getheaders_ignored: end.getheaders_ignored,
         },
     )
+}
+
+/// How the address book should judge a session that ran to its end.
+///
+/// Two of the three are verdicts on the peer rather than on the address, and
+/// neither is a disconnect to judge by its length: a peer on another chain was
+/// hung up on by us, and one that broke the protocol has earned a wait that
+/// has nothing to do with how long it managed to stay up.
+fn session_outcome(end: &crate::protocol::SessionEnd, uptime_secs: u32) -> Outcome {
+    let err = end.error.as_ref();
+    if err.is_some_and(|e| crate::protocol::other_chain_of(e).is_some()) {
+        return Outcome::OtherChain;
+    }
+    if err.is_some_and(is_violation) {
+        return Outcome::Violated;
+    }
+    Outcome::Disconnected {
+        uptime_secs,
+        // The handshake completed, so this is known -- and the result event is
+        // the only event a session that sent nothing else produces.
+        silent: end.silent(),
+    }
+}
+
+/// Whether the error that ended a session was the peer breaking the protocol.
+///
+/// Strictly what the protocol forbids: a header declaring a payload above the
+/// message limit, and an INV above the item limit. Deliberately not a decode
+/// failure, which is as likely to be a message we have not learned to read as
+/// one the peer invented -- the observer counts those and reads on, which is
+/// the whole stance of the tool -- and not a ping timeout either, which is a
+/// peer gone quiet rather than a peer in the wrong.
+fn is_violation(err: &anyhow::Error) -> bool {
+    matches!(crate::transport::fault_of(err), Some(Fault::Oversized))
+        || err
+            .downcast_ref::<crate::protocol::ProtocolViolation>()
+            .is_some()
 }
 
 /// How a session that had started ended.
@@ -266,7 +287,7 @@ fn failed_result(outcome: Outcome, elapsed: Duration) -> common::events::connect
         }),
         // Unreachable: both of these are sessions that ran, and a session has
         // its own constructor above.
-        Outcome::OtherChain | Outcome::Disconnected { .. } => {
+        Outcome::OtherChain | Outcome::Violated | Outcome::Disconnected { .. } => {
             connection_result::Result::Failed(connection_result::Failed {
                 reason: FailureReason::Unknown.into(),
                 setup_ms,
@@ -337,20 +358,11 @@ pub(crate) async fn bootstrap_attempt(
         let guard = addrman.end_guard(addr);
         match connect_and_run(id, &dial, cfg, addrman).await {
             Ok((_, end)) => {
-                // A bootstrap peer on another chain is no more use for the
-                // sync than for anything else, and gets the same day off.
-                let other_chain = end
-                    .error
-                    .as_ref()
-                    .is_some_and(|e| crate::protocol::other_chain_of(e).is_some());
-                guard.finish(if other_chain {
-                    Outcome::OtherChain
-                } else {
-                    Outcome::Disconnected {
-                        uptime_secs: end.connected_at.elapsed().as_secs() as u32,
-                        silent: end.silent(),
-                    }
-                });
+                // A bootstrap peer on another chain, or one that breaks the
+                // protocol, is no more use for the sync than for anything
+                // else, and is judged the same way.
+                let uptime_secs = end.connected_at.elapsed().as_secs() as u32;
+                guard.finish(session_outcome(&end, uptime_secs));
                 Ok(end.connected_at)
             }
             Err(e) => {
@@ -1090,6 +1102,39 @@ mod tests {
         let closed = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
             .context(Fault::PeerClosed);
         assert_eq!(classify_session_end(Some(&closed)), R::PeerClosed);
+    }
+
+    /// The address book backs a peer off for breaking the protocol, so what
+    /// counts as breaking it has to be exactly the two limits and not every
+    /// unhappy ending.
+    #[test]
+    fn test_only_a_broken_limit_is_a_violation() {
+        let oversized = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::InvalidData))
+            .context(Fault::Oversized)
+            .context("v1 header read");
+        assert!(is_violation(&oversized));
+
+        let inv = anyhow::Error::new(crate::protocol::ProtocolViolation(
+            "inv of 50001 items".to_owned(),
+        ))
+        .context("handling inv");
+        assert!(is_violation(&inv));
+
+        // A message we could not read may be one we never learned to read, so
+        // it is counted and read past rather than held against the peer.
+        let undecodable = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::InvalidData))
+            .context(Fault::Decode);
+        assert!(!is_violation(&undecodable));
+
+        // Gone quiet is not the same as in the wrong.
+        let quiet = anyhow::Error::new(crate::protocol::PingTimeout {
+            waited: std::time::Duration::from_secs(20 * 60),
+        });
+        assert!(!is_violation(&quiet));
+
+        let closed = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+            .context(Fault::PeerClosed);
+        assert!(!is_violation(&closed));
     }
 
     #[test]
