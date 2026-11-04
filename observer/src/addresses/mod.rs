@@ -261,7 +261,17 @@ pub struct Config {
     pub dials_per_tick: usize,
     /// Maximum attempts in flight at once.
     pub max_dialing: usize,
-    /// Hard ceiling on stored entries.
+    /// Ceiling on the entries learned from peers.
+    ///
+    /// Enforced where gossip is taken in: a full book evicts a batch to make
+    /// room, and drops the new address when nothing is evictable. Deliberately
+    /// not enforced on the two paths that do not come from peers. Operator and
+    /// bootstrap addresses go in however many there are, because they are
+    /// never evicted by design and their number is the operator's own doing;
+    /// and a snapshot is restored whole, so lowering this does not shrink a
+    /// book that is already larger than it. Gossip arriving afterwards brings
+    /// such a book back down: each address that wants in evicts a batch -- a
+    /// sixteenth of the ceiling -- before it is added.
     pub capacity: usize,
     pub nets: EnabledNets,
     pub snapshot_path: PathBuf,
