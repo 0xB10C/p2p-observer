@@ -53,6 +53,18 @@ const CLIENT_QUEUE: usize = 16_384;
 /// also talking to thousands of peers.
 const STATUS_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The shortest gap between two status polls a client asked for.
+///
+/// The on-demand path is there so that a page wanting the status does not wait
+/// out the interval, which an operator may have set to an hour. It lets a
+/// client decide when an observer is asked, and nothing above here limits how
+/// often a client may ask: the loop reads subscription messages for as long as
+/// one keeps sending them, and each puts one RPC request per network on the
+/// wire. The cache normally closes that door after the first answer -- but it
+/// is empty exactly when no observer is answering, which is when the last
+/// thing anyone wants is a relay asking faster.
+const STATUS_ON_DEMAND_GAP: Duration = Duration::from_secs(2);
+
 /// Forward p2p-observer events to browsers over a websocket
 #[derive(Parser, Debug, Clone)]
 #[command(version, about)]
@@ -319,6 +331,7 @@ pub async fn run(
         let period = Duration::from_secs(args.status_interval_secs);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(period);
+            let mut asked_at: Option<tokio::time::Instant> = None;
             loop {
                 // Either the interval came round, or a client just asked for
                 // a status it cannot be given from the cache.
@@ -326,8 +339,15 @@ pub async fn run(
                     _ = ticker.tick() => false,
                     _ = shared.poll_now.notified() => true,
                 };
-                // An observer is not polled to fill a cache nobody reads.
-                if !on_demand && !wants_status(&shared.clients).await {
+                if on_demand {
+                    // Collapse a burst, and a client sending in a loop, into
+                    // one round. See [`STATUS_ON_DEMAND_GAP`].
+                    if asked_at.is_some_and(|at| at.elapsed() < STATUS_ON_DEMAND_GAP) {
+                        continue;
+                    }
+                    asked_at = Some(tokio::time::Instant::now());
+                } else if !wants_status(&shared.clients).await {
+                    // An observer is not polled to fill a cache nobody reads.
                     continue;
                 }
                 let networks: Vec<String> = shared
