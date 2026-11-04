@@ -198,6 +198,7 @@ fn classify_session_end(err: Option<&anyhow::Error>) -> common::events::Disconne
             Fault::Truncated => R::Truncated,
             Fault::Decode => R::DecodeError,
             Fault::Oversized => R::OversizedMessage,
+            Fault::WrongMagic => R::WrongMagic,
             Fault::V2Decrypt => R::V2DecryptError,
             Fault::Write => R::WriteError,
         };
@@ -537,7 +538,7 @@ async fn connect_v1(id: u64, dial: &Dial, cfg: &Config, addrman: &Handle) -> Res
     let (reader, writer) = stream.into_split();
 
     run_session(
-        TransportV1Reader::new(BufReader::new(reader)),
+        TransportV1Reader::new(BufReader::new(reader), cfg.magic),
         TransportV1Writer {
             magic: cfg.magic,
             writer,
@@ -769,7 +770,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader, writer) = stream.into_split();
-            let mut r = TransportV1Reader::new(BufReader::new(reader));
+            let mut r = TransportV1Reader::new(BufReader::new(reader), Magic::REGTEST);
             let mut w = TransportV1Writer {
                 magic: MAGIC,
                 writer,
@@ -834,7 +835,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader, writer) = stream.into_split();
-            let mut r = TransportV1Reader::new(BufReader::new(reader));
+            let mut r = TransportV1Reader::new(BufReader::new(reader), Magic::REGTEST);
             let mut w = TransportV1Writer {
                 magic: MAGIC,
                 writer,
@@ -915,7 +916,7 @@ mod tests {
                         return;
                     }
                     let reader = std::io::Cursor::new(magic.to_vec()).chain(reader);
-                    let mut r = TransportV1Reader::new(BufReader::new(reader));
+                    let mut r = TransportV1Reader::new(BufReader::new(reader), Magic::REGTEST);
                     let mut w = TransportV1Writer {
                         magic: MAGIC,
                         writer,
