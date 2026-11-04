@@ -23,6 +23,37 @@ fn counted(name: &str, n: u32) -> String {
     }
 }
 
+/// A field as one line.
+///
+/// Several of the strings below are printed as they came rather than through
+/// `Debug`, because `peer=1.2.3.4:8333` reads better than its quoted form.
+/// One of them is a peer's to choose: a v1 command string is twelve bytes of
+/// whatever arrived, and nothing between the wire and here rejects a newline
+/// in it -- rust-bitcoin's `CommandString` checks the length and nothing
+/// else. A frame with an unknown command and a correct checksum is counted
+/// under that name, and the name reaches this line.
+///
+/// A line that is secretly two is a forged record: whatever reads the log
+/// splits on newlines, and the half after the break can be made to look like
+/// a complete entry from somewhere else. So control characters are escaped
+/// and everything else is left exactly as it arrived.
+fn one_line(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(
+        s.chars()
+            .flat_map(|c| {
+                if c.is_control() {
+                    c.escape_debug().collect::<Vec<char>>()
+                } else {
+                    vec![c]
+                }
+            })
+            .collect(),
+    )
+}
+
 /// An enum value as a name, or as the number it arrived as when this build
 /// has no name for it.
 ///
@@ -90,13 +121,13 @@ pub fn event_line(event: &PeerEvent) -> String {
             let addr_recv = if hs.addr_recv.is_empty() {
                 String::new()
             } else {
-                format!(" sees_us={}", hs.addr_recv)
+                format!(" sees_us={}", one_line(&hs.addr_recv))
             };
             format!(
                 "conn={} peer={} ua={:?} transport={} version={} services={:#x} height={} \
                  relay={} skew={}s addrv2={} wtxidrelay={}{addr_recv} ts={}",
                 event.connection_id,
-                event.peer_addr,
+                one_line(&event.peer_addr),
                 hs.user_agent,
                 transport(event.transport_version),
                 hs.protocol_version,
@@ -119,7 +150,7 @@ pub fn event_line(event: &PeerEvent) -> String {
         Some(peer_event::Event::PingRtt(ping)) => format!(
             "conn={} peer={} ua={:?} transport={} rtt={}ms{} ts={}",
             event.connection_id,
-            event.peer_addr,
+            one_line(&event.peer_addr),
             event.user_agent,
             transport(event.transport_version),
             ping.rtt_ms,
@@ -158,8 +189,8 @@ pub fn event_line(event: &PeerEvent) -> String {
             format!(
                 "conn={} peer={} block={} type={atype}{height}{unplaced}{new}{batch}{shape}{} ts={}",
                 event.connection_id,
-                event.peer_addr,
-                blk.block_hash,
+                one_line(&event.peer_addr),
+                one_line(&blk.block_hash),
                 tcp(blk.tcp_stats.as_ref()),
                 event.timestamp_ms,
             )
@@ -169,19 +200,26 @@ pub fn event_line(event: &PeerEvent) -> String {
             format!(
                 "conn={} peer={} block={} probe={stage}{} ts={}",
                 event.connection_id,
-                event.peer_addr,
-                probe.block_hash,
+                one_line(&event.peer_addr),
+                one_line(&probe.block_hash),
                 tcp(probe.tcp_stats.as_ref()),
                 event.timestamp_ms,
             )
         }
         Some(peer_event::Event::FeeFilter(f)) => format!(
             "conn={} peer={} feefilter={}sat/kvB ts={}",
-            event.connection_id, event.peer_addr, f.feerate_sat_per_kvb, event.timestamp_ms,
+            event.connection_id,
+            one_line(&event.peer_addr),
+            f.feerate_sat_per_kvb,
+            event.timestamp_ms,
         ),
         Some(peer_event::Event::SendCmpct(s)) => format!(
             "conn={} peer={} sendcmpct hb={} version={} ts={}",
-            event.connection_id, event.peer_addr, s.high_bandwidth, s.version, event.timestamp_ms,
+            event.connection_id,
+            one_line(&event.peer_addr),
+            s.high_bandwidth,
+            s.version,
+            event.timestamp_ms,
         ),
         Some(peer_event::Event::AddressAnnouncement(ann)) => {
             // Shown only when non-zero, which is almost never.
@@ -201,7 +239,7 @@ pub fn event_line(event: &PeerEvent) -> String {
                 "conn={} peer={} message={message} addresses={} solicited={}{limited}{unparsed} \
                  tokens={:.1} ts={}",
                 event.connection_id,
-                event.peer_addr,
+                one_line(&event.peer_addr),
                 ann.addresses.len(),
                 ann.solicited,
                 ann.rate_limit_tokens,
@@ -224,7 +262,7 @@ pub fn event_line(event: &PeerEvent) -> String {
                     let messages: Vec<String> = by_command
                         .iter()
                         .take(5)
-                        .map(|(cmd, n)| format!("{cmd}={n}"))
+                        .map(|(cmd, n)| format!("{}={n}", one_line(cmd)))
                         .collect();
                     // The session's own counters, each shown only when it has
                     // something to say -- which for all four is the exception.
@@ -259,7 +297,7 @@ pub fn event_line(event: &PeerEvent) -> String {
             format!(
                 "conn={} peer={} ua={:?} {detail} transport={} ts={}",
                 event.connection_id,
-                event.peer_addr,
+                one_line(&event.peer_addr),
                 event.user_agent,
                 transport(event.transport_version),
                 event.timestamp_ms,
@@ -268,7 +306,7 @@ pub fn event_line(event: &PeerEvent) -> String {
         // An event whose oneof is unset, or one carrying a variant this build
         // does not know about. Either way there is nothing to render but the
         // envelope.
-        None => format!("unknown event from {}", event.peer_addr),
+        None => format!("unknown event from {}", one_line(&event.peer_addr)),
     };
 
     // Shown only when something has been lost, so the usual line is unchanged
@@ -314,7 +352,9 @@ mod tests {
         ConnectionResult, DroppedEvents, FailureReason, FeeFilter, GossipedAddress, Handshake,
         OurFaultReason, PingRtt, SendCmpct,
     };
+    use crate::prost::Message;
     use std::collections::BTreeMap;
+    use testsupport::Rng;
 
     const NOW_MS: u64 = 1_700_000_000_000;
 
@@ -675,5 +715,278 @@ mod tests {
         }));
         event.transport_version = None;
         assert!(event_line(&event).contains("transport=detecting"));
+    }
+
+    // ── Arbitrary input ─────────────────────────────────────────────────────
+    //
+    // An event reaches this code off a NATS subject or out of an archive, and
+    // in both cases it is bytes somebody else wrote. The cases above each fix
+    // one shape; these say what has to hold for whatever arrives.
+
+    fn edge_u64(rng: &mut Rng) -> u64 {
+        *rng.pick(&[0, 1, 37, u64::MAX, u64::MAX / 2, 1_700_000_000_000])
+    }
+
+    fn edge_i64(rng: &mut Rng) -> i64 {
+        *rng.pick(&[0, 1, -1, i64::MIN, i64::MAX, 1_700_000_000])
+    }
+
+    fn edge_u32(rng: &mut Rng) -> u32 {
+        *rng.pick(&[0, 1, u32::MAX, u32::MAX / 2])
+    }
+
+    fn edge_i32(rng: &mut Rng) -> i32 {
+        *rng.pick(&[0, 1, -1, i32::MIN, i32::MAX])
+    }
+
+    /// Strings of the kind that break whatever reads the line afterwards.
+    fn edge_string(rng: &mut Rng) -> String {
+        let choice: &&str = rng.pick(&[
+            "",
+            "/Satoshi:29.0.0/",
+            "\"",
+            "\\",
+            "\r\n",
+            "\n",
+            "\0",
+            "a,b",
+            "👍",
+        ]);
+        if rng.one_in(8) {
+            choice.repeat(40)
+        } else {
+            (*choice).to_owned()
+        }
+    }
+
+    fn edge_tcp(rng: &mut Rng) -> Option<TcpStats> {
+        if rng.one_in(3) {
+            return None;
+        }
+        let maybe = |rng: &mut Rng| {
+            if rng.one_in(2) {
+                None
+            } else {
+                Some(edge_u32(rng))
+            }
+        };
+        Some(TcpStats {
+            srtt_us: edge_u32(rng),
+            rttvar_us: edge_u32(rng),
+            total_retrans: edge_u32(rng),
+            snd_cwnd: edge_u32(rng),
+            min_rtt_us: maybe(rng),
+            lost: maybe(rng),
+            reordering: maybe(rng),
+            delivery_rate: if rng.one_in(2) {
+                None
+            } else {
+                Some(edge_u64(rng))
+            },
+            bytes_received: if rng.one_in(2) {
+                None
+            } else {
+                Some(edge_u64(rng))
+            },
+        })
+    }
+
+    /// An event of a random kind with every field at an edge.
+    fn edge_event(rng: &mut Rng) -> PeerEvent {
+        use crate::events::connection_result::{Disconnected, Failed, OurFault, Result as R};
+        use crate::events::{
+            AddressAnnouncement, BlockAnnouncement, CompactBlockProbe, CompactBlockShape,
+            ConnectionResult, DroppedEvents, FeeFilter, GossipedAddress, Handshake, PingRtt,
+            SendCmpct,
+        };
+
+        let inner = match rng.below(9) {
+            0 => Some(peer_event::Event::Handshake(Handshake {
+                protocol_version: edge_u32(rng),
+                services: edge_u64(rng),
+                start_height: edge_i32(rng),
+                relay: rng.one_in(2),
+                peer_timestamp: edge_i64(rng),
+                addr_recv: edge_string(rng),
+                sendaddrv2: rng.one_in(2),
+                wtxid_relay: rng.one_in(2),
+                user_agent: edge_string(rng),
+                nonce: edge_u64(rng),
+            })),
+            1 => Some(peer_event::Event::PingRtt(PingRtt {
+                rtt_ms: edge_u64(rng),
+                tcp_stats: edge_tcp(rng),
+            })),
+            2 => Some(peer_event::Event::BlockAnnouncement(BlockAnnouncement {
+                block_hash: edge_string(rng),
+                announcement_type: edge_i32(rng),
+                tcp_stats: edge_tcp(rng),
+                batch_size: edge_u32(rng),
+                height: if rng.one_in(2) {
+                    None
+                } else {
+                    Some(edge_u32(rng))
+                },
+                new_to_us: rng.one_in(2),
+                compact_block: if rng.one_in(2) {
+                    None
+                } else {
+                    Some(CompactBlockShape {
+                        short_ids: edge_u32(rng),
+                        prefilled_txs: edge_u32(rng),
+                    })
+                },
+                unplaced: if rng.one_in(2) {
+                    None
+                } else {
+                    Some(edge_i32(rng))
+                },
+            })),
+            3 => Some(peer_event::Event::CompactBlockProbe(CompactBlockProbe {
+                block_hash: edge_string(rng),
+                stage: edge_i32(rng),
+                tcp_stats: edge_tcp(rng),
+            })),
+            4 => Some(peer_event::Event::FeeFilter(FeeFilter {
+                feerate_sat_per_kvb: edge_u64(rng),
+            })),
+            5 => Some(peer_event::Event::SendCmpct(SendCmpct {
+                high_bandwidth: rng.one_in(2),
+                version: edge_u64(rng),
+            })),
+            6 => Some(peer_event::Event::AddressAnnouncement(
+                AddressAnnouncement {
+                    message: edge_i32(rng),
+                    unparsed: edge_u32(rng),
+                    addresses: (0..rng.below(4))
+                        .map(|_| GossipedAddress {
+                            addr: edge_string(rng),
+                            services: edge_u64(rng),
+                            ntime: edge_u32(rng),
+                        })
+                        .collect(),
+                    solicited: rng.one_in(2),
+                    rate_limited: edge_u32(rng),
+                    rate_limit_tokens: *rng.pick(&[0.0, -1.0, f64::MAX, f64::NAN, 0.25]),
+                },
+            )),
+            7 => Some(peer_event::Event::ConnectionResult(ConnectionResult {
+                result: match rng.below(4) {
+                    0 => Some(R::Disconnected(Disconnected {
+                        setup_ms: edge_u64(rng),
+                        uptime_ms: edge_u64(rng),
+                        reason: edge_i32(rng),
+                        messages_by_command: (0..rng.below(3))
+                            .map(|_| (edge_string(rng), edge_u32(rng)))
+                            .collect(),
+                        messages_other: edge_u32(rng),
+                        unsolicited_pongs: edge_u32(rng),
+                        undecodable: edge_u32(rng),
+                        getheaders_ignored: edge_u32(rng),
+                    })),
+                    1 => Some(R::Failed(Failed {
+                        reason: edge_i32(rng),
+                        setup_ms: edge_u64(rng),
+                    })),
+                    2 => Some(R::OurFault(OurFault {
+                        reason: edge_i32(rng),
+                        setup_ms: edge_u64(rng),
+                    })),
+                    _ => None,
+                },
+            })),
+            _ => None,
+        };
+
+        PeerEvent {
+            peer_addr: edge_string(rng),
+            connection_id: edge_u64(rng),
+            user_agent: edge_string(rng),
+            transport_version: if rng.one_in(3) {
+                None
+            } else {
+                Some(edge_u32(rng))
+            },
+            timestamp_ms: edge_u64(rng),
+            instance_id: edge_u64(rng),
+            dropped_events: edge_u64(rng),
+            dropped_by_kind: if rng.one_in(2) {
+                None
+            } else {
+                Some(DroppedEvents {
+                    ping_rtt: edge_u64(rng),
+                    block_announcement: edge_u64(rng),
+                    address_announcement: edge_u64(rng),
+                    connection_result: edge_u64(rng),
+                    handshake: edge_u64(rng),
+                    compact_block_probe: edge_u64(rng),
+                    fee_filter: edge_u64(rng),
+                    send_cmpct: edge_u64(rng),
+                })
+            },
+            event: inner,
+        }
+    }
+
+    /// Every field at an edge, in every kind of event, rendered.
+    ///
+    /// These numbers are a peer's to choose and the line does arithmetic on
+    /// them -- which is how the handshake line came to overflow a subtraction
+    /// on a version message carrying `i64::MIN`. One case of that was found by
+    /// reading; this is the shape of test that finds the next one.
+    #[test]
+    fn test_every_field_at_an_edge_still_renders() {
+        for seed in 0..20_000u64 {
+            let mut rng = Rng::new(seed);
+            let event = edge_event(&mut rng);
+            let line = event_line(&event);
+            assert!(!line.is_empty(), "seed {seed} rendered nothing");
+        }
+    }
+
+    /// A rendered line is one line.
+    ///
+    /// The caller prefixes it and writes it out, and whatever reads the log
+    /// afterwards splits on newlines: a line that is secretly two is a forged
+    /// record. Several fields are printed raw rather than through `Debug`,
+    /// and while the observer is the one that formats them today, an archive
+    /// or a NATS subject is not something this code gets to vouch for.
+    #[test]
+    fn test_a_rendered_line_is_one_line() {
+        for seed in 0..20_000u64 {
+            let mut rng = Rng::new(seed);
+            let event = edge_event(&mut rng);
+            let line = event_line(&event);
+            assert!(
+                !line.contains('\n') && !line.contains('\r'),
+                "seed {seed} rendered {} lines: {line:?}",
+                line.split(['\n', '\r']).count()
+            );
+        }
+    }
+
+    /// Bytes nobody wrote on purpose, decoded as an event and rendered.
+    ///
+    /// Most are refused by the decoder; protobuf is permissive enough that
+    /// plenty are not, and those carry whatever the encoding allowed.
+    #[test]
+    fn test_arbitrary_bytes_that_decode_as_an_event_render() {
+        let mut rng = Rng::new(99);
+        let mut decoded = 0;
+        for _ in 0..20_000 {
+            let len = rng.below(64);
+            let bytes = rng.bytes(len);
+            if let Ok(event) = PeerEvent::decode(&bytes[..]) {
+                decoded += 1;
+                assert!(!event_line(&event).is_empty());
+            }
+        }
+        // Or the assertion above is about nothing. Most random bytes are not a
+        // protobuf message; a couple of hundred that are is plenty to be
+        // rendering something.
+        assert!(
+            decoded > 200,
+            "only {decoded} of 20000 inputs decoded as an event"
+        );
     }
 }
