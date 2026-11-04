@@ -314,7 +314,7 @@ impl Config {
     }
 
     /// The configured checkpoints, parsed.
-    pub fn checkpoints(&self) -> Result<Vec<crate::headertree::Checkpoint>> {
+    pub(crate) fn checkpoints(&self) -> Result<Vec<crate::headertree::Checkpoint>> {
         self.checkpoints
             .iter()
             .map(|c| {

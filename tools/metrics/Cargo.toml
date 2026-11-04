@@ -11,3 +11,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # Without the default protobuf feature: the text exposition format is all
 # Prometheus needs, and the protobuf one pulls in a second protobuf crate.
 prometheus = { version = "0.14", default-features = false }
+
+[dev-dependencies]
+testsupport = { path = "../../testsupport" }
