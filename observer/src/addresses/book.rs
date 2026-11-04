@@ -968,6 +968,61 @@ mod tests {
         assert!(t.len() <= cap);
     }
 
+    /// What the capacity does not bound, which is what its comment now says.
+    ///
+    /// `test_flood_cannot_grow_the_table_past_capacity` above covers the half
+    /// a peer controls. These are the two paths that bypass it, and both
+    /// bypasses are deliberate: a manual address is the operator's own doing
+    /// and is never evicted, and a snapshot has to come back whole or a
+    /// restart would quietly discard what the last run learned. The test is
+    /// here to keep the comment honest rather than to argue with the code.
+    #[test]
+    fn test_capacity_bounds_gossip_and_not_the_operator() {
+        fn v4(prefix: u8, n: u32) -> PeerAddr {
+            PeerAddr::Ipv4([prefix, (n >> 16) as u8, (n >> 8) as u8, n as u8], 8333)
+        }
+
+        let cap = 1_024;
+        let mut t = Book::new(cap, 1);
+        let bl = empty_banlist();
+
+        // More addresses than the whole table is allowed to hold, every one of
+        // them asked for by name.
+        let manual: Vec<PeerAddr> = (0..cap as u32 + 64).map(|i| v4(198, i)).collect();
+        assert_eq!(t.insert_manual(NOW, &manual), manual.len());
+        assert!(
+            t.len() > cap,
+            "the operator's own addresses were capped: {}",
+            t.len()
+        );
+
+        // And a snapshot comes back whole, however much of it there is.
+        let snapshot: HashMap<PeerAddr, Entry> = (0..cap as u32 * 3)
+            .map(|i| (v4(203, i), Entry::new(NOW, 0, Origin::Gossip)))
+            .collect();
+        let restored = snapshot.len();
+        t.restore(snapshot);
+        assert_eq!(t.len(), restored, "a snapshot was trimmed on the way in");
+        assert!(t.len() > cap);
+
+        // Gossip is the half that is bounded, and it brings an over-full table
+        // down rather than adding to it: each address that wants in evicts a
+        // batch first, and a batch is a sixteenth of the ceiling.
+        let flood: Vec<Gossiped> = (0..256u32)
+            .map(|i| Gossiped {
+                addr: v4(100, i),
+                services: 0,
+                ntime: NOW,
+            })
+            .collect();
+        t.ingest(NOW, &flood, &bl);
+        assert!(
+            t.len() < restored,
+            "gossip did not bring an over-full table down: {} of {restored}",
+            t.len()
+        );
+    }
+
     #[test]
     fn test_flood_does_not_evict_addresses_we_have_reached() {
         let cap = 100;

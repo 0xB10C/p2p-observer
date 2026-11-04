@@ -25,8 +25,15 @@ probe_compact_blocks: false
 
 # Bounds on the address manager.
 addrman:
-  # Hard ceiling on stored addresses. Inventing addresses costs a peer
-  # almost nothing, so this bound cannot depend on peers behaving.
+  # Ceiling on the addresses learned from peers. Inventing addresses costs a
+  # peer almost nothing, so this bound cannot depend on peers behaving.
+  #
+  # It bounds gossip, which is the part peers control. Addresses you supply
+  # yourself -- bootstrap_addrs, or addresses.add over the RPC -- are kept
+  # regardless and are never evicted, and an existing addresses.bin is loaded
+  # whole: lowering this does not shrink a book that is already bigger, though
+  # gossip arriving afterwards brings it back down, since every address that
+  # wants in evicts a batch first.
   capacity: 2000000
   # Maximum connection attempts in flight at once. Each one costs a socket
   # and a task, so this is the real limit on how hard we crawl --
