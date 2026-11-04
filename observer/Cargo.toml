@@ -33,3 +33,8 @@ bench = []
 name = "addressbook"
 harness = false
 required-features = ["bench"]
+
+[[bench]]
+name = "headertree"
+harness = false
+required-features = ["bench"]
