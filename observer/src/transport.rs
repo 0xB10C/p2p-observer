@@ -3,6 +3,7 @@ use bip324::io::Payload;
 use common::anyhow::{Context, Result};
 use common::{
     bitcoin::consensus::{deserialize, serialize},
+    bitcoin::hashes::sha256d,
     p2p::{
         Magic,
         message::{CommandString, NetworkMessage, RawNetworkMessage, V2NetworkMessage},
@@ -394,6 +395,34 @@ where
                 *pos += n;
             }
 
+            // Both ways a frame can fail to decode are decidable here, and
+            // they are not worth the same. A payload that does not match the
+            // checksum in its header says the bytes are corrupt -- which makes
+            // the command naming them, and the length that found where this
+            // frame ends, untrustworthy as well: there is no message to skip
+            // and no boundary to skip it to. A payload that does match and
+            // still will not parse is the other case entirely, and the only
+            // one [`undecodable`] is for. Letting the decoder fail on both
+            // counted a corrupt frame under whatever command it claimed, so a
+            // peer could inflate any command's count with garbage.
+            let computed = sha256d::Hash::hash(&buf[24..]).to_byte_array();
+            if computed[..4] != header[20..24] {
+                let cmd = String::from_utf8_lossy(&header[4..16]);
+                tracing::warn!(target: TARGET,
+                    cmd = %cmd.trim_end_matches('\0'),
+                    payload_len = buf.len() - 24,
+                    "v1 payload does not match its checksum"
+                );
+                // State left as it is, like the oversized case above: the
+                // stream cannot be trusted to go on, and another call failing
+                // the same way is the honest answer.
+                return Err(common::anyhow::Error::new(Error::new(
+                    ErrorKind::InvalidData,
+                    "v1 payload does not match the checksum in its header",
+                ))
+                .context(Fault::Decode));
+            }
+
             let raw: RawNetworkMessage = match deserialize(buf) {
                 Ok(m) => m,
                 Err(e) => {
@@ -498,6 +527,34 @@ mod tests {
             NetworkMessage::Ping(7)
         ));
         assert_eq!(reader.undecodable(), 1);
+    }
+
+    /// A payload that does not match the checksum in its header is a
+    /// different thing from one that will not parse, and is not treated as
+    /// one: the bytes are corrupt, so the command naming them and the length
+    /// that found where the frame ends are not to be trusted either.
+    ///
+    /// The frame below is a valid ping in every respect but its checksum, so
+    /// nothing downstream could tell it from a real one -- and before this it
+    /// came up as an unparseable `ping` and was counted as one.
+    #[tokio::test]
+    async fn test_v1_a_payload_that_fails_its_checksum_is_a_decode_fault() {
+        let mut stream = frame(b"ping\0\0\0\0\0\0\0\0", &7u64.to_le_bytes());
+        stream[20] ^= 0xff;
+        stream.extend(serialize(&RawNetworkMessage::new(
+            Magic::REGTEST,
+            NetworkMessage::Ping(7),
+        )));
+        let mut reader = TransportV1Reader::new(&stream[..]);
+
+        let err = reader.recv().await.unwrap_err();
+        assert_eq!(fault_of(&err), Some(Fault::Decode));
+        assert_eq!(reader.undecodable(), 0, "corrupt is not unread");
+
+        // And it stays failed: there is no boundary to resynchronise to, so
+        // the frame that followed is not read either.
+        let err = reader.recv().await.unwrap_err();
+        assert_eq!(fault_of(&err), Some(Fault::Decode));
     }
 
     /// A frame whose command is not a command string still ends the session

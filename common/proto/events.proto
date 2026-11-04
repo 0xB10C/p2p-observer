@@ -227,13 +227,14 @@ message ConnectionResult {
     // number -- but a peer answering pings it was not sent is behaviour worth
     // counting.
     uint32 unsolicited_pongs = 6;
-    // Messages that arrived under a command we could read with a payload we
-    // could not deserialize. Each is also counted under its command in
-    // messages_by_command, and the session went on without it: the frame
-    // boundary was known, so one unreadable message is not a stream that
-    // cannot be followed. Before this field existed such a message ended the
-    // session with DISCONNECT_REASON_DECODE_ERROR, which is how every session
-    // with a btcd peer ended -- on its addrv2 reply to our getaddr.
+    // Messages that arrived under a command we could read, with a payload
+    // that matched its checksum and still would not deserialize. Each is also
+    // counted under its command in messages_by_command, and the session went
+    // on without it: the frame boundary was known, so one unreadable message
+    // is not a stream that cannot be followed. Before this field existed such
+    // a message ended the session with DISCONNECT_REASON_DECODE_ERROR, which
+    // is how every session with a btcd peer ended -- on its addrv2 reply to
+    // our getaddr.
     uint32 undecodable = 7;
     // GETHEADERS from this peer that went unanswered because it asked faster
     // than the observer is willing to reply. Our own limit rather than
@@ -282,9 +283,10 @@ enum DisconnectReason {
   // The connection was reset or the pipe broke under us.
   DISCONNECT_REASON_CONNECTION_RESET = 3;
   // A frame arrived that could not be read at all: a v1 command that is not
-  // a command string, or a v2 short id outside the table. A readable command
-  // with a payload that would not deserialize is not this -- that message is
-  // skipped and counted in Disconnected.undecodable.
+  // a command string, a v1 payload that does not match the checksum in its
+  // header, or a v2 short id outside the table. A readable command with a
+  // payload that matches its checksum and still would not deserialize is not
+  // this -- that message is skipped and counted in Disconnected.undecodable.
   DISCONNECT_REASON_DECODE_ERROR = 4;
   // A v2 packet failed to decrypt, which means the stream is out of sync and
   // nothing further on it can be trusted.

@@ -16,6 +16,8 @@ mod emit;
 mod fdlimit;
 mod headertree;
 mod logging;
+#[cfg(test)]
+mod misbehaving;
 mod protocol;
 mod publisher;
 mod rpc;
