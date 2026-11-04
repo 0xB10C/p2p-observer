@@ -320,6 +320,15 @@ Recorded deliberately rather than discovered later.
   state, not in any single tick.
 - **Numbers are starting points.** Capacity, `max_dialing`, dials per tick, the
   weights and every delay need tuning against real load.
+- **Established connections are not capped.** `max_dialing` bounds the dials in
+  flight, and an address leaves that count once its handshake completes, so
+  sessions accumulate while peers stay up. Deliberate: a ceiling is a decision
+  to stop watching part of the network. The consequence is that the open file
+  limit is the real ceiling, so the observer raises it as far as the OS allows
+  at startup and refuses to run when it cannot cover the dials in flight. It
+  also means every per-peer limit -- the address and GETHEADERS buckets --
+  bounds the total only as far as the connection count is bounded, which is to
+  say by the host.
 - **I2P addresses are stored but not dialled.** `PeerAddr` and the pick handle
   them; there is no transport.
 - **A node reachable over several networks occupies several entries** and may
