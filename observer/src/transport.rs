@@ -736,4 +736,171 @@ mod tests {
         let msg = reader.recv().await.expect("a verack");
         assert!(matches!(msg, NetworkMessage::Verack), "{msg:?}");
     }
+
+    // ── Arbitrary bytes ──────────────────────────────────────────────────────
+    //
+    // The v1 reader is the first thing a peer's bytes reach, and the only one
+    // of the two transports where a peer gets to choose the framing: a v2
+    // packet that is not ours does not decrypt, while a v1 header is whatever
+    // arrived. The cases above each name one way to be wrong. These say what
+    // has to hold for every way at once.
+
+    /// Deterministic, so a failure names the stream that produced it.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+
+        fn bytes(&mut self, n: usize) -> Vec<u8> {
+            (0..n).map(|_| (self.next() & 0xff) as u8).collect()
+        }
+    }
+
+    /// A stream of frames, each wrong in a way the reader has to have an
+    /// answer for: another network's magic, a command that is not a command
+    /// string, a length that overruns the stream or the protocol's limit, a
+    /// checksum that does not match, a payload that will not parse.
+    ///
+    /// Deliberately not uniform noise, which would fail at the magic every
+    /// time and exercise one branch.
+    fn arbitrary_stream(rng: &mut Rng) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..rng.below(4) + 1 {
+            match rng.below(8) {
+                0 => {
+                    let n = rng.below(40) as usize + 1;
+                    out.extend_from_slice(&rng.bytes(n));
+                }
+                _ => {
+                    // A frame, with each field independently plausible or not.
+                    let magic = if rng.below(4) == 0 {
+                        rng.bytes(4)
+                    } else {
+                        Magic::REGTEST.to_bytes().to_vec()
+                    };
+                    let command: Vec<u8> = match rng.below(3) {
+                        0 => rng.bytes(12),
+                        1 => b"addrv2\0\0\0\0\0\0".to_vec(),
+                        _ => b"ping\0\0\0\0\0\0\0\0".to_vec(),
+                    };
+                    let n = rng.below(24) as usize;
+                    let payload = rng.bytes(n);
+                    let declared: u32 = match rng.below(4) {
+                        0 => u32::MAX,
+                        1 => rng.next() as u32,
+                        _ => payload.len() as u32,
+                    };
+                    let checksum = if rng.below(3) == 0 {
+                        rng.bytes(4)
+                    } else {
+                        sha256d::Hash::hash(&payload).to_byte_array()[..4].to_vec()
+                    };
+                    out.extend_from_slice(&magic);
+                    out.extend_from_slice(&command);
+                    out.extend_from_slice(&declared.to_le_bytes());
+                    out.extend_from_slice(&checksum);
+                    out.extend_from_slice(&payload);
+                }
+            }
+        }
+        out
+    }
+
+    /// Whatever arrives, the reader either returns a message or fails with a
+    /// fault that names what went wrong, and it does neither by panicking.
+    ///
+    /// The fault is the part worth asserting. An untyped error reaches the
+    /// session as `DisconnectReason::OTHER`, which tells an operator watching
+    /// a peer misbehave precisely nothing, and it is the one outcome here that
+    /// no individual test would notice.
+    #[tokio::test]
+    async fn test_arbitrary_bytes_are_refused_by_name_and_never_panic() {
+        let mut messages = 0u32;
+        let mut faults = std::collections::BTreeSet::new();
+        for seed in 0..2_000u64 {
+            let mut rng = Rng(seed);
+            let stream = arbitrary_stream(&mut rng);
+            let mut reader = TransportV1Reader::new(&stream[..], Magic::REGTEST);
+
+            // Until the first error: an error is terminal for a session, and
+            // the oversized case deliberately stays failed, so reading past
+            // one would spin.
+            //
+            // The bound is what says a frame always consumes something: a
+            // reader that returned messages without advancing would hang here
+            // rather than in production.
+            for _ in 0..stream.len() + 1 {
+                match reader.recv().await {
+                    Ok(_) => messages += 1,
+                    Err(err) => {
+                        let fault = fault_of(&err);
+                        assert!(
+                            fault.is_some(),
+                            "seed {seed}: an unnamed failure reaches an operator as OTHER: {err:#}"
+                        );
+                        faults.insert(format!("{:?}", fault.unwrap()));
+                        break;
+                    }
+                }
+            }
+        }
+
+        // The streams have to actually reach the interesting answers, or the
+        // assertion above is about nothing.
+        assert!(messages > 0, "no stream ever produced a message");
+        for expected in [
+            "WrongMagic",
+            "Oversized",
+            "Decode",
+            "PeerClosed",
+            "Truncated",
+        ] {
+            assert!(
+                faults.contains(expected),
+                "never reached {expected}: {faults:?}"
+            );
+        }
+    }
+
+    /// A payload of exactly the protocol's maximum is read, and one byte more
+    /// is refused.
+    ///
+    /// The limit is the protocol's, not ours, so refusing a message at it
+    /// would be refusing a legal message -- and the only test of the limit
+    /// used a verack, four million bytes away from the boundary it was meant
+    /// to be checking. Mutation testing is what pointed this out: turning the
+    /// `>` into `>=` changed nothing any test could see.
+    #[tokio::test]
+    async fn test_a_payload_of_exactly_the_maximum_is_read() {
+        let payload = vec![0x11u8; MAX_V1_PAYLOAD];
+        let mut stream = frame(b"blah\0\0\0\0\0\0\0\0", &payload);
+        assert_eq!(stream.len(), common::p2p::message::MAX_MSG_SIZE);
+        let mut reader = TransportV1Reader::new(&stream[..], Magic::REGTEST);
+        match reader.recv().await.expect("a message at the limit") {
+            NetworkMessage::Unknown {
+                command,
+                payload: got,
+            } => {
+                assert_eq!(command.as_ref(), "blah");
+                assert_eq!(got.len(), MAX_V1_PAYLOAD);
+            }
+            other => panic!("expected the frame as Unknown: {other:?}"),
+        }
+
+        // One byte more, declared and sent.
+        stream = frame(b"blah\0\0\0\0\0\0\0\0", &vec![0x11u8; MAX_V1_PAYLOAD + 1]);
+        let mut reader = TransportV1Reader::new(&stream[..], Magic::REGTEST);
+        let err = reader.recv().await.unwrap_err();
+        assert_eq!(fault_of(&err), Some(Fault::Oversized));
+    }
 }
