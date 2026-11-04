@@ -908,6 +908,7 @@ mod tests {
     use super::testing::{mine_header, regtest_params};
     use super::*;
     use bitcoind::client::bitcoin::Address;
+    use testsupport::TempDir;
 
     // A random regtest address we can mine to.
     fn regtest_address() -> Address {
@@ -1027,9 +1028,8 @@ mod tests {
         assert_eq!(tree.tip().1, 7);
         let tip_before = tree.tip().0;
 
-        let dir = std::env::temp_dir().join("headertree-test-roundtrip");
-        let path = dir.join("headers.bin");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TempDir::new("headertree-roundtrip");
+        let path = dir.path().join("headers.bin");
 
         let mut tips_before = tree.chain_tips();
         tips_before.sort_by_key(|t| t.hash);
@@ -1060,8 +1060,6 @@ mod tests {
         for header in &chain_b {
             assert!(loaded.height_of(&header.block_hash()).is_some());
         }
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1153,9 +1151,8 @@ mod tests {
         assert!(resp.is_empty());
 
         // Save and reload
-        let dir = std::env::temp_dir().join("headertree-test-regtest");
-        let path = dir.join("headers.bin");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TempDir::new("headertree-regtest");
+        let path = dir.path().join("headers.bin");
 
         tree.dirty = true;
         tree.save(&path).unwrap();
@@ -1164,8 +1161,6 @@ mod tests {
         assert_eq!(loaded.tip(), tree.tip());
         assert_eq!(loaded.len(), tree.len());
         assert_eq!(loaded.build_locator(), tree.build_locator());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Insert the same batch twice — second time should accept 0 new headers.
@@ -1670,9 +1665,8 @@ mod tests {
         tree.insert_batch(&stray);
         tree.insert_batch(&real);
         assert_eq!(tree.len(), 11);
-        let dir = std::env::temp_dir().join("headertree-test-checkpoint-load");
-        let path = dir.join("headers.bin");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TempDir::new("headertree-checkpoint-load");
+        let path = dir.path().join("headers.bin");
         tree.save(&path).unwrap();
 
         let loaded =
@@ -1686,7 +1680,6 @@ mod tests {
         }
         // The load is dirty: the next save writes the pruned tree.
         assert!(loaded.dirty);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1946,8 +1939,7 @@ mod tests {
     /// whichever one that order happened to put first.
     #[test]
     fn test_the_same_tree_saves_to_the_same_bytes() {
-        let dir = std::env::temp_dir().join(format!("headertree-stable-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("headertree-stable");
         for seed in 400..410u64 {
             let genesis = regtest_tree().tip().0;
             let shape = random_shape(&mut Rng(seed), 20, genesis);
@@ -1957,21 +1949,19 @@ mod tests {
                 for header in &shape {
                     tree.insert_batch(&[*header]);
                 }
-                let path = dir.join(format!("{seed}-{n}.bin"));
+                let path = dir.path().join(format!("{seed}-{n}.bin"));
                 tree.dirty = true;
                 tree.save(&path).unwrap();
                 std::fs::read(&path).unwrap()
             };
             assert_eq!(written(0), written(1), "seed {seed}");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A random tree survives the round trip to disk.
     #[test]
     fn test_save_and_load_agree_on_a_random_tree() {
-        let dir = std::env::temp_dir().join(format!("headertree-random-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("headertree-random");
         for seed in 300..310u64 {
             let mut rng = Rng(seed);
             let genesis = regtest_tree().tip().0;
@@ -1983,7 +1973,7 @@ mod tests {
                 tree.insert_batch(&[*header]);
             }
 
-            let path = dir.join(format!("{seed}.bin"));
+            let path = dir.path().join(format!("{seed}.bin"));
             tree.dirty = true;
             tree.save(&path).unwrap();
             let loaded = HeaderTree::load(&path, regtest_params(), Vec::new()).unwrap();
@@ -1993,6 +1983,5 @@ mod tests {
             assert_eq!(loaded.best_chain, tree.best_chain, "seed {seed}");
             assert_eq!(loaded.build_locator(), tree.build_locator(), "seed {seed}");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
