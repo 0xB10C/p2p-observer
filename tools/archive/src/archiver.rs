@@ -596,6 +596,35 @@ mod tests {
     }
 
     #[test]
+    fn test_any_one_flag_turns_everything_off() {
+        // Every flag on its own, which is how an operator uses this: archive
+        // just the handshakes, just the results. The "everything" decision is
+        // one long chain of `or`s, and a single `and` slipped into it leaves
+        // most combinations reading the same while making one particular flag
+        // archive the whole stream -- under a header that says it holds only
+        // that one kind. Mutation testing found two such places; a table over
+        // the flags is what closes all of them.
+        for flag in [
+            "--ping-rtt",
+            "--block-announcements",
+            "--address-announcements",
+            "--connection-results",
+            "--handshakes",
+            "--compact-block-probes",
+            "--fee-filters",
+            "--send-cmpcts",
+        ] {
+            let filter = Filter::from(&args(&[flag]));
+            assert!(!filter.all, "{flag} alone still archived everything");
+            assert_eq!(
+                filter.kinds().len(),
+                1,
+                "{flag} alone should record exactly one kind"
+            );
+        }
+    }
+
+    #[test]
     fn test_no_flags_archives_everything() {
         let filter = Filter::from(&args(&[]));
         assert!(filter.all);
@@ -848,6 +877,85 @@ mod tests {
         let path = file.path.clone();
         file.finalize().unwrap();
         fs::remove_file(&path).unwrap();
+    }
+
+    /// A compressed archive rotates too, eventually.
+    ///
+    /// The existing rotation test proves the compressed size is what counts
+    /// by showing that a heap of near-identical events does *not* reach the
+    /// limit. What it never showed is that anything does: with the byte
+    /// counter stuck at zero -- one operator away, as mutation testing
+    /// pointed out -- a compressed archive grows for ever, one file for the
+    /// lifetime of the process, and that test still passes.
+    ///
+    /// The records here carry distinct payloads so zstd cannot shrink them
+    /// to nothing, and the loop is bounded so a counter that never moves
+    /// fails here rather than filling a disk somewhere.
+    #[test]
+    fn test_a_compressed_archive_reaches_its_limit() {
+        let dir = tmp_dir("rotate-compressed");
+        let header = ArchiveHeader {
+            created: 1_700_000_000,
+            network: "signet".to_owned(),
+            events: Filter::from(&args(&[])).kinds(),
+        };
+        let mut file = ArchiveFile::create(dir.path(), "grows", 1, &header).unwrap();
+
+        let mut written = 0u32;
+        while !file.needs_rotation(4 * 1024) {
+            written += 1;
+            assert!(
+                written < 100_000,
+                "a compressed archive never reached its limit after {written} records, \
+                 with {} bytes handed to the encoder",
+                file.bytes_written
+            );
+            let mut event = ping(u64::from(written));
+            // Distinct and incompressible-ish, so the encoder has something
+            // to emit rather than a run of identical records.
+            event.user_agent = format!("/{written:064x}/");
+            file.write_record(&event.encode_to_vec()).unwrap();
+        }
+
+        let path = file.path.clone();
+        file.finalize().unwrap();
+        assert!(fs::metadata(&path).unwrap().len() >= 4 * 1024);
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// Twenty-two is a compression level and twenty-three is not.
+    ///
+    /// The check is the only thing between an operator typo and zstd being
+    /// handed a level it refuses, and the boundary was free: moving it by one
+    /// would reject the strongest level there is, or accept one that does not
+    /// exist, with nothing failing.
+    #[tokio::test]
+    async fn test_the_compression_level_boundary() {
+        let level = |n: u32| {
+            let mut a = args(&[]);
+            a.compression_level = n;
+            a.nats_url = "nats://127.0.0.1:1".to_owned();
+            a
+        };
+        let (_tx, rx) = watch::channel(false);
+
+        let err = run(level(23), rx.clone())
+            .await
+            .expect_err("23 is not a level");
+        assert!(
+            err.to_string().contains("out of range"),
+            "{err:#}: 23 should be refused as a level"
+        );
+
+        // Twenty-two gets past the check and fails later, on a NATS server
+        // that is not there, which is how we know it was not refused here.
+        let err = run(level(22), rx)
+            .await
+            .expect_err("there is no NATS server");
+        assert!(
+            !err.to_string().contains("out of range"),
+            "{err:#}: 22 is the strongest level and must be accepted"
+        );
     }
 
     #[test]
