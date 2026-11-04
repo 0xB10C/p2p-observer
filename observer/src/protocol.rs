@@ -2073,6 +2073,111 @@ mod tests {
         assert_eq!(announced, MAX_BLOCK_INVS_ANNOUNCED);
     }
 
+    /// A compact-block inv is announced, and asked for as a compact block.
+    ///
+    /// This is how a high-bandwidth BIP152 peer says it has a block, and it is
+    /// a separate arm in `handle_inv` from the plain and witness ones: it both
+    /// announces and sends a getdata, because the compact block is what the
+    /// probe measures. Delete the arm and a `cmpctblock` inv becomes an
+    /// inventory type we skip -- no announcement, no getdata, and a peer that
+    /// announces this way goes unobserved entirely.
+    #[tokio::test]
+    async fn test_a_compact_block_inv_is_announced_and_asked_for() {
+        use crate::headertree::testing::regtest_params;
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let mut h = harness(tree);
+
+        let hash = BlockHash::from_byte_array([7u8; 32]);
+        h.conn
+            .handle_inv(vec![Inventory::CompactBlock(hash)])
+            .await
+            .unwrap();
+
+        let announced: Vec<_> = std::iter::from_fn(|| h.events.try_recv().ok())
+            .filter_map(|e| match e.event {
+                Some(common::events::peer_event::Event::BlockAnnouncement(a)) => Some(a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(announced.len(), 1, "a cmpctblock inv was not announced");
+        assert_eq!(announced[0].block_hash, hash.to_string());
+        assert_eq!(
+            announced[0].announcement_type,
+            common::events::AnnouncementType::Inv as i32
+        );
+        assert_eq!(announced[0].batch_size, 1);
+
+        // And it was asked for, as a compact block rather than a block: the
+        // getdata is the request the probe times.
+        let getdata: Vec<_> = h
+            .conn
+            .writer
+            .0
+            .iter()
+            .filter_map(|m| match m {
+                NetworkMessage::GetData(payload) => Some(payload.0.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            getdata,
+            vec![vec![Inventory::CompactBlock(hash)]],
+            "the compact block was not asked for"
+        );
+    }
+
+    /// A plain block inv is announced and not asked for.
+    ///
+    /// The other half of the arm above: an inv carries no header, so a block
+    /// we do not know is chased with a getheaders, never a getdata. A getdata
+    /// for a block we have no header for is a request we could not place the
+    /// answer to.
+    #[tokio::test]
+    async fn test_a_plain_block_inv_is_not_asked_for() {
+        use crate::headertree::testing::regtest_params;
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let mut h = harness(tree);
+
+        h.conn.handle_inv(block_hashes(1)).await.unwrap();
+
+        assert!(
+            !h.conn
+                .writer
+                .0
+                .iter()
+                .any(|m| matches!(m, NetworkMessage::GetData(_))),
+            "a plain block inv drew a getdata: {:?}",
+            h.conn.writer.0
+        );
+        // It was chased the only way an inv can be: by asking for headers.
+        assert!(
+            h.conn
+                .writer
+                .0
+                .iter()
+                .any(|m| matches!(m, NetworkMessage::GetHeaders(_))),
+            "a block we do not know was not chased: {:?}",
+            h.conn.writer.0
+        );
+    }
+
+    /// An inv of exactly the protocol's limit is read.
+    ///
+    /// The other side of `test_an_inv_over_the_protocol_limit_ends_the_session`:
+    /// a limit tested only from above is satisfied by refusing everything, and
+    /// fifty thousand is what Core is entitled to send.
+    #[tokio::test]
+    async fn test_an_inv_of_exactly_the_protocol_limit_is_read() {
+        use crate::headertree::testing::regtest_params;
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let mut h = harness(tree);
+
+        h.conn
+            .handle_inv(block_hashes(MAX_INV_SIZE))
+            .await
+            .expect("an inv of exactly the limit was refused");
+    }
+
     #[test]
     fn test_a_pong_claims_the_ping_it_answers() {
         let mut stats = ConnectionStats::new();
