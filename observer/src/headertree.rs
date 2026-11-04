@@ -764,15 +764,27 @@ impl HeaderTree {
             return Ok(());
         }
 
+        // Height first, so a parent is always written before its child, which
+        // is what lets `load` replay the file straight back into a tree.
+        //
+        // Within one height, the block on the best chain first and the rest in
+        // hash order. Both halves are about the reload. The tree keeps the
+        // first tip it sees of a given amount of work, so writing the active
+        // chain ahead of its equals is what makes it the active chain again --
+        // otherwise a restart with two branches tied at the tip comes back on
+        // whichever one happened to be written first. And that was the
+        // iteration order of a HashMap, so it was not even the same twice: the
+        // same tree saved again could come back as the other chain.
+        let on_best: std::collections::HashSet<&BlockHash> = self.best_chain.iter().collect();
         let mut entries: Vec<_> = self
             .headers
-            .values()
-            .map(|e| (e.height, &e.header))
+            .iter()
+            .map(|(hash, e)| (e.height, !on_best.contains(hash), *hash, &e.header))
             .collect();
-        entries.sort_by_key(|(h, _)| *h);
+        entries.sort_unstable_by_key(|(height, off_best, hash, _)| (*height, *off_best, *hash));
 
         let mut buf = Vec::with_capacity(entries.len() * HEADER_SIZE);
-        for (_, header) in &entries {
+        for (_, _, _, header) in &entries {
             buf.extend_from_slice(&serialize(*header));
         }
 
@@ -1730,5 +1742,257 @@ mod tests {
         assert_eq!(merged[0].height, 970_000);
         assert_eq!(merged[0].hash, other);
         assert_eq!(merged[1].height, 973_364);
+    }
+
+    // ── Random shapes ────────────────────────────────────────────────────────
+    //
+    // The hand-written cases above each fix one shape and one order. What they
+    // cannot cover is the interaction: a reorg onto a branch that was itself
+    // reorged away, a header arriving between two others that depend on it.
+    // The tree's job over all of that is one sentence -- the tip is the
+    // deepest block it holds, and the best chain is that block's ancestry --
+    // and these check that sentence over shapes nobody chose.
+
+    /// Deterministic, so a failure names the case that produced it rather than
+    /// happening once in a thousand runs.
+    struct Rng(u64);
+
+    impl Rng {
+        /// splitmix64, which is short enough to read and good enough to pick
+        /// a parent with.
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// `count` headers, each built on a block already in the shape, so that
+    /// branches, forks and reorgs arise rather than being arranged. Returned
+    /// in creation order, which is one valid topological order.
+    fn random_shape(rng: &mut Rng, count: usize, genesis: BlockHash) -> Vec<Header> {
+        let mut hashes = vec![genesis];
+        let mut headers = Vec::with_capacity(count);
+        for i in 0..count {
+            let parent = hashes[rng.below(hashes.len())];
+            let header = mine_header(parent, 1_700_000_000 + i as u32, (i % 251) as u8 + 1);
+            hashes.push(header.block_hash());
+            headers.push(header);
+        }
+        headers
+    }
+
+    /// Heights of every header in a shape, worked out independently of the
+    /// tree: this is the reference the tree is checked against.
+    fn heights(headers: &[Header], genesis: BlockHash) -> HashMap<BlockHash, u32> {
+        let mut heights = HashMap::from([(genesis, 0)]);
+        // Creation order is topological, so one pass places everything.
+        for header in headers {
+            let height = heights[&header.prev_blockhash] + 1;
+            heights.insert(header.block_hash(), height);
+        }
+        heights
+    }
+
+    /// An order in which every parent still comes before its children, but
+    /// which branch is extended next is random.
+    fn topological_shuffle(rng: &mut Rng, headers: &[Header], genesis: BlockHash) -> Vec<Header> {
+        let mut placed: HashSet<BlockHash> = HashSet::from([genesis]);
+        let mut left: Vec<Header> = headers.to_vec();
+        let mut order = Vec::with_capacity(headers.len());
+        while !left.is_empty() {
+            let ready: Vec<usize> = left
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| placed.contains(&h.prev_blockhash))
+                .map(|(i, _)| i)
+                .collect();
+            let header = left.remove(ready[rng.below(ready.len())]);
+            placed.insert(header.block_hash());
+            order.push(header);
+        }
+        order
+    }
+
+    /// However the headers arrive, as long as each parent comes before its
+    /// children, the tree ends at the deepest block it holds and holds all of
+    /// them.
+    #[test]
+    fn test_any_topological_order_ends_at_the_deepest_block() {
+        for seed in 0..40u64 {
+            let mut rng = Rng(seed);
+            let genesis = regtest_tree().tip().0;
+            let shape = random_shape(&mut rng, 30, genesis);
+            let heights = heights(&shape, genesis);
+            let deepest = *heights.values().max().unwrap();
+
+            let order = topological_shuffle(&mut rng, &shape, genesis);
+            let mut tree = regtest_tree();
+            for header in &order {
+                let (accepted, err) = tree.insert_batch(&[*header]);
+                assert_eq!(
+                    accepted, 1,
+                    "seed {seed}: refused a placeable header: {err:?}"
+                );
+            }
+
+            assert_eq!(tree.len(), shape.len() + 1, "seed {seed}");
+            let (tip, height) = tree.tip();
+            assert_eq!(height, deepest, "seed {seed}: the tip is not the deepest");
+            assert_eq!(heights[&tip], deepest, "seed {seed}");
+
+            // Where the deepest block is the only one at that height, the tip
+            // is that block and not merely one of its depth.
+            let at_the_top: Vec<_> = heights
+                .iter()
+                .filter(|(_, h)| **h == deepest)
+                .map(|(hash, _)| *hash)
+                .collect();
+            if at_the_top.len() == 1 {
+                assert_eq!(tip, at_the_top[0], "seed {seed}");
+            }
+        }
+    }
+
+    /// The best chain is the tip's ancestry, every time.
+    ///
+    /// A reorg rebuilds this list, and a reorg that got it wrong -- a stale
+    /// entry, a missing link, the wrong length -- would still leave the tip
+    /// right, so the tip alone does not check it.
+    #[test]
+    fn test_the_best_chain_is_the_tips_ancestry() {
+        for seed in 100..130u64 {
+            let mut rng = Rng(seed);
+            let genesis = regtest_tree().tip().0;
+            let shape = random_shape(&mut rng, 25, genesis);
+            let order = topological_shuffle(&mut rng, &shape, genesis);
+
+            let mut tree = regtest_tree();
+            for header in &order {
+                tree.insert_batch(&[*header]);
+            }
+
+            let (tip, height) = tree.tip();
+            assert_eq!(tree.best_chain.len(), height as usize + 1, "seed {seed}");
+            assert_eq!(tree.best_chain[0], genesis, "seed {seed}");
+            assert_eq!(*tree.best_chain.last().unwrap(), tip, "seed {seed}");
+
+            let by_hash: HashMap<BlockHash, Header> =
+                shape.iter().map(|h| (h.block_hash(), *h)).collect();
+            for pair in tree.best_chain.windows(2) {
+                assert_eq!(
+                    by_hash[&pair[1]].prev_blockhash, pair[0],
+                    "seed {seed}: the best chain is not a chain"
+                );
+            }
+        }
+    }
+
+    /// Headers that arrive before their parents are refused, and the tree says
+    /// so rather than remembering them as wrong: offered again once the gap is
+    /// filled, they are taken.
+    ///
+    /// This is what the recovery requests are for, and the property they rely
+    /// on. An orphan rejection that stuck would leave the tree permanently
+    /// short of a branch it had been told about, with nothing asking again.
+    #[test]
+    fn test_a_tree_fed_out_of_order_catches_up_when_fed_again() {
+        for seed in 200..230u64 {
+            let mut rng = Rng(seed);
+            let genesis = regtest_tree().tip().0;
+            let shape = random_shape(&mut rng, 25, genesis);
+            let heights = heights(&shape, genesis);
+            let deepest = *heights.values().max().unwrap();
+
+            // A plain shuffle, so parents and children arrive in any order.
+            let mut scrambled = shape.clone();
+            for i in (1..scrambled.len()).rev() {
+                scrambled.swap(i, rng.below(i + 1));
+            }
+
+            let mut tree = regtest_tree();
+            // One pass can place at most one more generation, so the bound is
+            // the depth; failing to converge inside it is the bug.
+            let mut passes = 0;
+            while tree.len() < shape.len() + 1 {
+                passes += 1;
+                assert!(
+                    passes <= deepest + 1,
+                    "seed {seed}: {} of {} headers after {passes} passes",
+                    tree.len() - 1,
+                    shape.len()
+                );
+                for header in &scrambled {
+                    tree.insert_batch(&[*header]);
+                }
+            }
+            assert_eq!(tree.tip().1, deepest, "seed {seed}");
+        }
+    }
+
+    /// The same tree, built twice, saves to the same bytes.
+    ///
+    /// It did not: the order within a height was the iteration order of a
+    /// HashMap, which differs between two maps holding the same keys. So the
+    /// file written every minute could differ from the last for no reason, and
+    /// -- because the tree keeps the first tip it sees of a given amount of
+    /// work -- a restart with two branches tied at the tip came back on
+    /// whichever one that order happened to put first.
+    #[test]
+    fn test_the_same_tree_saves_to_the_same_bytes() {
+        let dir = std::env::temp_dir().join(format!("headertree-stable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for seed in 400..410u64 {
+            let genesis = regtest_tree().tip().0;
+            let shape = random_shape(&mut Rng(seed), 20, genesis);
+
+            let written = |n: u8| {
+                let mut tree = regtest_tree();
+                for header in &shape {
+                    tree.insert_batch(&[*header]);
+                }
+                let path = dir.join(format!("{seed}-{n}.bin"));
+                tree.dirty = true;
+                tree.save(&path).unwrap();
+                std::fs::read(&path).unwrap()
+            };
+            assert_eq!(written(0), written(1), "seed {seed}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A random tree survives the round trip to disk.
+    #[test]
+    fn test_save_and_load_agree_on_a_random_tree() {
+        let dir = std::env::temp_dir().join(format!("headertree-random-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for seed in 300..310u64 {
+            let mut rng = Rng(seed);
+            let genesis = regtest_tree().tip().0;
+            let shape = random_shape(&mut rng, 20, genesis);
+            let order = topological_shuffle(&mut rng, &shape, genesis);
+
+            let mut tree = regtest_tree();
+            for header in &order {
+                tree.insert_batch(&[*header]);
+            }
+
+            let path = dir.join(format!("{seed}.bin"));
+            tree.dirty = true;
+            tree.save(&path).unwrap();
+            let loaded = HeaderTree::load(&path, regtest_params(), Vec::new()).unwrap();
+
+            assert_eq!(loaded.tip(), tree.tip(), "seed {seed}");
+            assert_eq!(loaded.len(), tree.len(), "seed {seed}");
+            assert_eq!(loaded.best_chain, tree.best_chain, "seed {seed}");
+            assert_eq!(loaded.build_locator(), tree.build_locator(), "seed {seed}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
