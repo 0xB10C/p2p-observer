@@ -687,6 +687,103 @@ mod tests {
         }
     }
 
+    /// Whatever the archiver writes, the reader reads back unchanged.
+    ///
+    /// The archive is the durable artifact: an event that does not survive the
+    /// round trip is an observation lost for good, and the only place it would
+    /// show up is a reader months later wondering why a file stops early. The
+    /// round trip above uses three ordinary events; this one sweeps the edges
+    /// -- extreme numbers, control characters in the command names a peer
+    /// chooses, user agents long enough to matter against the record cap --
+    /// at all three compression levels.
+    ///
+    /// It also closes the loop between the two halves: a record the archiver
+    /// is willing to write but the reader refuses would be a file that cannot
+    /// be read, and nothing else would notice.
+    #[test]
+    fn test_an_archive_of_edge_events_round_trips() {
+        use common::events::connection_result::{Disconnected, Result as R};
+        use common::events::{AddressAnnouncement, ConnectionResult, GossipedAddress};
+
+        const EDGES: [&str; 6] = ["", "\r\n", "\0", "ping", "👍", "\""];
+
+        for level in [0, 1, 18] {
+            let dir = tmp_dir(&format!("edge-rt-{level}"));
+            let header = ArchiveHeader {
+                created: u64::MAX,
+                network: "signet".to_owned(),
+                events: Filter::from(&args(&[])).kinds(),
+            };
+
+            let written: Vec<PeerEvent> = (0..60u64)
+                .map(|i| {
+                    let edge =
+                        |n: u64| EDGES[(n as usize) % EDGES.len()].repeat(1 + (n as usize) % 3);
+                    let mut event = ping(i);
+                    event.peer_addr = edge(i);
+                    event.user_agent = "x".repeat((i as usize) * 97);
+                    event.timestamp_ms = u64::MAX - i;
+                    event.dropped_events = u64::MAX / (i + 1);
+                    match i % 3 {
+                        0 => {}
+                        1 => {
+                            event.event =
+                                Some(peer_event::Event::ConnectionResult(ConnectionResult {
+                                    result: Some(R::Disconnected(Disconnected {
+                                        setup_ms: u64::MAX,
+                                        uptime_ms: 0,
+                                        reason: i32::MAX,
+                                        messages_by_command: (0..i % 4)
+                                            .map(|k| (edge(i + k), u32::MAX))
+                                            .collect(),
+                                        messages_other: u32::MAX,
+                                        unsolicited_pongs: 0,
+                                        undecodable: u32::MAX,
+                                        getheaders_ignored: 1,
+                                    })),
+                                }));
+                        }
+                        _ => {
+                            event.event = Some(peer_event::Event::AddressAnnouncement(
+                                AddressAnnouncement {
+                                    message: i32::MAX,
+                                    unparsed: u32::MAX,
+                                    addresses: (0..i * 3)
+                                        .map(|k| GossipedAddress {
+                                            addr: edge(k),
+                                            services: u64::MAX,
+                                            ntime: u32::MAX,
+                                        })
+                                        .collect(),
+                                    solicited: true,
+                                    rate_limited: u32::MAX,
+                                    rate_limit_tokens: f64::MAX,
+                                },
+                            ));
+                        }
+                    }
+                    event
+                })
+                .collect();
+
+            let mut file = ArchiveFile::create(dir.path(), "edge", level, &header).unwrap();
+            for event in &written {
+                file.write_record(&event.encode_to_vec()).unwrap();
+            }
+            let path = file.path.clone();
+            file.finalize().unwrap();
+
+            let archive = ArchiveReader::open(&path).unwrap();
+            assert_eq!(archive.header, header, "level {level}: the header");
+            let read: Vec<PeerEvent> = archive
+                .map(|e| e.unwrap_or_else(|err| panic!("level {level}: {err}")))
+                .collect();
+            assert_eq!(read, written, "level {level}: the events");
+
+            fs::remove_file(&path).unwrap();
+        }
+    }
+
     /// An archive with no events in it is still a valid archive: the header
     /// says what was being recorded, which is the whole point of writing it out
     /// in full.
