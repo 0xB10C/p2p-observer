@@ -6,6 +6,8 @@
 
 pub mod dir;
 pub mod nats;
+pub mod rng;
 
 pub use dir::TempDir;
 pub use nats::NatsServer;
+pub use rng::Rng;

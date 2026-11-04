@@ -567,6 +567,7 @@ dependencies = [
  "prost-build",
  "serde",
  "serde_json",
+ "testsupport",
  "tokio",
  "tracing",
  "tracing-subscriber",

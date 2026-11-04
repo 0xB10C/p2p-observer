@@ -625,3 +625,50 @@ async fn test_a_peer_that_stops_answering_pings_is_hung_up_on() {
     observed.ended().await;
     ignoring.abort();
 }
+
+/// A command name is a peer's to choose, including the characters that end a
+/// line.
+///
+/// Twelve bytes of whatever arrived: rust-bitcoin's `CommandString` checks the
+/// length and nothing else, so a frame with an unknown command and a correct
+/// checksum is counted under a name that can hold a newline. That name reaches
+/// the archive and the rendered log line, and a line that is secretly two is a
+/// forged record. `common::render` escapes it now; this is the half that says
+/// a peer can reach it at all.
+#[tokio::test]
+async fn test_a_peer_chooses_the_name_its_messages_are_counted_under() {
+    let (mut peer, mut observed) = meet(1, |_| {}).await;
+
+    // An unknown command carrying a newline, with a checksum that matches, so
+    // nothing earlier refuses the frame.
+    peer.send_raw(&frame("ha\nha", &[], None)).await;
+    peer.send(ask_from(vec![nowhere(0)])).await;
+    let answered = answers(&peer.hang_up_and_drain().await);
+    assert_eq!(answered, vec![1], "the session carried on");
+
+    let end = observed.disconnected().await;
+    assert_eq!(
+        end.messages_by_command.get("ha\nha"),
+        Some(&1),
+        "a peer-chosen name with a newline in it: {:?}",
+        end.messages_by_command
+    );
+
+    // And the line that name reaches is still one line.
+    let event = common::events::PeerEvent {
+        peer_addr: "1.2.3.4:8333".to_owned(),
+        event: Some(common::events::peer_event::Event::ConnectionResult(
+            common::events::ConnectionResult {
+                result: Some(common::events::connection_result::Result::Disconnected(end)),
+            },
+        )),
+        ..Default::default()
+    };
+    let line = common::render::event_line(&event);
+    assert!(!line.contains('\n'), "{line:?}");
+    assert!(
+        line.contains("ha\\nha"),
+        "the name is escaped rather than dropped: {line:?}"
+    );
+    observed.ended().await;
+}
