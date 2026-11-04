@@ -572,7 +572,7 @@ mod tests {
             Magic::REGTEST,
             NetworkMessage::Ping(7),
         )));
-        let mut reader = TransportV1Reader::new(&stream[..]);
+        let mut reader = TransportV1Reader::new(&stream[..], Magic::REGTEST);
 
         let err = reader.recv().await.unwrap_err();
         assert_eq!(fault_of(&err), Some(Fault::Decode));
