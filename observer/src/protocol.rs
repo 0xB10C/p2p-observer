@@ -2166,6 +2166,115 @@ mod tests {
         assert_eq!(stats.messages_by_command.get("inv"), Some(&3));
     }
 
+    /// A reader that plays a script, so a test can be the peer.
+    struct Scripted(std::collections::VecDeque<NetworkMessage>);
+    impl TransportReader for Scripted {
+        async fn recv(&mut self) -> Result<NetworkMessage> {
+            self.0
+                .pop_front()
+                .ok_or_else(|| common::anyhow::anyhow!("the script ran out"))
+        }
+    }
+
+    /// A version message as a peer of this protocol version and user agent
+    /// would send it.
+    fn peer_version(version: u32, user_agent: &str) -> NetworkMessage {
+        let NetworkMessage::Version(mut v) = build_version(user_agent, 0) else {
+            unreachable!()
+        };
+        v.version = ProtocolVersion::from_nonstandard(version);
+        NetworkMessage::Version(v)
+    }
+
+    /// The commands the observer sent, in order, which is the part of a
+    /// handshake the peer judges us on.
+    async fn handshake_with(script: Vec<NetworkMessage>) -> (HandshakeInfo, Vec<String>) {
+        let mut r = Scripted(script.into());
+        let mut w = Captured(Vec::new());
+        let info = version_handshake(&mut r, &mut w, USER_AGENT, 0)
+            .await
+            .expect("the handshake did not complete");
+        let sent = w.0.iter().map(|m| m.command().to_string()).collect();
+        (info, sent)
+    }
+
+    /// What the observer offers an ordinary peer, in the order it offers it.
+    ///
+    /// Both offers buy something the tool needs. Without `sendaddrv2` a peer
+    /// gossips only the addresses that fit in an `addr` message, which is to
+    /// say no onion, i2p or cjdns address ever reaches the book. `wtxidrelay`
+    /// has to come before our verack to count at all. And all of it has to
+    /// come after our version: a peer that is sent anything before one
+    /// disconnects.
+    #[tokio::test]
+    async fn test_an_ordinary_peer_is_offered_addrv2_and_wtxid_relay() {
+        let (info, sent) = handshake_with(vec![
+            peer_version(70016, "/Satoshi:28.0.0/"),
+            NetworkMessage::Verack,
+        ])
+        .await;
+        assert_eq!(sent, ["version", "sendaddrv2", "wtxidrelay", "verack"]);
+        assert_eq!(u32::from(info.version.version), 70016);
+        // What the peer offered us, which it did not: these are its flags, not
+        // ours.
+        assert!(!info.send_addr_v2);
+        assert!(!info.wtxid_relay);
+    }
+
+    /// A peer too old for wtxid relay is not offered it, and is still offered
+    /// addrv2.
+    ///
+    /// The two are separate decisions. Testing only a modern peer and only
+    /// utreexod would leave them indistinguishable, and the utreexod rule
+    /// below is one `&&` away from applying to every peer of its vintage.
+    #[tokio::test]
+    async fn test_an_old_peer_is_offered_addrv2_but_not_wtxid_relay() {
+        let (_, sent) = handshake_with(vec![
+            peer_version(70013, "/Satoshi:0.17.0/"),
+            NetworkMessage::Verack,
+        ])
+        .await;
+        assert_eq!(sent, ["version", "sendaddrv2", "verack"]);
+    }
+
+    /// utreexod is sent nothing between our version and our verack.
+    ///
+    /// It is btcd-based and rejects any message in that gap, `sendaddrv2`
+    /// included, and answers with a reject and a disconnect. Skipping it for
+    /// this one peer is the reason we can see utreexod at all, and it is
+    /// recognised by its protocol version and its user agent together --
+    /// which is worth pinning, because getting it wrong in the generous
+    /// direction silently costs every other peer its addrv2 gossip.
+    #[tokio::test]
+    async fn test_utreexod_is_sent_nothing_before_our_verack() {
+        let (_, sent) = handshake_with(vec![
+            peer_version(70013, "/btcwire:0.5.0/utreexod:0.5.0/"),
+            NetworkMessage::Verack,
+        ])
+        .await;
+        assert_eq!(sent, ["version", "verack"]);
+    }
+
+    /// A verack before the version does not finish the handshake.
+    ///
+    /// The loop ends when both have arrived, and what comes out of it says
+    /// `expect("loop invariant")` about the version -- so a loop that ended on
+    /// either would not merely accept a half-handshake, it would panic in a
+    /// connection task on a peer that chose to send its verack first. Nothing
+    /// forbids a peer sending them in that order.
+    #[tokio::test]
+    async fn test_a_verack_before_the_version_does_not_finish_the_handshake() {
+        let (info, sent) = handshake_with(vec![
+            NetworkMessage::Verack,
+            peer_version(70016, "/Satoshi:28.0.0/"),
+            // Not read: the handshake is complete at the version above, since
+            // the verack already arrived.
+            NetworkMessage::Verack,
+        ])
+        .await;
+        assert_eq!(sent, ["version", "sendaddrv2", "wtxidrelay", "verack"]);
+        assert_eq!(u32::from(info.version.version), 70016);
+    }
     /// Test v1 handshake against a real bitcoind.
     #[tokio::test]
     async fn test_v1_bitcoind() {
