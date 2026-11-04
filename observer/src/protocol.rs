@@ -1740,6 +1740,12 @@ mod tests {
             stop_hash: BlockHash::from_byte_array([0; 32]),
         };
 
+        // Paused from the start, so no time passes between asks: the bucket
+        // holds exactly the burst and the fourth ask has exactly one token
+        // left. On the real clock a few microseconds of refill arrive between
+        // asks, and `tokens < 1.0` could become `tokens <= 1.0` without the
+        // test noticing -- a burst of three where the comment says four.
+        tokio::time::pause();
         let burst = GETHEADERS_BURST as usize;
         for _ in 0..burst + 3 {
             h.conn.handle_get_headers(ask.clone()).await.unwrap();
@@ -1750,14 +1756,94 @@ mod tests {
         assert_eq!(headers_sent(&h.conn.writer), burst);
         assert_eq!(h.conn.stats.getheaders_ignored, 3);
 
-        // Tokens come back with time -- the clock's, not a field rewound to
-        // stand in for it, which could not catch the refill reading a
-        // different one.
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(60)).await;
+        // Tokens come back at a rate, not merely eventually. One refill's
+        // worth of time buys exactly one answer: asking twice after it gets
+        // one answer and one refusal, which is what pins the rate rather than
+        // the fact of a refill. A bucket refilling thirty times too fast
+        // would answer both.
+        tokio::time::advance(Duration::from_secs_f64(1.0 / GETHEADERS_RATE_PER_SEC)).await;
+        h.conn.handle_get_headers(ask.clone()).await.unwrap();
         h.conn.handle_get_headers(ask).await.unwrap();
         assert_eq!(headers_sent(&h.conn.writer), burst + 1);
-        assert_eq!(h.conn.stats.getheaders_ignored, 3);
+        assert_eq!(h.conn.stats.getheaders_ignored, 4);
+    }
+
+    /// A session that said nothing is silent; one that said anything is not.
+    ///
+    /// The address manager backs off a peer that keeps producing silent
+    /// sessions, the way it backs off one that keeps being evicted, so this
+    /// verdict decides how often a peer is dialled. Loosening the `and` to an
+    /// `or` makes every ordinary session silent -- every session has an empty
+    /// `messages_other`, because that counter only fills once a peer has sent
+    /// more distinct commands than we keep -- and the manager would then back
+    /// off every peer on the network.
+    #[test]
+    fn test_a_session_is_silent_only_when_the_peer_said_nothing() {
+        let end = |by_command: BTreeMap<String, u32>, other: u32| SessionEnd {
+            connected_at: Instant::now(),
+            error: None,
+            user_agent: USER_AGENT.to_owned(),
+            messages_by_command: by_command,
+            messages_other: other,
+            unsolicited_pongs: 0,
+            undecodable: 0,
+            getheaders_ignored: 0,
+        };
+
+        assert!(end(BTreeMap::new(), 0).silent(), "nothing at all");
+        assert!(
+            !end(BTreeMap::from([("ping".to_owned(), 1)]), 0).silent(),
+            "a peer that sent one ping said something"
+        );
+        assert!(
+            !end(BTreeMap::new(), 1).silent(),
+            "a command past the cap is still a message"
+        );
+    }
+
+    /// A block invented as a compact block is announced, and asked for as one.
+    ///
+    /// Three inventory types carry a block and one of them is CMPCTBLOCK.
+    /// Deleting that arm sends it to the catch-all, where it is skipped in
+    /// silence: a peer that announces this way would stop appearing to
+    /// announce blocks at all, and would never be asked for the block.
+    #[tokio::test]
+    async fn test_a_compact_block_inv_is_an_announcement() {
+        use crate::headertree::testing::regtest_params;
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let mut h = harness(tree);
+        let hash = BlockHash::from_byte_array([7; 32]);
+
+        h.conn
+            .handle_inv(vec![Inventory::CompactBlock(hash)])
+            .await
+            .unwrap();
+
+        let ev = h.events.try_recv().expect("an announcement");
+        let Some(common::events::peer_event::Event::BlockAnnouncement(b)) = ev.event else {
+            panic!("expected a block announcement, got {:?}", ev.event)
+        };
+        assert_eq!(b.block_hash, hash.to_string());
+        // An inv is an inv however the peer typed it: the announcement says
+        // how we heard, and we heard an inventory message.
+        assert_eq!(
+            b.announcement_type,
+            common::events::AnnouncementType::Inv as i32
+        );
+
+        // And the type decides what we ask for, which is the other half of
+        // the arm: a compact block, not a plain one.
+        let asked: Vec<_> = h
+            .conn
+            .writer
+            .0
+            .iter()
+            .filter_map(|m| match m {
+                NetworkMessage::GetData(inv) => Some(inv.0.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked, vec![vec![Inventory::CompactBlock(hash)]]);
     }
 
     /// A locator longer than any implementation builds is walked only as far
@@ -2842,6 +2928,26 @@ mod tests {
         // One over the limit: a sync response. Inserted, nothing announced.
         h.conn.handle_headers(chain.clone()).await.unwrap();
         assert_eq!(tree.read().unwrap().tip().1, chain.len() as u32);
+        assert!(h.events.try_recv().is_err());
+
+        // Exactly the limit: still an announcement each. The boundary is the
+        // whole of the rule, and moving it by one turns the commonest batch a
+        // peer sends -- Core announces up to eight at a time -- into a sync
+        // response that nothing is published for.
+        h.conn
+            .handle_headers(chain[..MAX_HEADERS_ANNOUNCED].to_vec())
+            .await
+            .unwrap();
+        for _ in 0..MAX_HEADERS_ANNOUNCED {
+            let ev = h
+                .events
+                .try_recv()
+                .expect("an announcement per header at the limit");
+            assert!(matches!(
+                ev.event,
+                Some(common::events::peer_event::Event::BlockAnnouncement(_))
+            ));
+        }
         assert!(h.events.try_recv().is_err());
 
         // Two headers: an announcement each, and each says it came with one
