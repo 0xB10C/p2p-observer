@@ -199,6 +199,36 @@ async fn rpc(client: &async_nats::Client, method: &str, payload: &str) -> Value 
     }
 }
 
+/// Asks the same question until the answer satisfies `done`, and says what the
+/// last answer was if it never does.
+///
+/// For state that arrives rather than being there: nothing the observer
+/// publishes says "the header sync is finished". A node does not re-announce
+/// blocks it had before we connected, so there is no event to wait for, and
+/// the handshake -- the one thing that does arrive -- happens before the first
+/// `getheaders` goes out. A test that asked once right after the handshake
+/// would be asking whether the sync had already won a race, which on a busy
+/// runner it sometimes has not.
+async fn rpc_until(
+    client: &async_nats::Client,
+    method: &str,
+    payload: &str,
+    expected: &str,
+    done: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let answer = rpc(client, method, payload).await;
+        if done(&answer) {
+            return answer;
+        }
+        if Instant::now() >= deadline {
+            panic!("{method} never {expected} within {WAIT:?}; last answer: {answer}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// A running observer, stoppable the way the signal handler stops it.
 struct Running {
     stop: oneshot::Sender<()>,
@@ -255,9 +285,23 @@ async fn test_the_observer_syncs_publishes_and_persists() {
     assert_eq!(handshake.peer_addr, node.addr());
 
     // ── The chain reached the tree, which the RPC reads ─────────────────────
-    let tips = rpc(&client, "headertree.tips", "").await;
+    //
+    // Waited for rather than asserted on the spot: the handshake arrives
+    // before the sync does, so the height is a thing that becomes true.
+    let tips = rpc_until(
+        &client,
+        "headertree.tips",
+        "",
+        "reached the node's height",
+        |tips| {
+            tips.as_array()
+                .and_then(|tips| tips.first())
+                .and_then(|tip| tip["height"].as_u64())
+                == Some(BLOCKS as u64)
+        },
+    )
+    .await;
     let tip = &tips.as_array().expect("tips is an array")[0];
-    assert_eq!(tip["height"].as_u64(), Some(BLOCKS as u64));
     assert_eq!(tip["status"].as_str(), Some("active"));
     assert_eq!(
         tip["hash"].as_str(),
