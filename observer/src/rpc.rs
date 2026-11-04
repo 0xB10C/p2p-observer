@@ -180,7 +180,7 @@ impl Handler {
         let mut parsed = Vec::with_capacity(addrs.len());
         let mut rejected = Vec::new();
         for s in &addrs {
-            match PeerAddr::parse_ip(s) {
+            match PeerAddr::parse(s) {
                 Some(addr) => parsed.push(addr),
                 None => rejected.push(s.clone()),
             }
@@ -194,7 +194,7 @@ impl Handler {
     async fn inspect(&self, payload: &[u8]) -> Result<String, String> {
         let s: String =
             serde_json::from_slice(payload).map_err(|e| format!("invalid JSON: {e}"))?;
-        let addr = PeerAddr::parse_ip(&s).ok_or_else(|| format!("unparseable address: {s}"))?;
+        let addr = PeerAddr::parse(&s).ok_or_else(|| format!("unparseable address: {s}"))?;
 
         let entry = self.addrman.inspect(addr).await.ok_or(GONE)?;
         Ok(match entry {
@@ -354,12 +354,12 @@ mod tests {
             1000,
             &[
                 Gossiped {
-                    addr: PeerAddr::parse_ip("1.2.3.4:8333").unwrap(),
+                    addr: PeerAddr::parse("1.2.3.4:8333").unwrap(),
                     services: 9,
                     ntime: 900,
                 },
                 Gossiped {
-                    addr: PeerAddr::parse_ip("5.6.7.8:8333").unwrap(),
+                    addr: PeerAddr::parse("5.6.7.8:8333").unwrap(),
                     services: 0,
                     ntime: 900,
                 },

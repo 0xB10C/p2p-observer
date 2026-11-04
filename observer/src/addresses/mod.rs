@@ -622,7 +622,7 @@ mod tests {
     #[test]
     fn test_end_guard_reports_even_when_dropped_silently() {
         let (handle, _gossip_rx, mut life_rx, _cmd_rx) = channels();
-        let addr = PeerAddr::parse_ip("1.2.3.4:8333").unwrap();
+        let addr = PeerAddr::parse("1.2.3.4:8333").unwrap();
 
         // A task that simply vanishes -- panicked, aborted, early return --
         // must still release the address.
@@ -663,17 +663,17 @@ mod tests {
             NOW,
             &[
                 Gossiped {
-                    addr: PeerAddr::parse_ip("100.0.0.1:8333").unwrap(),
+                    addr: PeerAddr::parse("100.0.0.1:8333").unwrap(),
                     services: 0,
                     ntime: NOW,
                 },
                 Gossiped {
-                    addr: PeerAddr::parse_ip("100.9.9.9:8333").unwrap(),
+                    addr: PeerAddr::parse("100.9.9.9:8333").unwrap(),
                     services: 0,
                     ntime: NOW,
                 },
                 Gossiped {
-                    addr: PeerAddr::parse_ip("1.2.3.4:8333").unwrap(),
+                    addr: PeerAddr::parse("1.2.3.4:8333").unwrap(),
                     services: 0,
                     ntime: NOW,
                 },
@@ -704,7 +704,7 @@ mod tests {
             m.ingest(
                 NOW,
                 &[Gossiped {
-                    addr: PeerAddr::parse_ip("100.0.0.1:8333").unwrap(),
+                    addr: PeerAddr::parse("100.0.0.1:8333").unwrap(),
                     services: 0,
                     ntime: NOW
                 }]
@@ -742,7 +742,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         m.command(
             Command::Inspect {
-                addr: PeerAddr::parse_ip("9.9.9.9:1").unwrap(),
+                addr: PeerAddr::parse("9.9.9.9:1").unwrap(),
                 reply: tx,
             },
             NOW,
@@ -759,7 +759,7 @@ mod tests {
         let addrs: Vec<Gossiped> = (0..50).map(gossiped).collect();
         m.ingest(NOW, &addrs);
 
-        let manual = PeerAddr::parse_ip("9.9.9.9:8333").unwrap();
+        let manual = PeerAddr::parse("9.9.9.9:8333").unwrap();
         assert_eq!(m.add_manual(NOW, &[manual]), 1);
 
         m.tick(NOW);
@@ -817,7 +817,7 @@ mod tests {
     #[test]
     fn test_restore_clears_active() {
         let mut book = Book::new(100, 1);
-        let addr = PeerAddr::parse_ip("1.2.3.4:8333").unwrap();
+        let addr = PeerAddr::parse("1.2.3.4:8333").unwrap();
         book.ingest(
             NOW,
             &[Gossiped {
