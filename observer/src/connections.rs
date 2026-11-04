@@ -17,7 +17,7 @@
 //! belongs.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::addresses::peer_addr::PeerAddr;
 
@@ -70,11 +70,25 @@ impl Registry {
         Arc::new(Self::default())
     }
 
+    /// The map, whether or not a panic somewhere else has poisoned the lock.
+    ///
+    /// Nothing in here holds an invariant a half-finished write could break:
+    /// entries go in and come out whole. So a poisoned lock says only that
+    /// some other thread died nearby, and panicking on it would turn that
+    /// into a second failure -- in [`Registered::drop`] into an abort, since
+    /// a drop runs during the unwinding from the first panic and a panic
+    /// while unwinding ends the process. The worst a recovered lock can hold
+    /// is an entry for a session that has finished, which the RPC would
+    /// report for as long as the process ran.
+    fn map(&self) -> MutexGuard<'_, HashMap<u64, Live>> {
+        self.live.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Note a session that has just finished its handshake. The returned
     /// guard removes it again, so a task that is dropped or cancelled cannot
     /// leave a session in here that is no longer running.
     pub(crate) fn register(self: &Arc<Self>, id: u64, live: Live) -> Registered {
-        self.live.lock().expect("registry lock").insert(id, live);
+        self.map().insert(id, live);
         Registered {
             registry: Arc::clone(self),
             id,
@@ -83,7 +97,7 @@ impl Registry {
 
     /// Refresh the counters of a live session; does nothing once it is gone.
     pub(crate) fn refresh(&self, id: u64, counters: Counters, now_ms: u64) {
-        if let Some(live) = self.live.lock().expect("registry lock").get_mut(&id) {
+        if let Some(live) = self.map().get_mut(&id) {
             live.counters = counters;
             live.updated_ms = now_ms;
         }
@@ -93,9 +107,7 @@ impl Registry {
     /// in the same order.
     pub(crate) fn snapshot(&self) -> Vec<(u64, Live)> {
         let mut all: Vec<(u64, Live)> = self
-            .live
-            .lock()
-            .expect("registry lock")
+            .map()
             .iter()
             .map(|(id, live)| (*id, live.clone()))
             .collect();
@@ -113,11 +125,7 @@ pub(crate) struct Registered {
 
 impl Drop for Registered {
     fn drop(&mut self) {
-        self.registry
-            .live
-            .lock()
-            .expect("registry lock")
-            .remove(&self.id);
+        self.registry.map().remove(&self.id);
     }
 }
 
@@ -190,5 +198,40 @@ mod tests {
         drop(_guard);
         registry.refresh(7, Counters::default(), 0);
         assert!(registry.snapshot().is_empty());
+    }
+
+    /// Dropping a registration must not panic, whatever state the lock is in.
+    ///
+    /// A `Drop` that can panic is a process abort waiting for a bad moment:
+    /// it runs during unwinding from some other panic, and a panic while
+    /// unwinding aborts. In a test binary that eats the summary -- the run
+    /// ends mid-list with no failure named, which is exactly as much as it
+    /// tells you in production.
+    ///
+    /// The lock is poisoned here the way any panic holding it would poison
+    /// it. A poisoned map of live sessions is not corrupted state worth
+    /// ending the process over: the worst it can hold is an entry for a
+    /// session that has finished, which the RPC would report for as long as
+    /// the process ran.
+    #[test]
+    fn test_dropping_a_registration_survives_a_poisoned_lock() {
+        let registry = Registry::new();
+        let registered = registry.register(1, live(100));
+
+        let poisoner = Arc::clone(&registry);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.live.lock().expect("registry lock");
+            panic!("poisoning the registry lock the way a panic in here would");
+        })
+        .join();
+        assert!(registry.live.is_poisoned());
+
+        drop(registered);
+        // And the entry is gone, so the guard did its job rather than merely
+        // surviving.
+        assert!(
+            registry.snapshot().is_empty(),
+            "the registration outlived its guard"
+        );
     }
 }
