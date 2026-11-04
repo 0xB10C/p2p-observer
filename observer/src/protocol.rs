@@ -2089,6 +2089,70 @@ mod tests {
         assert_eq!(stats.unsolicited_pongs, 1);
     }
 
+    /// What the registry is told, which is what an operator reads.
+    ///
+    /// `connections.list` answers from these counters and from nothing else,
+    /// so they are the only account of a live session anyone sees -- and
+    /// nothing asked for them. The two round-trip numbers are deliberately
+    /// different questions: the latest sample says what the path is doing now,
+    /// the lowest of the window says what it is capable of, and a window of
+    /// ten is what makes the second one mean "recently" rather than "ever".
+    #[test]
+    fn test_the_counters_say_the_latest_rtt_and_the_lowest_recent_one() {
+        let mut stats = ConnectionStats::new();
+        assert_eq!(stats.counters().rtt_ms, None, "no samples, no number");
+        assert_eq!(stats.counters().min_rtt_ms, None);
+
+        // A low sample early, then ten more that are all worse. The early one
+        // has fallen out of the window, so the lowest is the lowest of the
+        // ten that remain -- not of the session.
+        stats.record_rtt(1);
+        for i in 0..10 {
+            stats.record_rtt(100 + i);
+        }
+        let c = stats.counters();
+        assert_eq!(c.rtt_ms, Some(109), "the latest sample is the last one in");
+        assert_eq!(
+            c.min_rtt_ms,
+            Some(100),
+            "the window kept a sample it should have dropped, or dropped one it should have kept"
+        );
+
+        // One better sample and both answers move, which is the point of
+        // reporting the two separately.
+        stats.record_rtt(42);
+        let c = stats.counters();
+        assert_eq!(c.rtt_ms, Some(42));
+        assert_eq!(c.min_rtt_ms, Some(42));
+    }
+
+    /// The message total counts the commands it stopped naming.
+    ///
+    /// The per-command map is capped so a peer cannot name its way into
+    /// unbounded memory, and everything past the cap goes into one
+    /// `messages_other`. The total has to add that back or a peer could hide
+    /// its traffic from the operator by inventing command names.
+    #[test]
+    fn test_the_message_total_includes_what_the_cap_stopped_naming() {
+        let mut stats = ConnectionStats::new();
+        for i in 0..MESSAGES_BY_COMMAND_CAP {
+            stats.record_message(&format!("cmd{i}"));
+        }
+        // Three more of a command already named, and three of names that will
+        // not fit.
+        for _ in 0..3 {
+            stats.record_message("cmd0");
+            stats.record_message("never-seen-before");
+        }
+        assert_eq!(stats.messages_by_command.len(), MESSAGES_BY_COMMAND_CAP);
+        assert_eq!(stats.messages_other, 3);
+        assert_eq!(
+            stats.counters().messages,
+            MESSAGES_BY_COMMAND_CAP as u64 + 3 + 3,
+            "the total lost the messages the cap stopped naming"
+        );
+    }
+
     #[test]
     fn test_a_pong_we_never_asked_for_is_counted_not_timed() {
         let mut stats = ConnectionStats::new();
