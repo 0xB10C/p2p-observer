@@ -117,7 +117,7 @@ impl Peer {
         let (stream, _) = listener.accept().await.expect("accepting the dial");
         let (reader, writer) = stream.into_split();
         let mut peer = Peer {
-            r: TransportV1Reader::new(BufReader::new(reader)),
+            r: TransportV1Reader::new(BufReader::new(reader), MAGIC),
             w: TransportV1Writer {
                 magic: MAGIC,
                 writer,
