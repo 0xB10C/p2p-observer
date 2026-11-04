@@ -220,4 +220,62 @@ mod tests {
             }
         );
     }
+
+    /// `prepare` reads the real limit, raises it, and leaves the process able
+    /// to open what it promised.
+    ///
+    /// Everything above this was the decision in the abstract. This is the
+    /// part that calls `getrlimit` and `setrlimit` -- the part that either
+    /// lets the observer hold its peers or refuses to start -- and it was
+    /// covered only by two runs against the binary at the time it was
+    /// written, which is not something a later edit can repeat.
+    ///
+    /// Raising the soft limit to the hard one is the only side effect, and it
+    /// is the one the binary has anyway: more descriptors, no fewer.
+    #[cfg(unix)]
+    #[test]
+    fn test_prepare_raises_the_soft_limit_to_the_hard_one() {
+        let (_, hard_before) = current().expect("the kernel reports RLIMIT_NOFILE");
+        prepare(200).expect("200 dials plus a reserve fits in any usable limit");
+
+        let (soft, hard) = current().expect("the kernel reports RLIMIT_NOFILE");
+        assert_eq!(hard, hard_before, "the hard limit is not ours to move");
+        assert_eq!(
+            soft, hard,
+            "the soft limit should have been raised to the hard one"
+        );
+        assert!(
+            soft >= floor(200),
+            "{soft} descriptors is under the {} needed",
+            floor(200)
+        );
+    }
+
+    /// And it refuses, by name, when the limit cannot cover what was asked.
+    ///
+    /// The refusal is deliberate -- starting and then failing to dial halfway
+    /// through is worse than not starting -- so the message is what an
+    /// operator has to act on, and it has to name both numbers. Asked for
+    /// more dials than any host could have descriptors for, which exercises
+    /// the real syscalls without moving the process's own limit anywhere.
+    #[cfg(unix)]
+    #[test]
+    fn test_prepare_refuses_a_limit_that_cannot_cover_the_dials() {
+        let (_, hard) = current().expect("the kernel reports RLIMIT_NOFILE");
+        if hard == u64::MAX {
+            // An unlimited hard limit covers anything, and saying so is the
+            // other branch's job.
+            return;
+        }
+        let too_many = usize::try_from(hard).unwrap_or(usize::MAX);
+        let err = prepare(too_many).expect_err("more dials than descriptors");
+        assert!(
+            err.contains(&hard.to_string()),
+            "{err}: the message should name the limit it found"
+        );
+        assert!(
+            err.contains("max_dialing") || err.contains("needed"),
+            "{err}: the message should say what to do about it"
+        );
+    }
 }
