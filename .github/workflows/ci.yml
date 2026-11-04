@@ -6,6 +6,12 @@ on:
     branches: [ master ]
   pull_request:
     branches: [ master ]
+  # A merge queue tests a pull request grouped with the ones ahead of it,
+  # which is a different event from either of the two above: without this
+  # line the required checks never run for a queued pull request, it waits
+  # for checks that cannot arrive, and the queue stalls. Harmless until a
+  # queue exists -- the event does not fire -- so it goes in first.
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
