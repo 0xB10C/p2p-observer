@@ -138,3 +138,74 @@ pub(crate) fn tcp_info(fd: std::os::unix::io::RawFd) -> Option<TcpStats> {
 pub(crate) fn tcp_info(_fd: i32) -> Option<TcpStats> {
     None
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use common::tokio;
+    use common::tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use common::tokio::net::{TcpListener, TcpStream};
+    use std::os::unix::io::AsRawFd;
+
+    /// The kernel actually answers, and the fields come back where this code
+    /// says they are.
+    ///
+    /// Everything in here is offsets into a struct that has grown over kernel
+    /// versions, read through a raw `getsockopt`. The `have` check exists
+    /// because a field the kernel did not write would otherwise read as a
+    /// zero -- and a zero minimum RTT or delivery rate is a claim, not a
+    /// blank. None of that had a test: the only thing exercising this path
+    /// was a session test that never looked at the numbers, so a wrong offset
+    /// would have shown up as a plausible measurement in the archive and
+    /// nowhere else.
+    #[tokio::test]
+    async fn test_the_kernel_answers_and_the_fields_land_where_they_should() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            stream.write_all(&buf).await.unwrap();
+            stream.flush().await.unwrap();
+            // Held open until the client has sampled.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // A round trip first: the smoothed RTT is zero until something has
+        // been acknowledged, and a sample of nothing proves nothing.
+        client.write_all(b"ping").await.unwrap();
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).await.unwrap();
+
+        let stats = tcp_info(client.as_raw_fd()).expect("the kernel reports TCP_INFO on linux");
+
+        // Loopback is fast but not instantaneous, and the units are
+        // microseconds: a value of zero here means the field was never
+        // written, which is what a wrong offset looks like.
+        assert!(stats.srtt_us > 0, "srtt was {}", stats.srtt_us);
+        // Nothing was lost on loopback, and these are counters.
+        assert_eq!(stats.total_retrans, 0);
+        assert!(stats.snd_cwnd > 0, "cwnd was {}", stats.snd_cwnd);
+
+        // The fields that arrived with later kernels. Any kernel that reports
+        // them at all reports them for a connection that has just exchanged
+        // data, and the minimum cannot exceed the smoothed value it is the
+        // minimum of.
+        if let Some(min_rtt) = stats.min_rtt_us {
+            assert!(
+                min_rtt <= stats.srtt_us,
+                "a minimum RTT of {min_rtt} above the smoothed {}",
+                stats.srtt_us
+            );
+        }
+        assert_eq!(stats.lost, Some(0), "nothing is lost on loopback");
+        // Four bytes each way, so the count is small but not zero.
+        if let Some(rx) = stats.bytes_received {
+            assert_eq!(rx, 4, "bytes_received was {rx}");
+        }
+
+        server.abort();
+    }
+}

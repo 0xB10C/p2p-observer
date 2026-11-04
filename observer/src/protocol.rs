@@ -1655,6 +1655,61 @@ mod tests {
             .count()
     }
 
+    /// Each sampled field reaches the event field it is named for.
+    ///
+    /// Nine numbers of two types copied from one struct to another: the
+    /// mistake available here is a swap, and a swap is invisible afterwards.
+    /// Every value stays plausible, and the series it lands in is simply the
+    /// wrong one until somebody re-derives it from first principles.
+    /// Mutation testing could replace the whole mapping with
+    /// `Default::default()` and nothing failed.
+    #[test]
+    fn test_every_sampled_field_reaches_the_field_it_is_named_for() {
+        let event = tcp_stats_event(&crate::tcp::TcpStats {
+            srtt_us: 1,
+            rttvar_us: 2,
+            total_retrans: 3,
+            snd_cwnd: 4,
+            min_rtt_us: Some(5),
+            lost: Some(6),
+            reordering: Some(7),
+            delivery_rate: Some(8),
+            bytes_received: Some(9),
+        });
+        // Distinct values, so a swap cannot pass.
+        assert_eq!(event.srtt_us, 1);
+        assert_eq!(event.rttvar_us, 2);
+        assert_eq!(event.total_retrans, 3);
+        assert_eq!(event.snd_cwnd, 4);
+        assert_eq!(event.min_rtt_us, Some(5));
+        assert_eq!(event.lost, Some(6));
+        assert_eq!(event.reordering, Some(7));
+        assert_eq!(event.delivery_rate, Some(8));
+        assert_eq!(event.bytes_received, Some(9));
+    }
+
+    /// A field the platform does not report stays absent rather than becoming
+    /// a zero, which would read as no loss and no distance.
+    #[test]
+    fn test_an_unreported_field_stays_absent() {
+        let event = tcp_stats_event(&crate::tcp::TcpStats {
+            srtt_us: 1,
+            rttvar_us: 2,
+            total_retrans: 3,
+            snd_cwnd: 4,
+            min_rtt_us: None,
+            lost: None,
+            reordering: None,
+            delivery_rate: None,
+            bytes_received: None,
+        });
+        assert_eq!(event.min_rtt_us, None);
+        assert_eq!(event.lost, None);
+        assert_eq!(event.reordering, None);
+        assert_eq!(event.delivery_rate, None);
+        assert_eq!(event.bytes_received, None);
+    }
+
     #[test]
     fn test_version_nonce_is_fresh() {
         let nonce = |msg: NetworkMessage| match msg {
