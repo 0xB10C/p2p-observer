@@ -39,6 +39,22 @@ use addresses::peer_addr::PeerAddr;
 
 pub use settings::Config;
 
+/// The internals the benchmarks in `benches/` measure.
+///
+/// A benchmark is a separate crate and can only see what is public, and the
+/// things worth measuring here -- the address book at the size it reaches, the
+/// header tree at the height mainnet is at -- are deliberately not. Behind a
+/// feature rather than simply public, so that an ordinary build exposes
+/// nothing it does not have to.
+#[cfg(feature = "bench")]
+pub mod bench_api {
+    pub use crate::addresses::banlist::Banlist;
+    pub use crate::addresses::book::{Book, EnabledNets, Gossiped};
+    pub use crate::addresses::peer_addr::PeerAddr;
+    pub use crate::addresses::policy::{Outcome, Reason};
+    pub use crate::headertree::{HeaderTree, testing};
+}
+
 /// Installs the log subscriber the configuration asks for.
 ///
 /// Separate from [`run`] because a subscriber is process-wide and can only be
