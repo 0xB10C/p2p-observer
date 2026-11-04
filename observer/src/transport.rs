@@ -517,6 +517,7 @@ where
 mod tests {
     use super::*;
     use common::bitcoin::hashes::sha256d;
+    use common::tokio::time::{Duration, timeout};
 
     /// A v1 frame as the peer would put it on the wire.
     fn frame(command: &[u8; 12], payload: &[u8]) -> Vec<u8> {
@@ -930,5 +931,165 @@ mod tests {
             let other = ProtocolError::from(Error::new(kind, "something else"));
             assert_eq!(fault_of(&v2_fault(other)), None, "{kind:?}");
         }
+    }
+
+    /// Two BIP324 ends, handshaked over an in-memory pipe, with a relay in
+    /// the middle that can be told to corrupt one byte.
+    ///
+    /// Until now a `TransportV2Reader` could only be built by handshaking
+    /// with a real bitcoind -- `test_v2_bitcoind` is the only thing that ever
+    /// has -- so everything the v2 reader does for itself went untested. A
+    /// duplex pipe and both roles gets the same reader in milliseconds.
+    ///
+    /// The relay exists for the corruption case: a decryption failure cannot
+    /// be constructed, because the error it carries comes from a private
+    /// module of the bip324 crate. It has to be provoked, and the only way to
+    /// provoke it is to change a byte after the handshake has agreed the keys.
+    async fn v2_pair() -> (
+        TransportV2Reader<impl AsyncRead + Unpin + Send>,
+        TransportV2Writer<impl common::tokio::io::AsyncWrite + Unpin + Send>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use bip324::Role;
+        use bip324::futures::Protocol;
+        use common::tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+
+        // responder -> relay -> initiator, and initiator -> responder direct.
+        let (resp_side, relay_in) = common::tokio::io::duplex(1 << 16);
+        let (relay_out, init_side) = common::tokio::io::duplex(1 << 16);
+        let (mut relay_in_r, mut relay_in_w) = common::tokio::io::split(relay_in);
+        let (mut relay_out_r, mut relay_out_w) = common::tokio::io::split(relay_out);
+
+        // The responder's bytes on their way to the initiator, with the last
+        // byte of the next chunk flipped once the test says so. A flag rather
+        // than a byte count, because the handshake has to get through intact
+        // and its length is not ours to know.
+        //
+        // The last byte rather than the first: the first three bytes of a v2
+        // frame are its encrypted length, and changing those makes the reader
+        // wait for a frame that is never coming rather than fail to decrypt
+        // one. In a session that is the ping timeout's problem rather than the
+        // transport's; in a test it is a hang. The last byte is inside the
+        // ciphertext and its tag, which is what a decryption failure is about.
+        let corrupt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let corrupting = std::sync::Arc::clone(&corrupt);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = relay_in_r.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                if corrupting.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    buf[n - 1] ^= 0xff;
+                }
+                if relay_out_w.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+        });
+        // And the initiator's bytes back, untouched.
+        tokio::spawn(async move {
+            let _ = common::tokio::io::copy(&mut relay_out_r, &mut relay_in_w).await;
+        });
+
+        let (ir, iw) = common::tokio::io::split(init_side);
+        let (rr, rw) = common::tokio::io::split(resp_side);
+        let initiator = tokio::spawn(Protocol::new(
+            Magic::REGTEST,
+            Role::Initiator,
+            None,
+            None,
+            BufReader::new(ir),
+            iw,
+        ));
+        let responder = Protocol::new(
+            Magic::REGTEST,
+            Role::Responder,
+            None,
+            None,
+            BufReader::new(rr),
+            rw,
+        )
+        .await
+        .expect("the responder's handshake failed");
+        let initiator = initiator
+            .await
+            .expect("the initiator task panicked")
+            .expect("the initiator's handshake failed");
+
+        let (ir, _) = initiator.into_split();
+        let (_, rw) = responder.into_split();
+        (
+            TransportV2Reader::new(ir),
+            TransportV2Writer { writer: rw },
+            corrupt,
+        )
+    }
+
+    /// The v2 reader counts the frames it could only name, and goes on
+    /// reading.
+    ///
+    /// `undecodable` is on the session report, which is where an operator
+    /// learns that a peer is speaking something this tool does not parse. The
+    /// v1 reader's count is tested; the v2 reader's never was, and replacing
+    /// it with a constant survives the suite.
+    #[tokio::test]
+    async fn test_the_v2_reader_counts_what_it_could_only_name() {
+        let (mut reader, mut writer, _) = v2_pair().await;
+        assert_eq!(reader.undecodable(), 0, "nothing read yet");
+
+        // Short id 28 is addrv2, and this payload is not an addrv2: the
+        // decoder refuses it and the fallback names it.
+        writer
+            .writer
+            .write(&bip324::io::Payload::genuine(vec![28, 1, 2, 3]))
+            .await
+            .expect("writing the frame");
+        match reader.recv().await.expect("the frame was refused outright") {
+            NetworkMessage::Unknown { command, payload } => {
+                assert_eq!(command.as_ref(), "addrv2");
+                assert_eq!(payload, vec![1, 2, 3]);
+            }
+            other => panic!("expected the frame as Unknown: {other:?}"),
+        }
+        assert_eq!(reader.undecodable(), 1);
+
+        // And the session carries on: a frame it cannot parse is not a frame
+        // it cannot survive.
+        writer
+            .send(NetworkMessage::Ping(7))
+            .await
+            .expect("writing a ping");
+        assert!(matches!(
+            reader.recv().await.unwrap(),
+            NetworkMessage::Ping(7)
+        ));
+        assert_eq!(reader.undecodable(), 1, "a ping is not undecodable");
+    }
+
+    /// A v2 frame that will not decrypt is named as that.
+    ///
+    /// The one fault in this file that cannot be constructed -- the error it
+    /// carries comes from a private module of the bip324 crate -- so it is
+    /// provoked instead, by changing a byte between the two ends after the
+    /// handshake. Without the name the disconnect reads as whatever the
+    /// ordinary `ErrorKind` classification makes of it, and an operator whose
+    /// v2 path is being tampered with is told their socket broke.
+    #[tokio::test]
+    async fn test_a_v2_frame_that_will_not_decrypt_says_so() {
+        let (mut reader, mut writer, corrupt) = v2_pair().await;
+        // The handshake is done, so the next bytes across are a frame.
+        corrupt.store(true, std::sync::atomic::Ordering::SeqCst);
+        writer
+            .send(NetworkMessage::Ping(7))
+            .await
+            .expect("writing a ping");
+        // Bounded, because the failure mode next door to this one is a wait
+        // rather than an error.
+        let err = timeout(Duration::from_secs(10), reader.recv())
+            .await
+            .expect("the reader waited instead of refusing")
+            .expect_err("a corrupted frame was read as a message");
+        assert_eq!(fault_of(&err), Some(Fault::V2Decrypt), "{err:#}");
     }
 }
