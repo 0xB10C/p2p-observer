@@ -358,13 +358,13 @@ impl HeaderTree {
         pruned
     }
 
-    // Insert a single header. Returns `Ok(true)` if new, `Ok(false)` if already known.
-    // In batch mode, the caller has to take care of calling rebuild_best_chain().
-    fn insert_inner(
-        &mut self,
-        header: Header,
-        batch: bool,
-    ) -> std::result::Result<bool, HeaderError> {
+    /// Insert a single header. Returns `Ok(true)` if new, `Ok(false)` if
+    /// already known.
+    ///
+    /// Does not rebuild the best chain: both callers insert a run of headers
+    /// and rebuild once at the end, which is the only way either of them is
+    /// cheap.
+    fn insert_inner(&mut self, header: Header) -> std::result::Result<bool, HeaderError> {
         let hash = header.block_hash();
         if self.headers.contains_key(&hash) {
             return Ok(false);
@@ -428,12 +428,6 @@ impl HeaderTree {
                     "chain reorg detected"
                 );
             }
-
-            // On batch inserts, don't rebuild the bast chain here.
-            // The caller has to take care of it.
-            if !batch {
-                self.rebuild_best_chain();
-            }
         }
 
         self.dirty = true;
@@ -451,7 +445,7 @@ impl HeaderTree {
         // rejected too. The first error is the one reported: it is the one
         // that explains the rest.
         for header in headers {
-            match self.insert_inner(*header, true) {
+            match self.insert_inner(*header) {
                 Ok(true) => accepted += 1,
                 Ok(false) => {} // already known, skip
                 Err(e) => err = err.or(Some(e)),
@@ -823,7 +817,7 @@ impl HeaderTree {
                     let offset = i * HEADER_SIZE;
                     let header: Header = deserialize(&data[offset..offset + HEADER_SIZE])
                         .context("deserialize header")?;
-                    if let Err(e) = tree.insert_inner(header, true) {
+                    if let Err(e) = tree.insert_inner(header) {
                         *skipped.entry(e.to_string()).or_default() += 1;
                     }
                 }
