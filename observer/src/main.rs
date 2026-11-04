@@ -13,6 +13,7 @@ mod addresses;
 mod connection;
 mod connections;
 mod emit;
+mod fdlimit;
 mod headertree;
 mod logging;
 mod protocol;
@@ -45,6 +46,10 @@ async fn main() {
         .init();
 
     cfg.log_settings();
+
+    // Before anything opens a socket: the descriptor limit is what bounds how
+    // many peers we can hold, see [`fdlimit`].
+    fdlimit::prepare(cfg.addrman.max_dialing).expect("not enough file descriptors");
 
     // One directory per network, created up front. Every loader below reads a
     // missing file as "no state yet" and starts empty, so the directory is the
