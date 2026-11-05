@@ -28,6 +28,13 @@
         }
       );
 
+      # services.p2p-observer (the observer, the metrics and websocket
+      # tools, and the archivers)
+      nixosModules = rec {
+        p2p-observer = import ./nix/module.nix self;
+        default = p2p-observer;
+      };
+
       devShells = forAllSystems (
         system:
         let
