@@ -10,3 +10,17 @@ zstd = "0.14"
 
 [dev-dependencies]
 testsupport = { path = "../../testsupport" }
+
+# The binaries carry the project's name rather than the crate's: "archiver",
+# "replayer" and "stats" are too plain to claim in a PATH.
+[[bin]]
+name = "p2p-observer-archiver"
+path = "src/bin/archiver.rs"
+
+[[bin]]
+name = "p2p-observer-replayer"
+path = "src/bin/replayer.rs"
+
+[[bin]]
+name = "p2p-observer-stats"
+path = "src/bin/stats.rs"

@@ -8,3 +8,9 @@ common = { path = "../../common" }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# The binary carries the project's name rather than the crate's, so that it
+# does not claim a word as plain as "rpc" in a PATH.
+[[bin]]
+name = "p2p-observer-rpc"
+path = "src/main.rs"

@@ -99,7 +99,7 @@ difference between a readable archive and a truncated one.
 Archive everything on signet, rotating at 100 MB:
 
 ```
-$ cargo run --bin archiver -- \
+$ cargo run --bin p2p-observer-archiver -- \
     --network signet \
     --output-dir ./archive \
     --base-name signet \
@@ -110,7 +110,7 @@ Archive only what the address manager cares about, which is the long-running
 job the compression is there for:
 
 ```
-$ cargo run --bin archiver -- \
+$ cargo run --bin p2p-observer-archiver -- \
     --network signet \
     --output-dir ./archive \
     --address-announcements --connection-results
@@ -121,7 +121,7 @@ $ cargo run --bin archiver -- \
 ```
 Archive p2p-observer events to disk
 
-Usage: archiver [OPTIONS] --network <NETWORK> --output-dir <OUTPUT_DIR>
+Usage: p2p-observer-archiver [OPTIONS] --network <NETWORK> --output-dir <OUTPUT_DIR>
 
 Options:
   -a, --nats-url <NATS_URL>
@@ -182,7 +182,7 @@ every bit set is one row of its own rather than one count on each of sixty-four
 bits, because a few sources gossip such fields by the hundred thousand.
 
 ```bash
-$ cargo run --bin stats -- archive/mainnet.*.bin.zst --top 10
+$ cargo run --bin p2p-observer-stats -- archive/mainnet.*.bin.zst --top 10
 ```
 == coverage (mainnet)
   events                            33
@@ -250,7 +250,7 @@ $ cargo run --bin stats -- archive/mainnet.*.bin.zst --top 10
 ```
 Summarise p2p-observer archive files
 
-Usage: stats [OPTIONS] <FILE>...
+Usage: p2p-observer-stats [OPTIONS] <FILE>...
 
 Arguments:
   <FILE>...  Archive files to read, either `.bin` or `.bin.zst`. Read in the order given, as one stream
@@ -272,7 +272,7 @@ truncated archive is a normal thing to find after a crash — but the exit statu
 is non-zero if any file failed.
 
 ```bash
-$ cargo run --bin replayer -- archive/signet.20261025-120000-000.bin.zst
+$ cargo run --bin p2p-observer-replayer -- archive/signet.20261025-120000-000.bin.zst
  ```
 
 ### Example output
@@ -290,7 +290,7 @@ INFO replayer: total: 3 events
 ```
 Read and display p2p-observer archive files
 
-Usage: replayer [OPTIONS] <FILE>...
+Usage: p2p-observer-replayer [OPTIONS] <FILE>...
 
 Arguments:
   <FILE>...  Archive files to read, either `.bin` or `.bin.zst`
