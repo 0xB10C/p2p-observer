@@ -1,17 +1,35 @@
 {
-  description = "p2p-observer dev environment";
+  description = "p2p-observer: observes the Bitcoin P2P network by connecting to its peers";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs =
+    { self, nixpkgs }:
     let
-      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
     in
     {
-      devShells = forAllSystems (system:
+      packages = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in
+        rec {
+          p2p-observer = pkgs.callPackage ./nix/package.nix { };
+          default = p2p-observer;
+        }
+      );
+
+      devShells = forAllSystems (
+        system:
         let
           pkgs = import nixpkgs { inherit system; };
         in
@@ -44,6 +62,9 @@
               export NATS_SERVER_BINARY="${pkgs.nats-server}/bin/nats-server"
             '';
           };
-        });
+        }
+      );
+
+      formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixfmt-tree);
     };
 }
