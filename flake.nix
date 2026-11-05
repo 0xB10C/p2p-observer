@@ -14,7 +14,12 @@
         "x86_64-darwin"
         "aarch64-darwin"
       ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
+      linuxSystems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
+      forSystems = systems: f: nixpkgs.lib.genAttrs systems (system: f system);
+      forAllSystems = forSystems systems;
     in
     {
       packages = forAllSystems (
@@ -34,6 +39,13 @@
         p2p-observer = import ./nix/module.nix self;
         default = p2p-observer;
       };
+
+      checks = forSystems linuxSystems (system: {
+        module = import ./nix/test.nix {
+          inherit self;
+          pkgs = import nixpkgs { inherit system; };
+        };
+      });
 
       devShells = forAllSystems (
         system:
