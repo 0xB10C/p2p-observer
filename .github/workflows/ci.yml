@@ -85,6 +85,37 @@ jobs:
         name: coverage-lcov
         path: lcov.info
 
+  nix-package:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: ./.github/actions/setup-nix-action
+    # Builds the workspace in the sandbox and runs the test suite in the
+    # checkPhase, against the bitcoind and nats-server the package pins. The
+    # dev shell jobs above run the same tests; this one also proves the package
+    # itself still builds, which is what a NixOS host installs.
+    - name: Build the package
+      run: nix build .#p2p-observer --print-build-logs
+
+  nix-vm-test:
+    runs-on: ubuntu-latest
+    needs: nix-package
+    steps:
+    - uses: actions/checkout@v6
+    # The NixOS test boots two VMs, and nix only schedules such a build on a
+    # machine whose /dev/kvm it can open. The runner has the device but not the
+    # permissions, so widen them before nix starts and detects the feature.
+    - name: Allow the runner to use KVM
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+    - uses: ./.github/actions/setup-nix-action
+    # Several minutes: two VMs boot, Bitcoin Core syncs a regtest chain to the
+    # observer, and Grafana provisions every dashboard the metrics tool ships.
+    - name: Run the NixOS module test
+      run: nix build .#checks.x86_64-linux.module --print-build-logs
+
   # Ubuntu jobs
 
   ubuntu-build:
