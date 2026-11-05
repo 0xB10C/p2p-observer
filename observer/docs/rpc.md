@@ -11,7 +11,7 @@ wraps the same methods as subcommands, so the subject and the JSON payload
 need not be typed:
 
 ```bash
-$ rpc --network signet addresses inspect 1.2.3.4:38333
+$ p2p-observer-rpc --network signet addresses inspect 1.2.3.4:38333
 ```
 
 ## `addresses.info`

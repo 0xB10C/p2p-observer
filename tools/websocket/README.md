@@ -8,7 +8,7 @@ several instances.
 ```sh
 # IP -> ASN data: Bitcoin Core's asmap, optional but recommended
 curl -sSfL -o latest_asmap.dat https://raw.githubusercontent.com/bitcoin-core/asmap-data/main/latest_asmap.dat
-cargo run --release --bin websocket -- --asmap latest_asmap.dat   # websocket on 127.0.0.1:47484
+cargo run --release --bin p2p-observer-websocket -- --asmap latest_asmap.dat   # websocket on 127.0.0.1:47484
 # serve tools/websocket/www with any static file server, then open
 # http://127.0.0.1:8000/peers.html?ws=ws://127.0.0.1:47484
 ```
@@ -165,7 +165,7 @@ and a page keeps the snapshot it has until the next one.
 ```
 Forward p2p-observer events to browsers over a websocket
 
-Usage: websocket [OPTIONS]
+Usage: p2p-observer-websocket [OPTIONS]
 
 Options:
   -a, --nats-url <NATS_URL>

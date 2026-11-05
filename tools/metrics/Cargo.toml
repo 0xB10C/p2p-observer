@@ -14,3 +14,9 @@ prometheus = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 testsupport = { path = "../../testsupport" }
+
+# The binary carries the project's name rather than the crate's, so that it
+# does not claim a word as plain as "metrics" in a PATH.
+[[bin]]
+name = "p2p-observer-metrics"
+path = "src/main.rs"

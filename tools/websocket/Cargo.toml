@@ -15,3 +15,9 @@ asinfo = "0.1"
 
 [dev-dependencies]
 testsupport = { path = "../../testsupport" }
+
+# The binary carries the project's name rather than the crate's, so that it
+# does not claim a word as plain as "websocket" in a PATH.
+[[bin]]
+name = "p2p-observer-websocket"
+path = "src/main.rs"

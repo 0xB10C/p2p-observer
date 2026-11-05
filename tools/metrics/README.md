@@ -5,7 +5,7 @@ metrics tool of peer-observer: subscribe to NATS, count and sample, serve
 `/metrics` over HTTP.
 
 ```sh
-cargo run --release --bin metrics        # NATS at localhost:4222, metrics at 127.0.0.1:8282
+cargo run --release --bin p2p-observer-metrics        # NATS at localhost:4222, metrics at 127.0.0.1:8282
 curl -s 127.0.0.1:8282/metrics
 ```
 
@@ -146,7 +146,7 @@ cargo test -p metrics --test dashboards -- --nocapture
 ```
 Serve Prometheus metrics computed from p2p-observer events
 
-Usage: metrics [OPTIONS]
+Usage: p2p-observer-metrics [OPTIONS]
 
 Options:
   -a, --nats-url <NATS_URL>  The NATS server to subscribe to [default: nats://localhost:4222]

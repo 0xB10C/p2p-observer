@@ -5,7 +5,7 @@ the methods in [`observer/docs/rpc.md`](../../observer/docs/rpc.md) can be
 called without hand-writing subjects and JSON payloads.
 
 ```
-$ rpc --network signet addresses inspect 1.2.3.4:38333
+$ p2p-observer-rpc --network signet addresses inspect 1.2.3.4:38333
 {
   "addr": "1.2.3.4:38333",
   "class": "good",
@@ -18,10 +18,10 @@ repeating them:
 
 ```
 $ export P2P_OBSERVER_NETWORK=mainnet P2P_OBSERVER_NATS_URL=nats://localhost:4222
-$ rpc addresses info
-$ rpc headertree tips
-$ rpc banlist add --comment "spammy node" --net 1.2.3.4 --net 10.0.0.0/8
-$ rpc addresses due --limit 5
+$ p2p-observer-rpc addresses info
+$ p2p-observer-rpc headertree tips
+$ p2p-observer-rpc banlist add --comment "spammy node" --net 1.2.3.4 --net 10.0.0.0/8
+$ p2p-observer-rpc addresses due --limit 5
 ```
 
 Replies are pretty-printed. An `{"error": ...}` reply goes to stderr with
@@ -32,7 +32,7 @@ the same way, so a script can tell a failed call from an empty answer.
 Methods this tool does not know yet can be called directly:
 
 ```
-$ rpc call addresses.due 3
+$ p2p-observer-rpc call addresses.due 3
 ```
 
 ## Usage
@@ -40,7 +40,7 @@ $ rpc call addresses.due 3
 ```
 Call the p2p-observer RPC over NATS
 
-Usage: rpc [OPTIONS] --network <NETWORK> <COMMAND>
+Usage: p2p-observer-rpc [OPTIONS] --network <NETWORK> <COMMAND>
 
 Commands:
   addresses   The address book

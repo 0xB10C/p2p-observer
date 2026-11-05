@@ -6,3 +6,9 @@ edition = "2024"
 [dependencies]
 common = { path = "../../common" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# The binary carries the project's name rather than the crate's, so that it
+# does not claim a word as plain as "logger" in a PATH.
+[[bin]]
+name = "p2p-observer-logger"
+path = "src/main.rs"
