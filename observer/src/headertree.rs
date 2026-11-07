@@ -1313,8 +1313,13 @@ mod tests {
     }
 
     /// A reorg that crosses a retarget boundary (height 2016). Both chains share
-    /// 2010 blocks, then diverge. Both cross the retarget, exercising the
-    /// walk_back path in validate_header. Chain B (15 blocks) beats chain A (10).
+    /// 2010 blocks, then diverge. Chain B (15 blocks) beats chain A (10).
+    ///
+    /// The crossing itself is not what this holds down: regtest sets
+    /// `no_pow_retargeting`, so at height 2016 the retarget asks for the
+    /// parent's own bits and the computation is invisible from here. See
+    /// `test_retarget_bits_come_from_the_epoch_start_header` for that. What
+    /// this test is, is the deep reorg: 2035 headers, two branches, both kept.
     #[test]
     fn test_reorg_across_retarget() {
         const SHARED: u32 = 2010;
@@ -1386,6 +1391,126 @@ mod tests {
         assert_eq!(active.height, SHARED + CHAIN_B_LEN);
         assert_eq!(active.branch_len, 0);
         assert_eq!(active.status, ChainTipStatus::Active);
+    }
+
+    /// A header mined to a chosen target.
+    ///
+    /// [`mine_header`] is fixed to the regtest maximum, which is the target
+    /// every regtest header carries; the retarget test below needs a header at
+    /// the target a retarget computed, and headers at targets it did not.
+    fn mine_header_with_bits(prev: BlockHash, time: u32, seed: u8, bits: CompactTarget) -> Header {
+        use common::bitcoin::{TxMerkleNode, blockdata::block::Version, time::BlockTime};
+        let merkle_root = TxMerkleNode::from_byte_array([seed; 32]);
+        for nonce in 0..=u32::MAX {
+            let header = Header {
+                version: Version::ONE,
+                prev_blockhash: prev,
+                merkle_root,
+                time: BlockTime::from(time),
+                bits,
+                nonce,
+            };
+            if header.validate_pow(bits.into()).is_ok() {
+                return header;
+            }
+        }
+        panic!("no nonce met the target");
+    }
+
+    /// The bits a header at a retarget height must carry are computed from the
+    /// first header of its epoch, 2016 back, and from no other header.
+    ///
+    /// No mined chain can show this. Regtest sets `no_pow_retargeting`, which
+    /// makes the retarget hand back the parent's own bits, and the networks
+    /// that do retarget have targets far too hard to mine to in a test. So
+    /// this takes regtest's easy target with retargeting switched on -- the
+    /// same computation either way -- and hands the tree a 2016-header spine
+    /// directly: only the links and two of the timestamps are read, so the
+    /// spine needs no proof of work.
+    ///
+    /// The span from the epoch start to the parent is half a retarget period,
+    /// so the target halves and the expected bits differ from the parent's,
+    /// which is what makes any of this visible: with retargeting off, a
+    /// walk_back of the wrong length, the two headers passed the wrong way
+    /// round and a retarget at every height all ask for the parent's bits.
+    #[test]
+    fn test_retarget_bits_come_from_the_epoch_start_header() {
+        use common::bitcoin::{TxMerkleNode, blockdata::block::Version, time::BlockTime};
+
+        /// Half a retarget period, over which the target halves.
+        const SPAN: u32 = 7 * 24 * 60 * 60;
+
+        let mut params = regtest_params();
+        params.no_pow_retargeting = false;
+        let mut tree = HeaderTree::new(params.clone());
+
+        let epoch_start = tree.headers[&tree.tip().0].header;
+        let start_time = epoch_start.time.to_u32();
+        let bits = CompactTarget::from_consensus(0x207fffff);
+
+        // Heights 1..=2015, straight into the tree. Height 1 gets a span of
+        // its own so that the bits it would give are a third distinct value.
+        let mut spine = vec![epoch_start];
+        for height in 1..=2015u32 {
+            let time = match height {
+                1 => start_time + SPAN / 2,
+                2015 => start_time + SPAN,
+                _ => start_time + 1,
+            };
+            let mut merkle_root = [0u8; 32];
+            merkle_root[..4].copy_from_slice(&height.to_le_bytes());
+            let header = Header {
+                version: Version::ONE,
+                prev_blockhash: spine[height as usize - 1].block_hash(),
+                merkle_root: TxMerkleNode::from_byte_array(merkle_root),
+                time: BlockTime::from(time),
+                bits,
+                nonce: 0,
+            };
+            tree.headers.insert(
+                header.block_hash(),
+                HeaderEntry {
+                    header,
+                    height,
+                    chain_work: header.work(),
+                },
+            );
+            spine.push(header);
+        }
+
+        let parent = &tree.headers[&spine[2015].block_hash()];
+        assert_eq!(parent.height, 2015);
+
+        let expected =
+            CompactTarget::from_header_difficulty_adjustment(epoch_start, parent.header, &params);
+        assert_ne!(
+            expected, bits,
+            "the span has to move the target, or none of this is observable"
+        );
+
+        let time = start_time + SPAN + 1;
+        let good = mine_header_with_bits(parent.header.block_hash(), time, 1, expected);
+        assert_eq!(tree.validate_header(&good, 2016, parent), Ok(()));
+
+        // The parent's bits are what every other height asks for, and what a
+        // retarget that did not happen would ask for here.
+        let unchanged = mine_header_with_bits(parent.header.block_hash(), time, 2, bits);
+        assert_eq!(
+            tree.validate_header(&unchanged, 2016, parent),
+            Err(HeaderError::InvalidPow)
+        );
+        assert_eq!(tree.validate_header(&unchanged, 2017, parent), Ok(()));
+
+        // And the header one past the epoch start is not the epoch start: a
+        // walk_back one step short computes from this one instead.
+        let wrong_epoch =
+            CompactTarget::from_header_difficulty_adjustment(spine[1], parent.header, &params);
+        assert_ne!(wrong_epoch, expected);
+        let off_by_one = mine_header_with_bits(parent.header.block_hash(), time, 3, wrong_epoch);
+        assert_eq!(
+            tree.validate_header(&off_by_one, 2016, parent),
+            Err(HeaderError::InvalidPow)
+        );
     }
 
     #[test]
