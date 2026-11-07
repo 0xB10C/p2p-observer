@@ -746,6 +746,15 @@ mod tests {
         }
     }
 
+    /// What the mock peer claims about itself in its version message.
+    ///
+    /// Deliberately nothing the observer could produce on its own: it sends
+    /// its own `USER_AGENT` and its own height, so a handshake event asserted
+    /// against those constants would hold just as well if the emitter read
+    /// our side of the handshake instead of the peer's.
+    const PEER_USER_AGENT: &str = "/fake-peer:9.9.9/";
+    const PEER_START_HEIGHT: i32 = 1234;
+
     /// Complete the server side of the version handshake.
     async fn server_handshake(
         reader: &mut impl TransportReader,
@@ -757,7 +766,7 @@ mod tests {
             }
         }
         writer
-            .send(build_version(crate::protocol::USER_AGENT, 0))
+            .send(build_version(PEER_USER_AGENT, PEER_START_HEIGHT))
             .await
             .unwrap();
         writer.send(NetworkMessage::Verack).await.unwrap();
@@ -897,17 +906,25 @@ mod tests {
         let Some(common::events::peer_event::Event::Handshake(hs)) = event.event else {
             panic!("expected Handshake first, got: {:?}", event.event);
         };
-        assert_eq!(hs.user_agent, crate::protocol::USER_AGENT);
+        // The peer's own claims, not ours: the mock answers with a user agent
+        // and a height the observer has no other way to come by, so an
+        // emitter reading our side of the handshake would fail here.
+        assert_eq!(hs.user_agent, PEER_USER_AGENT);
+        assert_eq!(hs.start_height, PEER_START_HEIGHT);
         assert_eq!(hs.protocol_version, 70016);
 
         let event = next().await;
+        let Some(common::events::peer_event::Event::PingRtt(ping)) = event.event else {
+            panic!("expected PingRtt, got: {:?}", event.event);
+        };
+        // A measurement, and not just the variant: this is a loopback round
+        // trip inside the two seconds the reader above waits, so an rtt taken
+        // from the wrong instant -- the connect, the handshake, the epoch --
+        // lands outside that budget.
         assert!(
-            matches!(
-                event.event,
-                Some(common::events::peer_event::Event::PingRtt(_))
-            ),
-            "expected PingRtt, got: {:?}",
-            event.event,
+            ping.rtt_ms < 2_000,
+            "{} ms is not a loopback round trip",
+            ping.rtt_ms
         );
         // The server now outlives the measurement by design, so it is stopped
         // rather than waited for.
@@ -1011,12 +1028,20 @@ mod tests {
         server.abort();
     }
 
-    /// The attempt always reports back, so the manager can free the slot.
+    /// The attempt always reports back, so the manager can free the slot, and
+    /// it reports what actually happened.
+    ///
+    /// `counts_as_failure()` is no test of that: the `EndGuard` substitutes
+    /// `Failed(Reason::Other)` for an attempt that never called `finish`, so
+    /// a dropped `finish` or a `classify` that named the wrong reason both
+    /// satisfy it. The refused connect has one right answer on both sides of
+    /// the report -- the outcome the manager hears and the event the archive
+    /// keeps -- and this asks for it by name.
     #[tokio::test]
     async fn test_attempt_always_reports_an_outcome() {
         setup();
         // Nothing listening: the connection is refused immediately.
-        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
         let (handle, _g, mut life_rx, _c) = crate::addresses::channels();
         let addr = PeerAddr::Ipv4([127, 0, 0, 1], 1);
 
@@ -1033,10 +1058,26 @@ mod tests {
         match life_rx.try_recv().expect("no outcome reported") {
             crate::addresses::Lifecycle::Ended { addr: got, outcome } => {
                 assert_eq!(got, addr);
-                assert!(outcome.counts_as_failure());
+                assert_eq!(outcome, Outcome::Failed(Reason::ConnectionRefused));
             }
             other => panic!("unexpected message: {other:?}"),
         }
+
+        let event = event_rx.try_recv().expect("no event emitted");
+        let Some(common::events::peer_event::Event::ConnectionResult(result)) = event.event else {
+            panic!("expected a ConnectionResult, got: {:?}", event.event);
+        };
+        let Some(common::events::connection_result::Result::Failed(failed)) = result.result else {
+            panic!("expected Failed, got: {:?}", result.result);
+        };
+        assert_eq!(
+            failed.reason,
+            common::events::FailureReason::ConnectionRefused as i32
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "an attempt that never reached a session emits this and nothing else"
+        );
     }
 
     #[test]

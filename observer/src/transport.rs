@@ -1103,7 +1103,13 @@ mod tests {
     /// and a slice, over a length the peer chose.
     #[tokio::test]
     async fn test_v2_contents_of_any_shape_are_read_or_refused() {
+        // A name has to be UTF-8, which twelve random bytes almost never are,
+        // so a zero id over random contents is refused every time and leaves
+        // that branch unvisited. Half the inputs spell a name out after the
+        // zero: one padded with NULs, one filling the field.
+        const NAMES: [&[u8; 12]; 2] = [b"ping\0\0\0\0\0\0\0\0", b"getcfcheckpt"];
         let mut named = 0;
+        let mut spelled_out = 0;
         for seed in 0..20_000u64 {
             let mut rng = testsupport::Rng::new(seed);
             // Mostly short, because the interesting lengths are the ones around
@@ -1113,15 +1119,32 @@ mod tests {
             } else {
                 rng.below(16)
             };
-            let contents = rng.bytes(len);
+            let contents = if rng.one_in(2) {
+                let name = *rng.pick(&NAMES);
+                let mut contents = vec![0u8];
+                contents.extend_from_slice(name);
+                contents.extend_from_slice(&rng.bytes(len));
+                contents
+            } else {
+                rng.bytes(len)
+            };
 
             match v2_undecodable(&contents) {
                 Some(NetworkMessage::Unknown { command, payload }) => {
                     named += 1;
-                    // Whatever was read as a name has to be a name, and the
-                    // payload has to be bytes that were actually there.
-                    assert!(command.as_ref().len() <= 12, "seed {seed}");
-                    assert!(payload.len() <= contents.len(), "seed {seed}");
+                    // Where the payload starts is the whole of what the two
+                    // branches disagree about: a short id spends one byte on
+                    // itself and the rest is payload, a zero id spends
+                    // thirteen -- the id and the twelve-byte name behind it.
+                    // An index off by one hands up a byte of the name as
+                    // payload, or drops a byte the peer sent.
+                    let expected = if contents[0] == 0 {
+                        spelled_out += 1;
+                        contents.len() - 13
+                    } else {
+                        contents.len() - 1
+                    };
+                    assert_eq!(payload.len(), expected, "seed {seed}, {command}");
                 }
                 Some(other) => panic!("seed {seed}: expected Unknown, got {other:?}"),
                 None => {}
@@ -1131,6 +1154,11 @@ mod tests {
         assert!(
             named > 1_000,
             "only {named} of 20000 inputs produced a command name"
+        );
+        // And neither branch's arithmetic was checked by the other's inputs.
+        assert!(
+            spelled_out > 1_000 && named - spelled_out > 1_000,
+            "{spelled_out} of {named} names were spelled out after a zero id"
         );
     }
 }

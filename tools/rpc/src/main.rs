@@ -247,6 +247,7 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::clap::{CommandFactory, error::ErrorKind};
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(["rpc", "--network", "signet"].iter().chain(args)).unwrap()
@@ -266,16 +267,34 @@ mod tests {
             }
         );
         assert_eq!(
-            req(&["addresses", "add", "1.2.3.4:8333", "nonsense"]).payload,
-            r#"["1.2.3.4:8333","nonsense"]"#
+            req(&["addresses", "add", "1.2.3.4:8333", "nonsense"]),
+            Request {
+                method: "addresses.add".into(),
+                payload: r#"["1.2.3.4:8333","nonsense"]"#.into()
+            }
         );
         // A JSON string, quotes included, as the observer expects.
         assert_eq!(
-            req(&["addresses", "inspect", "1.2.3.4:38333"]).payload,
-            r#""1.2.3.4:38333""#
+            req(&["addresses", "inspect", "1.2.3.4:38333"]),
+            Request {
+                method: "addresses.inspect".into(),
+                payload: r#""1.2.3.4:38333""#.into()
+            }
         );
-        assert_eq!(req(&["addresses", "due"]).payload, "");
-        assert_eq!(req(&["addresses", "due", "--limit", "5"]).payload, "5");
+        assert_eq!(
+            req(&["addresses", "due"]),
+            Request {
+                method: "addresses.due".into(),
+                payload: String::new()
+            }
+        );
+        assert_eq!(
+            req(&["addresses", "due", "--limit", "5"]),
+            Request {
+                method: "addresses.due".into(),
+                payload: "5".into()
+            }
+        );
         assert_eq!(
             req(&["connections", "list"]),
             Request {
@@ -283,8 +302,20 @@ mod tests {
                 payload: String::new()
             }
         );
-        assert_eq!(req(&["headertree", "tips"]).method, "headertree.tips");
-        assert_eq!(req(&["banlist", "list"]).method, "banlist.list");
+        assert_eq!(
+            req(&["headertree", "tips"]),
+            Request {
+                method: "headertree.tips".into(),
+                payload: String::new()
+            }
+        );
+        assert_eq!(
+            req(&["banlist", "list"]),
+            Request {
+                method: "banlist.list".into(),
+                payload: String::new()
+            }
+        );
     }
 
     #[test]
@@ -348,6 +379,14 @@ mod tests {
 
     #[test]
     fn test_network_is_required() {
-        assert!(Cli::try_parse_from(["rpc", "addresses", "info"]).is_err());
+        // The env source is dropped for this parse: with it in place an
+        // exported P2P_OBSERVER_NETWORK -- which the README tells operators
+        // to set -- satisfies the argument and the test fails on a shell it
+        // has nothing to say about.
+        let err = Cli::command()
+            .mut_arg("network", |a| a.env(None::<&str>))
+            .try_get_matches_from(["rpc", "addresses", "info"])
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
     }
 }

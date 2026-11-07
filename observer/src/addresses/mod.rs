@@ -843,10 +843,11 @@ mod tests {
         let entries = book.iter().map(|(k, e)| (*k, e.clone())).collect();
         book.restore(entries);
         assert_eq!(book.stats().dialing, 0);
-        assert!(!book.iter().any(|(k, _)| {
-            let _ = k;
-            false
-        }));
+        // Only the in-flight marker is dropped: the entry itself comes back
+        // whole, including the attempt recorded before the restart.
+        let restored = book.entry(&addr).expect("restored entry missing");
+        assert_eq!(restored.last_attempt, NOW);
+        assert_eq!(restored.last_announced, NOW);
         assert_eq!(book.len(), 1);
     }
 

@@ -235,19 +235,50 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_prepare_raises_the_soft_limit_to_the_hard_one() {
-        let (_, hard_before) = current().expect("the kernel reports RLIMIT_NOFILE");
+        let (soft, hard) = current().expect("the kernel reports RLIMIT_NOFILE");
+        // Make the precondition rather than inherit it. Where the soft limit
+        // is already the hard one -- this dev shell, and any systemd unit
+        // whose LimitNOFILE= sets both -- `plan` returns `Keep`, `raise` is
+        // never called, and every assertion below holds before `prepare` is
+        // even entered. Lowering our own soft limit first, with the module's
+        // own `raise`, is the one way to leave the raise somewhere to go.
+        if soft == hard {
+            let lowered = floor(200).max(soft / 2);
+            assert!(
+                lowered < hard,
+                "a host whose whole limit is {hard} cannot show a raise"
+            );
+            raise(lowered, hard).expect("lowering our own soft limit");
+        }
+
+        let (soft_before, hard_before) = current().expect("the kernel reports RLIMIT_NOFILE");
+        assert!(
+            soft_before < hard_before,
+            "the raise has nowhere to go, so nothing below is a test of it"
+        );
         prepare(200).expect("200 dials plus a reserve fits in any usable limit");
 
         let (soft, hard) = current().expect("the kernel reports RLIMIT_NOFILE");
         assert_eq!(hard, hard_before, "the hard limit is not ours to move");
-        assert_eq!(
-            soft, hard,
-            "the soft limit should have been raised to the hard one"
-        );
+        // What `prepare` promises: it returned Ok, so the limit it left us
+        // covers the dials, and it never went down to get there.
         assert!(
             soft >= floor(200),
             "{soft} descriptors is under the {} needed",
             floor(200)
+        );
+        assert!(
+            soft >= soft_before,
+            "{soft} descriptors is fewer than the {soft_before} we started with"
+        );
+        // A refused raise is tolerated on purpose -- macOS refuses one to an
+        // unlimited hard limit and a sandbox may refuse one outright, and
+        // `prepare` warns and carries on -- so the equality is asserted only
+        // where the kernel is expected to grant it.
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            soft, hard,
+            "the soft limit should have been raised to the hard one"
         );
     }
 
@@ -267,11 +298,23 @@ mod tests {
             // other branch's job.
             return;
         }
-        let too_many = usize::try_from(hard).unwrap_or(usize::MAX);
+        // One more dial than the hard limit has descriptors, rather than
+        // exactly as many: with the two numbers equal, the message contains
+        // the limit twice -- once as the limit it found and once as the
+        // argument echoed back -- and deleting the former leaves the
+        // assertion below passing on the latter.
+        let too_many = usize::try_from(hard)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let needed = floor(too_many as u64);
         let err = prepare(too_many).expect_err("more dials than descriptors");
         assert!(
             err.contains(&hard.to_string()),
-            "{err}: the message should name the limit it found"
+            "{err}: the message should name the {hard} descriptors it found"
+        );
+        assert!(
+            err.contains(&needed.to_string()),
+            "{err}: the message should name the {needed} descriptors needed"
         );
         assert!(
             err.contains("max_dialing") || err.contains("needed"),

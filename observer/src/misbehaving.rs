@@ -244,6 +244,24 @@ impl Observed {
         .expect("the session was not reported finished in time")
     }
 
+    /// The session report if there already is one, without waiting for it.
+    ///
+    /// For a test holding a paused clock short of a deadline, where
+    /// [`Observed::disconnected`] cannot be used: a paused runtime with
+    /// nothing runnable jumps to the next timer, so waiting on the channel is
+    /// how such a test would hand the session the deadline it is holding it
+    /// short of.
+    fn reported_so_far(&mut self) -> Option<Disconnected> {
+        while let Ok(event) = self.events.try_recv() {
+            if let Some(peer_event::Event::ConnectionResult(res)) = event.event
+                && let Some(connection_result::Result::Disconnected(d)) = res.result
+            {
+                return Some(d);
+            }
+        }
+        None
+    }
+
     /// Waits for the attempt task to finish, so a test can tell "the session
     /// ended" from "the session is still sitting there".
     async fn ended(self) {
@@ -587,9 +605,18 @@ async fn test_a_peer_cannot_announce_addresses_faster_than_the_bucket() {
 /// out: the wiring from the ping timer, through the deadline check, to the
 /// reason that reaches an operator is otherwise untestable, and the parts on
 /// either side of it being tested does not test the join.
+///
+/// Moved in steps, not in one jump. A single advance past the deadline proves
+/// only that a session that has been quiet for long enough ends: the check
+/// could fire on any tick with a ping outstanding and the test would see the
+/// same reason. The deadline itself is what the steps hold down -- a tick a
+/// second short of it ends nothing, the next tick past it ends the session.
 #[tokio::test]
 async fn test_a_peer_that_stops_answering_pings_is_hung_up_on() {
-    let (peer, mut observed) = meet(1, |_| {}).await;
+    // The session's own interval, set here because the steps below are
+    // measured in ticks: the deadline is only ever checked when one fires.
+    const PING_EVERY: Duration = Duration::from_secs(120);
+    let (peer, mut observed) = meet(1, |cfg| cfg.ping_interval = PING_EVERY).await;
 
     // Reads everything and answers nothing. The connection stays open and
     // every byte is acknowledged, so nothing at the TCP level will notice:
@@ -610,18 +637,38 @@ async fn test_a_peer_that_stops_answering_pings_is_hung_up_on() {
     // that expected a reply in between gets a session that has already timed
     // out instead.
     tokio::time::pause();
-    // Two ping intervals past the deadline: one tick to send a ping, and the
-    // deadline cannot pass until one is outstanding.
-    tokio::time::advance(crate::protocol::PING_TIMEOUT + Duration::from_secs(300)).await;
+
+    // One tick, which sends a ping: nothing is owed before that, so the
+    // deadline cannot pass however long the peer has been quiet.
+    tokio::time::advance(PING_EVERY).await;
+
+    // A second short of the deadline, counted from the handshake, which is
+    // the last thing the peer answered. Read without waiting, for the reason
+    // in the comment above: waiting is how this test would hand the session
+    // the deadline it is holding it short of.
+    tokio::time::advance(crate::protocol::PING_TIMEOUT - PING_EVERY - Duration::from_secs(1)).await;
+    // Yields instead, which lets the session run everything it already can --
+    // including ending, if it ended -- and leaves the clock where it was put.
+    // One is enough for a session that timed out here to have reported it; a
+    // handful costs nothing and does not assume how many polls that takes.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        observed.reported_so_far().is_none(),
+        "the session was reported finished a second short of the deadline"
+    );
+    assert!(
+        !observed.task.is_finished(),
+        "the session ended a second short of the deadline"
+    );
+
+    // And past it, on the tick that crosses it.
+    tokio::time::advance(2 * PING_EVERY).await;
     tokio::time::resume();
 
     let end = observed.disconnected().await;
     assert_eq!(reason(&end), DisconnectReason::PingTimeout);
-    assert!(
-        end.uptime_ms >= crate::protocol::PING_TIMEOUT.as_millis() as u64,
-        "the session was reported shorter than the deadline it hit: {}ms",
-        end.uptime_ms
-    );
     observed.ended().await;
     ignoring.abort();
 }

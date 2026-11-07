@@ -934,13 +934,64 @@ mod tests {
     /// them -- which is how the handshake line came to overflow a subtraction
     /// on a version message carrying `i64::MIN`. One case of that was found by
     /// reading; this is the shape of test that finds the next one.
+    ///
+    /// Overflow is a panic only in a debug profile, so the line is also held
+    /// to its shape: whatever the fields were, it names the connection, says
+    /// which kind of event this is, and ends with when it happened.
     #[test]
     fn test_every_field_at_an_edge_still_renders() {
         for seed in 0..20_000u64 {
             let mut rng = Rng::new(seed);
             let event = edge_event(&mut rng);
             let line = event_line(&event);
-            assert!(!line.is_empty(), "seed {seed} rendered nothing");
+            match &event.event {
+                // Nothing to render but the envelope.
+                None => assert!(
+                    line.starts_with("unknown event from "),
+                    "seed {seed} rendered {line:?}"
+                ),
+                Some(inner) => {
+                    // The key that says which kind of event this is. Each one
+                    // is unique to the arm that prints it, so a line rendered
+                    // by the wrong arm does not carry it.
+                    let kind_key = match inner {
+                        peer_event::Event::Handshake(_) => " skew=",
+                        peer_event::Event::PingRtt(_) => " rtt=",
+                        peer_event::Event::BlockAnnouncement(_) => " type=",
+                        peer_event::Event::CompactBlockProbe(_) => " probe=",
+                        peer_event::Event::FeeFilter(_) => " feefilter=",
+                        peer_event::Event::SendCmpct(_) => " sendcmpct hb=",
+                        peer_event::Event::AddressAnnouncement(_) => " addresses=",
+                        peer_event::Event::ConnectionResult(_) => " result=",
+                    };
+                    assert!(
+                        line.starts_with(&format!("conn={} peer=", event.connection_id)),
+                        "seed {seed} rendered {line:?}"
+                    );
+                    assert!(
+                        line.contains(kind_key),
+                        "seed {seed} rendered no {kind_key:?} in {line:?}"
+                    );
+                    // When it happened closes the line, unless something was
+                    // lost -- then the count does.
+                    let ts = format!(" ts={}", event.timestamp_ms);
+                    if event.dropped_events == 0 {
+                        assert!(line.ends_with(&ts), "seed {seed} rendered {line:?}");
+                    } else {
+                        assert!(line.contains(&ts), "seed {seed} rendered {line:?}");
+                    }
+                }
+            }
+            // The loss count rides on every kind of line, and on no line that
+            // lost nothing.
+            if event.dropped_events > 0 {
+                assert!(
+                    line.contains(&format!(" dropped={}", event.dropped_events)),
+                    "seed {seed} rendered {line:?}"
+                );
+            } else {
+                assert!(!line.contains(" dropped="), "seed {seed} rendered {line:?}");
+            }
         }
     }
 
@@ -969,24 +1020,52 @@ mod tests {
     ///
     /// Most are refused by the decoder; protobuf is permissive enough that
     /// plenty are not, and those carry whatever the encoding allowed.
+    ///
+    /// Pure noise that decodes is almost always the empty message, which says
+    /// nothing about the branches that render an actual event. So half of
+    /// these start as a real encoding with a few bits flipped: a mutation
+    /// mostly still decodes, and what comes back has a kind.
     #[test]
     fn test_arbitrary_bytes_that_decode_as_an_event_render() {
-        let mut rng = Rng::new(99);
-        let mut decoded = 0;
-        for _ in 0..20_000 {
-            let len = rng.below(64);
-            let bytes = rng.bytes(len);
-            if let Ok(event) = PeerEvent::decode(&bytes[..]) {
-                decoded += 1;
-                assert!(!event_line(&event).is_empty());
+        let mut with_event = 0;
+        for seed in 0..20_000u64 {
+            let mut rng = Rng::new(seed);
+            let bytes = if rng.one_in(2) {
+                let len = rng.below(64);
+                rng.bytes(len)
+            } else {
+                let mut bytes = edge_event(&mut rng).encode_to_vec();
+                if !bytes.is_empty() {
+                    for _ in 0..=rng.below(3) {
+                        let at = rng.below(bytes.len());
+                        bytes[at] ^= 1 << rng.below(8);
+                    }
+                }
+                bytes
+            };
+            let Ok(event) = PeerEvent::decode(&bytes[..]) else {
+                continue;
+            };
+            let line = event_line(&event);
+            if event.event.is_some() {
+                with_event += 1;
+                assert!(
+                    line.starts_with(&format!("conn={} peer=", event.connection_id)),
+                    "seed {seed} rendered {line:?}"
+                );
+            } else {
+                assert!(
+                    line.starts_with("unknown event from "),
+                    "seed {seed} rendered {line:?}"
+                );
             }
         }
-        // Or the assertion above is about nothing. Most random bytes are not a
-        // protobuf message; a couple of hundred that are is plenty to be
-        // rendering something.
+        // Or the assertions above are about the empty message, whose envelope
+        // line is already pinned above. What this test is for is a kind of
+        // event assembled by something other than the observer.
         assert!(
-            decoded > 200,
-            "only {decoded} of 20000 inputs decoded as an event"
+            with_event > 2_000,
+            "only {with_event} of 20000 inputs decoded as an event with a kind"
         );
     }
 }
