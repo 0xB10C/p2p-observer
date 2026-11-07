@@ -92,6 +92,10 @@ $ nats request p2p-observer.signet.rpc.connections.list ''
 Chain tips from the header tree — headers not referenced as a parent by
 another header.
 
+The active tip comes first, whatever its height, then the rest by descending
+height with the hash breaking a tie, so the same tree always answers in the
+same order.
+
 ```bash
 $ nats request p2p-observer.signet.rpc.headertree.tips ''
 [{"branch_len":0,"hash":"000000c0c4c4c8b73438f8a36966a6fbc7b12198c80c89d8e5fb7d1f7f737427","height":225381,"status":"active"}]
