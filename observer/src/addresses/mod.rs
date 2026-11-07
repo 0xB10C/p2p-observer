@@ -316,14 +316,19 @@ impl<D: Dialer> Manager<D> {
     /// Consider new dials. Called once a second.
     fn tick(&mut self, now: u32) -> usize {
         // Never exceed the in-flight ceiling, however generous the per-tick
-        // rate is: each dial holds a socket and a task.
+        // rate is: each dial holds a socket and a task. The room goes to the
+        // pick as a hard cap, because the two claims that are outside the
+        // rate -- manual addresses and reconnects -- are not outside the
+        // ceiling.
         let room = self
             .cfg
             .max_dialing
             .saturating_sub(self.book.dialing_count());
         let budget = self.cfg.dials_per_tick.min(room);
 
-        let picks = self.book.pick(now, budget, &self.cfg.nets, &self.banlist);
+        let picks = self
+            .book
+            .pick(now, budget, room, &self.cfg.nets, &self.banlist);
         for dial in &picks {
             self.dialer.dial(*dial);
         }
@@ -564,8 +569,38 @@ mod tests {
     fn test_in_flight_ceiling_is_respected() {
         let dialer = RecordingDialer::default();
         let (mut m, _dir) = manager("ceiling", dialer.clone());
-        m.cfg.max_dialing = 12;
 
+        // Thirty peers we have connected to once, so they are due reconnects
+        // a minute later: the claim that is outside the per-tick dial budget.
+        m.cfg.dials_per_tick = 30;
+        let goods: Vec<Gossiped> = (100..130).map(gossiped).collect();
+        assert_eq!(m.ingest(NOW, &goods), 30);
+        assert_eq!(m.tick(NOW), 30);
+        for g in &goods {
+            m.apply(
+                Lifecycle::Connected {
+                    addr: g.addr,
+                    services: 0,
+                    transport_version: 2,
+                },
+                NOW,
+            );
+            m.apply(
+                Lifecycle::Ended {
+                    addr: g.addr,
+                    outcome: Outcome::Disconnected {
+                        uptime_secs: 3600,
+                        silent: false,
+                    },
+                },
+                NOW,
+            );
+        }
+        assert_eq!(m.book.dialing_count(), 0);
+        assert_eq!(dialer.taken().len(), 30);
+
+        m.cfg.dials_per_tick = 10;
+        m.cfg.max_dialing = 12;
         let addrs: Vec<Gossiped> = (0..100).map(gossiped).collect();
         m.ingest(NOW, &addrs);
 
@@ -575,9 +610,20 @@ mod tests {
         assert_eq!(m.tick(NOW), 2);
         assert_eq!(m.tick(NOW), 0);
         assert_eq!(m.book.dialing_count(), 12);
-
-        // As attempts finish, room opens up again.
         let first = dialer.taken();
+        assert_eq!(first.len(), 12);
+
+        // A minute on, an operator address and thirty reconnects are due as
+        // well. Neither is taken out of the per-tick rate, but both cost a
+        // socket and a task, so at the ceiling nothing starts at all.
+        const DUE: u32 = NOW + 60;
+        m.add_manual(NOW, &[PeerAddr::parse("9.9.9.9:8333").unwrap()]);
+        assert_eq!(m.tick(DUE), 0);
+        assert_eq!(m.tick(DUE), 0);
+        assert_eq!(m.book.dialing_count(), 12);
+        assert!(dialer.taken().is_empty());
+
+        // As attempts finish, room opens up again -- and no more than that.
         for dial in first.iter().take(5) {
             m.apply(
                 Lifecycle::Ended {
@@ -588,7 +634,8 @@ mod tests {
             );
         }
         assert_eq!(m.book.dialing_count(), 7);
-        assert_eq!(m.tick(NOW + 60), 5);
+        assert_eq!(m.tick(DUE), 5);
+        assert_eq!(m.book.dialing_count(), 12);
     }
 
     #[test]
