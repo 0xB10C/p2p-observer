@@ -2585,4 +2585,42 @@ mod tests {
         // nothing, which is the answer that costs nothing to give.
         assert!(tree.get_headers_from_locator(&[tip], zero).is_empty());
     }
+
+    /// The two-thousand-header cap on an answer, from both sides of it.
+    ///
+    /// The fuzz above asserts the cap but cannot reach it: its tree is a
+    /// hundred and twenty headers deep, so the length of the chain decides
+    /// every answer and the cap could be any number at all. These two chains
+    /// sit either side of it, and a chain one header short of the cap is the
+    /// case that tells a cap from an off-by-one.
+    #[test]
+    fn test_an_answer_stops_at_two_thousand_headers() {
+        let zero = BlockHash::from_byte_array([0; 32]);
+        let genesis = regtest_tree().tip().0;
+
+        // Past the cap: the answer stops at height 2000 and the rest of the
+        // chain waits for the getheaders this one's last hash will prompt.
+        let mut tree = regtest_tree();
+        let chain = mine_chain(genesis, 2010, 0);
+        let (accepted, err) = tree.insert_batch(&chain);
+        assert_eq!(accepted, 2010);
+        assert!(err.is_none());
+
+        let answer = tree.get_headers_from_locator(&[genesis], zero);
+        assert_eq!(answer.len(), 2000);
+        let last = answer.last().unwrap().block_hash();
+        assert_eq!(tree.height_of(&last), Some(2000));
+        assert_eq!(last, chain[1999].block_hash());
+
+        // One short of it: the whole chain, and nothing past the tip.
+        let mut short = regtest_tree();
+        let short_chain = mine_chain(genesis, 1999, 1);
+        let (accepted, err) = short.insert_batch(&short_chain);
+        assert_eq!(accepted, 1999);
+        assert!(err.is_none());
+
+        let answer = short.get_headers_from_locator(&[genesis], zero);
+        assert_eq!(answer.len(), 1999);
+        assert_eq!(answer.last().unwrap().block_hash(), short.tip().0);
+    }
 }
