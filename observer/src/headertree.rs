@@ -532,6 +532,8 @@ impl HeaderTree {
                 parent.header,
                 &self.params,
             )
+        } else if self.params.allow_min_difficulty_blocks && !self.params.no_pow_retargeting {
+            self.min_difficulty_bits(header, parent)
         } else {
             parent.header.bits
         };
@@ -541,6 +543,41 @@ impl HeaderTree {
             .map_err(|_| HeaderError::InvalidPow)?;
 
         Ok(())
+    }
+
+    /// The bits a header outside a retarget boundary must carry on a network
+    /// that allows minimum-difficulty blocks.
+    ///
+    /// Bitcoin Core's testnet rule, from `GetNextWorkRequired`: a block more
+    /// than two block intervals after its parent is mined at the
+    /// proof-of-work limit, and one inside that gap is mined at the target
+    /// its epoch asks for -- which is not its parent's bits when the parent
+    /// is one of those minimum-difficulty blocks, so those are walked back
+    /// past to the last block the epoch's own target was asked of.
+    ///
+    /// A network that never retargets is not asked: its genesis is at the
+    /// limit and so, by this same rule, is every block after it, which makes
+    /// both answers the parent's bits and the walk a thousand lookups per
+    /// header on regtest.
+    fn min_difficulty_bits(&self, header: &Header, parent: &HeaderEntry) -> CompactTarget {
+        let limit = self.params.max_attainable_target.to_compact_lossy();
+        let gap =
+            u64::from(header.time.to_u32()).saturating_sub(u64::from(parent.header.time.to_u32()));
+        if gap > 2 * self.params.pow_target_spacing {
+            return limit;
+        }
+        // Stops at the epoch's first block, as Core's walk does: below that
+        // is another epoch's difficulty. A tree pruned below a checkpoint can
+        // run out of ancestors first, and then the lowest header it holds is
+        // the best it can say.
+        let mut entry = parent;
+        while !entry.height.is_multiple_of(2016) && entry.header.bits == limit {
+            match self.headers.get(&entry.header.prev_blockhash) {
+                Some(prev) => entry = prev,
+                None => break,
+            }
+        }
+        entry.header.bits
     }
 
     /// Walk back `steps` blocks from `start_hash` via prev_blockhash.
@@ -1663,6 +1700,176 @@ mod tests {
         )));
         let (_, err) = testnet.insert_batch(&[orphan(0x1e00_ffff, 2)]);
         assert_eq!(err, Some(HeaderError::OrphanHeader));
+    }
+
+    /// Testnet lets a block be mined at the minimum difficulty when it comes
+    /// more than two block intervals after its parent, and asks for the
+    /// epoch's own target again from the block after such a run. Without
+    /// either half the tree stalls at the first minimum-difficulty block and
+    /// every peer serving the honest chain reads as a peer on another one.
+    ///
+    /// Real testnet4 headers, 59884 to 59891: the chain sits at its epoch's
+    /// target, spends six blocks at the minimum, and returns to the epoch's
+    /// target. Real ones because the proof of work is the point -- no
+    /// fabricated header meets either target.
+    #[test]
+    fn test_testnet_takes_a_run_of_min_difficulty_blocks() {
+        use common::bitcoin::{
+            Network,
+            consensus::encode::deserialize_hex,
+            network::{Params, TestnetVersion},
+        };
+
+        const RUN: [&str; 8] = [
+            "0000c020656000367343a7984944f15099bca780d0e57dbc5ac7936c5a702aa1000000007859bf13056b9aece911ffeb1c89bf00edd7d99fcf19035fa53084375523808f06416b6770fe1e19b4af1674",
+            "0000002008678b4a06b24acd1c28fabcef19f712001c690b76618bfd0500000000000000a4488afbe2878c26f735318f1d8c561d1c649cdf8e01c9a5edbe781feefa1ebbb7456b67ffff001d39ba54d2",
+            "00000020b08b348f28807681e0483ae90f9a36f121e2169714fd7fae64c1207900000000da4371cd7cd8536b39f141f8ab7bd3ca36d2e34abdadda51f8bd83fdd65aa516684a6b67ffff001d4655128e",
+            "00000020ff7cebb7d0ad47cb8a9581f5eca005e5a83ff2ffed6219601ea83219000000002ca530855eaf364ea38d67579e6ead8193c95b60ef4b89ebf88a3f1ea8141d73194f6b67ffff001d2aa81958",
+            "00000020dcb7229c29ebbdb99cb24d59cf73eb1c121238b3b854769302ffbcd500000000846a10b1158106f5a7cab174fb13569676fee9ece4f8352b92a5c4ec0acb9edcca536b67ffff001d98b08466",
+            "00000020c1fab3e0e68be5022400824c789fd4e88bb0314a60354b6cd2600f6a00000000a3cf8e33b5f067c8d8dc7296336c0c4bef8ce4f552dcebf335b24be75da5b6c87b586b67ffff001d338cbdad",
+            "0000002001a9faf9f7227c14164f710498a899485b013c46c69ead783ecc316b00000000b4d4ba7e2448f404e38f69d4c2ef307a84c42ceb81a18517dd23a33e72acb0e42c5d6b67ffff001d8fd6be84",
+            "00000020cadaff8a778c02ee95241748f685042f66bfc2936e2742ac447ab5c900000000132e32ec23dbf298df2ae4952803560faab9288e32fef6d3cf94c5053882e1e8694a6b6770fe1e1989ef54cb",
+        ];
+        let headers = RUN.map(|hex| deserialize_hex::<Header>(hex).expect("a testnet4 header"));
+
+        // What makes this run the one to test is the shape of the real data.
+        let epoch_bits = CompactTarget::from_consensus(0x191e_fe70);
+        let minimum = CompactTarget::from_consensus(0x1d00_ffff);
+        assert_eq!(headers[0].bits, epoch_bits);
+        assert_eq!(headers[1].bits, minimum, "the first block at the minimum");
+        assert!(
+            headers[1].time.to_u32() > headers[0].time.to_u32() + 2 * 600,
+            "more than two block intervals after its parent"
+        );
+        assert_eq!(headers[7].bits, epoch_bits, "the epoch's target again");
+
+        let mut tree = HeaderTree::new(Params::new(Network::Testnet(TestnetVersion::V4)));
+        // The run's parent, put straight into the tree: nothing below it is
+        // needed, and the heights these blocks really have do not matter to
+        // the rule -- none of them is a retarget boundary either way -- while
+        // height 0 is what keeps the walk from the tip to the root short.
+        let parent = headers[0];
+        tree.headers.insert(
+            parent.block_hash(),
+            HeaderEntry {
+                header: parent,
+                height: 0,
+                chain_work: parent.work(),
+            },
+        );
+
+        let (accepted, err) = tree.insert_batch(&headers[1..]);
+        assert_eq!((accepted, err), (7, None));
+        assert_eq!(tree.tip(), (headers[7].block_hash(), 7));
+    }
+
+    /// The rule at its boundary, which no header the chain really holds can
+    /// show: a block inside the two intervals owes its epoch's target, and a
+    /// block at the epoch's own first height is already that target.
+    ///
+    /// This asks the tree what bits it demands rather than offering it
+    /// headers, because the headers that would settle it -- a minimum
+    /// difficulty inside the gap -- are the ones consensus forbids, so none
+    /// exists to be found and none can be mined at a testnet target.
+    #[test]
+    fn test_the_min_difficulty_allowance_is_the_two_interval_gap() {
+        use common::bitcoin::{
+            Network, TxMerkleNode,
+            blockdata::block::Version,
+            network::{Params, TestnetVersion},
+            time::BlockTime,
+        };
+
+        const EPOCH: u32 = 0x191e_fe70;
+        const MINIMUM: u32 = 0x1d00_ffff;
+        const T: u32 = 1_735_000_000;
+        let header = |prev: BlockHash, time: u32, bits: u32| Header {
+            version: Version::ONE,
+            prev_blockhash: prev,
+            merkle_root: TxMerkleNode::from_byte_array([7; 32]),
+            time: BlockTime::from(time),
+            bits: CompactTarget::from_consensus(bits),
+            nonce: 0,
+        };
+        let plant = |tree: &mut HeaderTree, h: Header, height: u32| {
+            tree.headers.insert(
+                h.block_hash(),
+                HeaderEntry {
+                    header: h,
+                    height,
+                    chain_work: h.work(),
+                },
+            );
+        };
+        let epoch = CompactTarget::from_consensus(EPOCH);
+        let minimum = CompactTarget::from_consensus(MINIMUM);
+
+        // Both testnets carry the same rule.
+        for version in [TestnetVersion::V3, TestnetVersion::V4] {
+            let mut tree = HeaderTree::new(Params::new(Network::Testnet(version)));
+            let start = header(BlockHash::from_byte_array([1; 32]), T, EPOCH);
+            plant(&mut tree, start, 1);
+
+            let early = header(start.block_hash(), T + 19 * 60, MINIMUM);
+            let late = header(start.block_hash(), T + 21 * 60, MINIMUM);
+            let parent = &tree.headers[&start.block_hash()];
+            assert_eq!(tree.min_difficulty_bits(&early, parent), epoch, "19 min");
+            assert_eq!(tree.min_difficulty_bits(&late, parent), minimum, "21 min");
+
+            // After a block at the minimum, a block inside the gap owes the
+            // target the epoch asked for, which is behind that block.
+            plant(&mut tree, late, 2);
+            let after = header(late.block_hash(), T + 22 * 60, MINIMUM);
+            let parent = &tree.headers[&late.block_hash()];
+            assert_eq!(tree.min_difficulty_bits(&after, parent), epoch, "after");
+
+            // The walk stops at the epoch's first block: a minimum there is
+            // what that epoch retargeted to, not an exception to look past.
+            let below = header(BlockHash::from_byte_array([2; 32]), T, EPOCH);
+            plant(&mut tree, below, 2015);
+            let boundary = header(below.block_hash(), T, MINIMUM);
+            plant(&mut tree, boundary, 2016);
+            let child = header(boundary.block_hash(), T + 60, MINIMUM);
+            let parent = &tree.headers[&boundary.block_hash()];
+            assert_eq!(tree.min_difficulty_bits(&child, parent), minimum, "epoch");
+        }
+    }
+
+    /// A network that does not allow the minimum asks for the parent's bits
+    /// however long the gap, and one whose difficulty never moves is as it
+    /// was.
+    #[test]
+    fn test_the_min_difficulty_allowance_is_only_for_the_networks_with_it() {
+        use common::bitcoin::{Network, consensus::encode::deserialize_hex, network::Params};
+
+        // Mainnet 699964 and 699965, an hour and four minutes apart at the
+        // same target. Under testnet's rule the second would be owed the
+        // minimum and refused.
+        const PAIR: [&str; 2] = [
+            "04e0ff279ab141045df114034794b86fb7af9e79963d488bc3c0070000000000000000007fe412d164a38e785d91d8cede49556b28e9dc3492bb1421350e1c75be48f681c5e33b61e4480f1729a7d11c",
+            "040040205c862ef4073b311a4c56713140985eb0afeb9bd96838090000000000000000007be74967ae28de450dbfb4cb4c7a70fa962b9528499370628c9b6e4fb53f3ddae6f23b61e4480f1794bb88b4",
+        ];
+        let pair = PAIR.map(|hex| deserialize_hex::<Header>(hex).expect("a mainnet header"));
+        assert!(pair[1].time.to_u32() > pair[0].time.to_u32() + 2 * 600);
+
+        let mut tree = HeaderTree::new(Params::new(Network::Bitcoin));
+        let parent = pair[0];
+        tree.headers.insert(
+            parent.block_hash(),
+            HeaderEntry {
+                header: parent,
+                height: 0,
+                chain_work: parent.work(),
+            },
+        );
+        assert_eq!(tree.insert_batch(&pair[1..]), (1, None));
+
+        // Regtest allows the minimum and is at it already, so a header two
+        // hours after its parent is still asked for the parent's bits.
+        let mut tree = regtest_tree();
+        let genesis = tree.tip().0;
+        let late = mine_header(genesis, 1296688602 + 2 * 3600, 1);
+        assert_eq!(tree.insert_batch(&[late]), (1, None));
     }
 
     /// A header built on a rejected one is rejected for the same reason, not

@@ -48,11 +48,9 @@ impl Harness {
         tokio::spawn(async move {
             run(args, shutdown_rx, Some(bound_tx)).await.unwrap();
         });
+        // The address arrives once the subscription exists, so a publish
+        // from here on cannot be lost.
         let addr = timeout(WAIT, bound_rx).await.unwrap().unwrap();
-        // The subscription is made after the listener is bound; a publish
-        // before it exists is lost, and the protocol has no reply to wait
-        // for.
-        tokio::time::sleep(Duration::from_millis(300)).await;
         Some(Harness {
             _nats: nats,
             publisher,

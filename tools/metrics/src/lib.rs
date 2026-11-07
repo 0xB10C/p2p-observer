@@ -180,7 +180,8 @@ impl State {
 }
 
 /// Runs the tool until `shutdown` turns true. `bound_addr` receives the
-/// address the HTTP server listens on, for tests that bind port 0.
+/// address the HTTP server listens on, for tests that bind port 0, once the
+/// tool is ready: the listener is up and the event subscription exists.
 pub async fn run(
     args: Args,
     mut shutdown: watch::Receiver<bool>,
@@ -196,9 +197,6 @@ pub async fn run(
         .with_context(|| format!("listening on {}", args.listen))?;
     let addr = listener.local_addr().context("reading the bound address")?;
     tracing::info!(target: TARGET, %addr, "serving metrics at /metrics");
-    if let Some(tx) = bound_addr {
-        let _ = tx.send(addr);
-    }
     let server = tokio::spawn(server::serve(listener, metrics.registry.clone()));
 
     let nats = async_nats::connect(&args.nats_url)
@@ -211,6 +209,11 @@ pub async fn run(
         .with_context(|| format!("subscribing to {subject}"))?;
     nats.flush().await.context("flushing the subscription")?;
     tracing::info!(target: TARGET, url = %args.nats_url, subject, "connected to NATS");
+    // Core NATS has no replay, so a publish that lands before the
+    // subscription exists is lost: the address only goes out once it does.
+    if let Some(tx) = bound_addr {
+        let _ = tx.send(addr);
+    }
 
     let mut state = State::default();
     let result = loop {
@@ -335,9 +338,6 @@ fn observe_pipeline(
         .observer_dropped_events
         .with_label_values(&[network])
         .set(event.dropped_events as i64);
-    if let Some(by_kind) = &event.dropped_by_kind {
-        observe_dropped_by_kind(network, by_kind, metrics);
-    }
 
     let net = state.network(network);
     match net.instance {
@@ -353,6 +353,12 @@ fn observe_pipeline(
         _ => {}
     }
     net.instance = Some(event.instance_id);
+
+    // After the restart reset, so the first event of a new run keeps the
+    // drops it reports instead of having them zeroed.
+    if let Some(by_kind) = &event.dropped_by_kind {
+        observe_dropped_by_kind(network, by_kind, metrics);
+    }
 }
 
 fn observe_dropped_by_kind(network: &str, dropped: &DroppedEvents, metrics: &Metrics) {
@@ -1255,6 +1261,7 @@ mod tests {
             addresses: vec![
                 gossip("9.9.9.9:8333", 1, 900),
                 gossip("[2001:db8::1]:8333", 1 | 8, 1000),
+                gossip("cjdns:[fc00::1]:8333", 1, 1000),
                 gossip(&format!("{}.onion:8333", "a".repeat(56)), 0, 2000),
             ],
             solicited: true,
@@ -1269,13 +1276,14 @@ mod tests {
             0,
         );
         assert_eq!(counter(&m.address_announcements_total, &[NET, "addrv2"]), 1);
-        assert_eq!(histogram_sum(&m.address_announcement_entries, &[NET]), 5.0);
+        assert_eq!(histogram_sum(&m.address_announcement_entries, &[NET]), 6.0);
         assert_eq!(counter(&m.address_entries_total, &[NET, "ipv4"]), 1);
         assert_eq!(counter(&m.address_entries_total, &[NET, "ipv6"]), 1);
+        assert_eq!(counter(&m.address_entries_total, &[NET, "cjdns"]), 1);
         assert_eq!(counter(&m.address_entries_total, &[NET, "onion"]), 1);
         assert_eq!(
             counter(&m.address_entry_services_total, &[NET, "network"]),
-            2
+            3
         );
         assert_eq!(
             counter(&m.address_entry_services_total, &[NET, "witness"]),
@@ -1289,8 +1297,8 @@ mod tests {
             m.address_rate_limit_tokens.with_label_values(&[NET]).get(),
             3.5
         );
-        // Ages: 1000 - 900, 1000 - 1000, 1000 - 2000.
-        assert_eq!(histogram_count(&m.address_entry_age_seconds, &[NET]), 3);
+        // Ages: 1000 - 900, 1000 - 1000, 1000 - 1000, 1000 - 2000.
+        assert_eq!(histogram_count(&m.address_entry_age_seconds, &[NET]), 4);
         assert_eq!(histogram_sum(&m.address_entry_age_seconds, &[NET]), -900.0);
         assert_eq!(counter(&m.self_announcements_total, &[NET]), 0);
 
@@ -1381,11 +1389,24 @@ mod tests {
         );
         assert_eq!(counter(&m.observer_restarts_total, &[NET]), 0);
 
+        // The first event of a new run can already report drops of its
+        // own: the old run's counts go, the new run's stay.
         let mut second = event(1, 0, peer_event::Event::FeeFilter(FeeFilter::default()));
         second.instance_id = 8;
+        second.dropped_events = 3;
+        second.dropped_by_kind = Some(DroppedEvents {
+            ping_rtt: 3,
+            ..Default::default()
+        });
         observe(NET, &second, &m, &mut state, 0);
         assert_eq!(counter(&m.observer_restarts_total, &[NET]), 1);
-        assert_eq!(m.observer_dropped_events.with_label_values(&[NET]).get(), 0);
+        assert_eq!(m.observer_dropped_events.with_label_values(&[NET]).get(), 3);
+        assert_eq!(
+            m.observer_dropped_events_by_kind
+                .with_label_values(&[NET, "ping_rtt"])
+                .get(),
+            3
+        );
         assert_eq!(
             m.observer_dropped_events_by_kind
                 .with_label_values(&[NET, "address_announcement"])

@@ -240,7 +240,9 @@ impl Handler {
         let mut purged = 0;
         let mut save_error = None;
         for entry in entries {
-            let result = self.addrman.ban(entry).await.ok_or(GONE)?;
+            // A refusal is the operator's to see: an entry that cannot be
+            // banned is intent that would otherwise never take effect.
+            let result = self.addrman.ban(entry).await.ok_or(GONE)??;
             added += result.added;
             purged += result.purged;
             save_error = save_error.or(result.save_error);
@@ -264,11 +266,18 @@ impl Handler {
     fn chain_tips(&self) -> Result<String, String> {
         let tree = self.header_tree.read().unwrap();
         let mut tips = tree.chain_tips();
-        // Deterministic order: active tip first, then descending by height.
+        // Deterministic order: active tip first, then descending by height,
+        // with the hash to break a tie. The active tip is sorted on its
+        // status rather than on its branch length, which is zero for it and
+        // non-zero for every other tip -- so ordering by branch length put
+        // the one tip callers read first last instead. The hash is there
+        // because tips are walked out of a HashMap: without it two tips of
+        // equal height come back in whatever order that walk took.
         tips.sort_by(|a, b| {
-            b.branch_len
-                .cmp(&a.branch_len)
+            (a.status != ChainTipStatus::Active)
+                .cmp(&(b.status != ChainTipStatus::Active))
                 .then(b.height.cmp(&a.height))
+                .then(a.hash.cmp(&b.hash))
         });
         let json: Vec<_> = tips
             .iter()
@@ -492,6 +501,17 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&h.dispatch(Some("addresses.inspect"), &payload).await).unwrap();
         assert!(v["error"].as_str().unwrap().contains("unparseable"));
+
+        // A ban the list cannot store is an error rather than an answer
+        // saying nothing was added: the operator asked for a ban that would
+        // never have taken effect.
+        let payload = serde_json::to_vec(&[serde_json::json!({ "hosts": ["nonsense"] })]).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&h.dispatch(Some("banlist.add"), &payload).await).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("not an address"),
+            "{v}"
+        );
     }
 
     /// The sessions the registry holds, with the dialing count beside them.
@@ -567,6 +587,63 @@ mod tests {
         assert_eq!(tips.len(), 1);
         assert_eq!(tips[0]["height"], 0);
         assert_eq!(tips[0]["status"], "active");
+    }
+
+    /// With a fork in the tree the active tip comes first, and tips of equal
+    /// height come back in the same order every time.
+    ///
+    /// `tips[0]` is read as the active tip by the integration test and by
+    /// anyone following the documented order, and the active tip is the one
+    /// whose branch length is zero -- so sorting by branch length put it last
+    /// as soon as a second tip existed.
+    #[tokio::test]
+    async fn test_chain_tips_puts_the_active_tip_first() {
+        use crate::headertree::testing::mine_header;
+        let (h, _mgr) = handler_with_manager("tips-fork");
+
+        // Three branches off genesis: the active one, and two stale ones of
+        // equal height to pin the tie-break.
+        let genesis = h.header_tree.read().unwrap().tip().0;
+        let branch = |seed: u8, len: u32| {
+            let mut prev = genesis;
+            let headers: Vec<_> = (0..len)
+                .map(|i| {
+                    let header = mine_header(prev, 1_296_688_602 + i, seed);
+                    prev = header.block_hash();
+                    header
+                })
+                .collect();
+            let (accepted, err) = h.header_tree.write().unwrap().insert_batch(&headers);
+            assert_eq!(
+                accepted, len as usize,
+                "the mined chain was refused: {err:?}"
+            );
+            headers.last().unwrap().block_hash()
+        };
+        let stale_a = branch(1, 2);
+        let stale_b = branch(2, 2);
+        let active = branch(3, 3);
+
+        let response = h.dispatch(Some("headertree.tips"), b"").await;
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let tips = v.as_array().unwrap();
+        assert_eq!(tips.len(), 3);
+
+        assert_eq!(tips[0]["status"], "active");
+        assert_eq!(tips[0]["hash"], active.to_string());
+        assert_eq!(tips[0]["height"], 3);
+        assert_eq!(tips[0]["branch_len"], 0);
+
+        // Then the stale ones, in hash order: same height and same branch
+        // length, and the tips are walked out of a HashMap, so without the
+        // tie-break their order is whatever that walk happened to take.
+        let mut stale = [stale_a, stale_b];
+        stale.sort();
+        for (i, hash) in stale.iter().enumerate() {
+            assert_eq!(tips[i + 1]["status"], "headers-only");
+            assert_eq!(tips[i + 1]["hash"], hash.to_string());
+            assert_eq!(tips[i + 1]["branch_len"], 2);
+        }
     }
 
     /// Commands answer with an error rather than hanging once the manager has

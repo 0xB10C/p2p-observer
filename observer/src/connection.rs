@@ -50,7 +50,12 @@ const TOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for the BIP324 transport handshake, which runs before the version
 /// handshake and is just as capable of stalling forever against a peer that
 /// accepts the connection and then goes quiet.
+#[cfg(not(test))]
 const V2_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Shortened under test, the way the version handshake's deadline is, so the
+/// stalled-handshake cases do not take half a minute each.
+#[cfg(test)]
+const V2_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(2);
 
 static PEER_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -469,7 +474,8 @@ async fn tor_connect(addr: &PeerAddr, cfg: &Config) -> Result<TcpStream> {
         .tor
         .proxy_addr
         .parse()
-        .context("invalid SOCKS5 proxy address")?;
+        .map_err(|e| anyhow::Error::new(e).context(Stage::ProxyAddrInvalid))
+        .with_context(|| format!("proxy_addr {:?}", cfg.networks.tor.proxy_addr))?;
 
     let target = addr.to_string();
     tracing::trace!(target: TARGET, %proxy, %target, "connecting via the Tor SOCKS5 proxy");
@@ -591,6 +597,9 @@ pub(crate) enum Stage {
     VersionHandshake,
     /// The Tor proxy is not answering at all.
     ProxyUnreachable,
+    /// The configured Tor proxy address is not a socket address, so there is
+    /// no proxy to reach.
+    ProxyAddrInvalid,
     /// This network is switched off in the config, or has no transport here.
     NetworkDisabled,
 }
@@ -605,6 +614,7 @@ impl std::fmt::Display for Stage {
             Stage::V2TransportHandshake => "BIP324 transport handshake failed",
             Stage::VersionHandshake => "version handshake failed",
             Stage::ProxyUnreachable => "Tor SOCKS5 proxy unreachable",
+            Stage::ProxyAddrInvalid => "configured Tor SOCKS5 proxy address is not an address",
             Stage::NetworkDisabled => "network disabled or unsupported",
         };
         f.write_str(s)
@@ -639,6 +649,12 @@ fn classify(err: &anyhow::Error, net: Net) -> Outcome {
     match stage_of(err) {
         Some(Stage::NetworkDisabled) => return Outcome::OurFault(OurFault::NetworkDisabled),
         Some(Stage::ProxyUnreachable) => return Outcome::OurFault(OurFault::ProxyUnreachable),
+        Some(Stage::ProxyAddrInvalid) => {
+            // A proxy address we cannot parse is a mistake in our config, and
+            // it fails every onion dial. Reported as an unreachable proxy
+            // because that is what it is from here: there is no proxy to try.
+            return Outcome::OurFault(OurFault::ProxyUnreachable);
+        }
         Some(Stage::TorProxyTimeout) => {
             // The onion service is only reachable through our proxy, so a
             // proxy that will not answer is our problem, not the peer's.
@@ -675,13 +691,25 @@ fn classify(err: &anyhow::Error, net: Net) -> Outcome {
 
 /// TCP-level failures, where retrying with a different transport version
 /// cannot help.
+///
+/// A stalled BIP324 handshake is the one timeout this excludes: it can only
+/// happen once TCP is up, so the peer was reached and the v1 fallback is
+/// exactly what it is for. A version handshake that stalled stays in, for the
+/// opposite reason -- the BIP324 transport came up, so the peer does speak v2
+/// and v1 would be a step backwards.
 fn is_tcp_level(err: &anyhow::Error) -> bool {
+    if matches!(stage_of(err), Some(Stage::V2TransportTimeout)) {
+        return false;
+    }
     has_kind(err, std::io::ErrorKind::ConnectionRefused)
         || has_kind(err, std::io::ErrorKind::NetworkUnreachable)
         || has_kind(err, std::io::ErrorKind::HostUnreachable)
         || is_timed_out(err)
 }
 
+/// Whether the attempt ran out of time, wherever it had got to. Which of
+/// those timeouts ends the attempt is [`is_tcp_level`]'s question, not this
+/// one's.
 fn is_timed_out(err: &anyhow::Error) -> bool {
     if matches!(
         stage_of(err),
@@ -1011,6 +1039,61 @@ mod tests {
         server.abort();
     }
 
+    /// A peer that completed TCP and then never answered the BIP324 opener
+    /// still gets its v1 attempt.
+    ///
+    /// The stall is no evidence about the transport: the peer was reached,
+    /// which is the whole condition for the fallback, and it may well answer a
+    /// v1 version message. Without the attempt nothing ever settles the hint,
+    /// so it stays `Unknown` and every later dial spends the transport timeout
+    /// over again -- the address is then effectively unreachable for good.
+    #[tokio::test]
+    async fn test_a_stalled_v2_handshake_still_tries_v1() {
+        setup();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        // Accepts both attempts -- the v2 opener and then the v1 version --
+        // and answers neither. Both are held open, because a close would be an
+        // EOF rather than the stall this is about.
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            let (second, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(first);
+            drop(second);
+        });
+
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (handle, _g, mut life_rx, _c) = crate::addresses::channels();
+        let addr = PeerAddr::Ipv4([127, 0, 0, 1], listen_addr.port());
+        let dial = Dial {
+            addr,
+            transport: TransportHint::Unknown,
+        };
+
+        let err = connect_and_run(0, &dial, &test_config(event_tx), &handle)
+            .await
+            .expect_err("a silent peer must not yield a session");
+        // The v1 attempt ran and reached its own deadline, so what comes out
+        // is the version handshake's timeout rather than the transport's.
+        assert_eq!(
+            classify(&err, Net::Ipv4),
+            Outcome::Failed(Reason::VersionHandshakeTimeout),
+            "the v1 fallback should have run: {err:#}"
+        );
+        // And the verdict was filed before the retry, so later dials skip v2
+        // instead of stalling again.
+        let mut v1_only = false;
+        while let Ok(msg) = life_rx.try_recv() {
+            if matches!(msg, Lifecycle::V1Only { addr: a } if a == addr) {
+                v1_only = true;
+            }
+        }
+        assert!(v1_only, "the v2 stall was never recorded as v1-only");
+        server.abort();
+    }
+
     /// The attempt always reports back, so the manager can free the slot.
     #[tokio::test]
     async fn test_attempt_always_reports_an_outcome() {
@@ -1288,7 +1371,9 @@ mod tests {
     /// attempt ends there -- and if one were not recognised, the fallback
     /// would run `addrman.v1_only(addr)` first, writing a permanent v1-only
     /// verdict about a peer we never reached. A transient network failure
-    /// would cost that address its chance at v2 for good.
+    /// would cost that address its chance at v2 for good. The line is drawn at
+    /// "was the peer reached", which is why a stalled BIP324 handshake is on
+    /// the other side of it despite being a timeout.
     ///
     /// The chain is four `or`s and only the first was tested, so each of the
     /// others could have been an `and` -- which, over mutually exclusive error
@@ -1305,17 +1390,28 @@ mod tests {
             assert!(is_tcp_level(&err), "{kind:?} is a TCP-level failure");
         }
 
-        // And a timeout of our own, however it is expressed.
+        // And a timeout of our own, however it is expressed. The version
+        // handshake's is here because the BIP324 transport came up first: the
+        // peer speaks v2, so there is nothing for v1 to find out.
         for stage in [
             Stage::TcpConnectTimeout,
             Stage::TorProxyTimeout,
-            Stage::V2TransportTimeout,
             Stage::VersionHandshakeTimeout,
         ] {
             let err = anyhow::Error::new(stage).context("dialling");
             assert!(is_tcp_level(&err), "{stage:?} is a timeout");
             assert!(is_timed_out(&err), "{stage:?} is a timeout");
         }
+
+        // A stalled BIP324 handshake is a timeout too, but not one that ends
+        // the attempt: it can only happen with TCP already up, so the peer was
+        // reached and v1 is still worth asking.
+        let stalled = anyhow::Error::new(Stage::V2TransportTimeout).context("dialling");
+        assert!(is_timed_out(&stalled));
+        assert!(
+            !is_tcp_level(&stalled),
+            "a stalled v2 handshake must leave the v1 fallback to run"
+        );
 
         // What is not: a failure after the connection was up, which is the
         // case the v1 fallback exists for.
@@ -1401,7 +1497,28 @@ mod tests {
         assert!(format!("{err:#}").contains("Tor is disabled"));
     }
 
-    /// Minimal blocking executor for the one synchronous test above.
+    /// A proxy address we cannot parse is our configuration, not the onion
+    /// service's doing.
+    ///
+    /// One typo in `networks.tor.proxy_addr` fails every onion dial, and
+    /// counting those as failures would back off and eventually drop every
+    /// onion address in the book over a mistake of ours.
+    #[test]
+    fn test_an_unparseable_proxy_addr_is_our_fault() {
+        let mut cfg = test_config(mpsc::channel(1).0);
+        cfg.networks.tor.enabled = true;
+        cfg.networks.tor.proxy_addr = "not-an-address".to_owned();
+        let addr = PeerAddr::TorV3([7u8; 32], 8333);
+        let err =
+            futures_block_on(tor_connect(&addr, &cfg)).expect_err("the proxy address is not one");
+        assert_eq!(
+            classify(&err, Net::TorV3),
+            Outcome::OurFault(OurFault::ProxyUnreachable)
+        );
+        assert!(!classify(&err, Net::TorV3).counts_as_failure());
+    }
+
+    /// Minimal blocking executor for the synchronous tests above.
     fn futures_block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

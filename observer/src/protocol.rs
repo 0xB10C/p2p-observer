@@ -1214,13 +1214,28 @@ impl<R: TransportReader, W: TransportWriter> Connection<R, W> {
         received: usize,
         mut parsed: Vec<Gossiped>,
     ) {
+        // Nothing announced and nothing to report: an empty addr message, or
+        // an addrv2 whose count we could not read at all. There is no
+        // announcement to publish here, and nothing for the flag below to be
+        // about.
+        if received == 0 && parsed.is_empty() {
+            return;
+        }
+
         // A peer announces its own address on its own schedule, and usually
         // gets that one-entry message out before it answers our GETADDR. It
         // is not the reply, so it must not take the flag: that left the real
         // reply charged against the bucket, which it drained for the rest of
         // the session, and archived as unsolicited.
+        //
+        // A message carrying no address we could use goes the same way, for
+        // the same reason and with nothing gained: it is charged nothing
+        // whether or not it is exempt, so taking the flag only costs the real
+        // reply its exemption.
         let self_announcement = received == 1 && parsed.len() == 1 && parsed[0].addr == self.addr;
-        let solicited = !self_announcement && std::mem::take(&mut self.getaddr_outstanding);
+        let solicited = !self_announcement
+            && !parsed.is_empty()
+            && std::mem::take(&mut self.getaddr_outstanding);
 
         // Refilled whether or not this message will be charged, so the level
         // reported below means the same thing on both paths. Harmless to the
@@ -2943,6 +2958,57 @@ mod tests {
         h.conn
             .offer_gossip(common::events::AddrMessage::Addrv2, 1, other);
         assert!(solicited(&mut h));
+    }
+
+    /// A message carrying no address we could use is not the reply either,
+    /// and one carrying nothing at all is not published.
+    ///
+    /// An addrv2 whose count byte promises entries that never arrive reads
+    /// leniently as nothing, and an empty addr message is legal. Both used to
+    /// take the flag, which left the real reply charged against the bucket
+    /// and archived as unsolicited -- and published an announcement of no
+    /// addresses that said we had asked for them.
+    #[tokio::test]
+    async fn test_a_message_with_no_addresses_does_not_answer_getaddr() {
+        use crate::headertree::testing::regtest_params;
+        use common::events::peer_event::Event;
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let mut h = harness(tree);
+        h.conn.getaddr_outstanding = true;
+
+        h.conn
+            .offer_gossip(common::events::AddrMessage::Addrv2, 0, vec![]);
+        assert!(
+            h.events.try_recv().is_err(),
+            "an announcement with nothing in it was published"
+        );
+        assert!(h.conn.getaddr_outstanding, "the exemption was spent");
+
+        // Entries we could not parse are still worth an announcement: the
+        // count is the only place they appear. It is not an answer either.
+        h.conn
+            .offer_gossip(common::events::AddrMessage::Addrv2, 3, vec![]);
+        let Some(Event::AddressAnnouncement(a)) = h.events.try_recv().unwrap().event else {
+            panic!("expected an address announcement");
+        };
+        assert_eq!(a.unparsed, 3);
+        assert!(a.addresses.is_empty());
+        assert!(!a.solicited);
+        assert!(h.conn.getaddr_outstanding, "the exemption was spent");
+
+        // And the reply that does carry addresses gets it.
+        let reply = vec![Gossiped {
+            addr: PeerAddr::Ipv4([10, 0, 0, 1], 8333),
+            services: 0,
+            ntime: 0,
+        }];
+        h.conn
+            .offer_gossip(common::events::AddrMessage::Addrv2, 1, reply);
+        let Some(Event::AddressAnnouncement(a)) = h.events.try_recv().unwrap().event else {
+            panic!("expected an address announcement");
+        };
+        assert!(a.solicited);
+        assert!(!h.conn.getaddr_outstanding);
     }
 
     /// An addrv2 payload with one entry the decoder rejects between two it
