@@ -247,6 +247,7 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::clap::{CommandFactory, error::ErrorKind};
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(["rpc", "--network", "signet"].iter().chain(args)).unwrap()
@@ -378,6 +379,14 @@ mod tests {
 
     #[test]
     fn test_network_is_required() {
-        assert!(Cli::try_parse_from(["rpc", "addresses", "info"]).is_err());
+        // The env source is dropped for this parse: with it in place an
+        // exported P2P_OBSERVER_NETWORK -- which the README tells operators
+        // to set -- satisfies the argument and the test fails on a shell it
+        // has nothing to say about.
+        let err = Cli::command()
+            .mut_arg("network", |a| a.env(None::<&str>))
+            .try_get_matches_from(["rpc", "addresses", "info"])
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
     }
 }
