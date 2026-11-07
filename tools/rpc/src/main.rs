@@ -191,6 +191,23 @@ fn interpret(text: &str) -> Reply {
     }
 }
 
+/// What to print for a reply, and whether it is a failure -- which decides
+/// both the stream it is printed on and the exit status. `raw` selects the
+/// formatting only: the reply is passed on as received, error or not.
+fn output(raw: bool, text: &str) -> (String, bool) {
+    match interpret(text) {
+        Reply::Ok(pretty) => (if raw { text.to_owned() } else { pretty }, false),
+        Reply::Error(e) => (
+            if raw {
+                text.to_owned()
+            } else {
+                format!("error: {e}")
+            },
+            true,
+        ),
+    }
+}
+
 async fn call(cli: &Cli, req: &Request) -> Result<String> {
     let nats = async_nats::connect(&cli.nats_url)
         .await
@@ -228,17 +245,13 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if cli.raw {
-        println!("{text}");
-        return ExitCode::SUCCESS;
-    }
-    match interpret(&text) {
-        Reply::Ok(out) => {
+    match output(cli.raw, &text) {
+        (out, false) => {
             println!("{out}");
             ExitCode::SUCCESS
         }
-        Reply::Error(e) => {
-            eprintln!("error: {e}");
+        (out, true) => {
+            eprintln!("{out}");
             ExitCode::FAILURE
         }
     }
@@ -344,6 +357,25 @@ mod tests {
         );
         // Not JSON at all is printed as received rather than hidden.
         assert_eq!(interpret("plain"), Reply::Ok("plain".into()));
+    }
+
+    #[test]
+    fn test_raw_keeps_the_exit_status() {
+        // --raw chooses the formatting, not the exit status: the reply goes
+        // out byte for byte either way, and an error reply still fails.
+        let error = r#"{"error":"address manager unavailable"}"#;
+        assert_eq!(output(true, error), (error.to_owned(), true));
+        assert_eq!(
+            output(false, error),
+            ("error: address manager unavailable".to_owned(), true)
+        );
+
+        let ok = r#"{"b":1,"a":2}"#;
+        assert_eq!(output(true, ok), (ok.to_owned(), false));
+        assert_eq!(
+            output(false, ok),
+            ("{\n  \"a\": 2,\n  \"b\": 1\n}".to_owned(), false)
+        );
     }
 
     #[test]
