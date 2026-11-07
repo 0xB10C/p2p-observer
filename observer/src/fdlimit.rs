@@ -298,11 +298,23 @@ mod tests {
             // other branch's job.
             return;
         }
-        let too_many = usize::try_from(hard).unwrap_or(usize::MAX);
+        // One more dial than the hard limit has descriptors, rather than
+        // exactly as many: with the two numbers equal, the message contains
+        // the limit twice -- once as the limit it found and once as the
+        // argument echoed back -- and deleting the former leaves the
+        // assertion below passing on the latter.
+        let too_many = usize::try_from(hard)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let needed = floor(too_many as u64);
         let err = prepare(too_many).expect_err("more dials than descriptors");
         assert!(
             err.contains(&hard.to_string()),
-            "{err}: the message should name the limit it found"
+            "{err}: the message should name the {hard} descriptors it found"
+        );
+        assert!(
+            err.contains(&needed.to_string()),
+            "{err}: the message should name the {needed} descriptors needed"
         );
         assert!(
             err.contains("max_dialing") || err.contains("needed"),
