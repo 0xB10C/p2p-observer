@@ -402,10 +402,12 @@ message TcpStats {
   optional uint32 reordering = 7;
   // The stack's delivery rate estimate in bytes per second. Linux only.
   optional uint64 delivery_rate = 8;
-  // Bytes received from the peer over the connection's life.
+  // Payload bytes received from the peer over the connection's life.
   //
-  // TCP-level, so it counts protocol overhead and retransmissions that
-  // messages_by_command does not. Available on Linux and macOS.
+  // Counted by the TCP stack, so it covers every byte of the stream --
+  // message headers, the v2 transport's framing, and messages
+  // messages_by_command does not account for -- but not TCP/IP header
+  // overhead. Available on Linux and macOS.
   optional uint64 bytes_received = 9;
 }
 

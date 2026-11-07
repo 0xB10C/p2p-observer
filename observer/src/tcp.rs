@@ -41,8 +41,8 @@ pub(crate) struct TcpStats {
     /// Available on: Linux (`tcpi_delivery_rate`).
     pub delivery_rate: Option<u64>,
 
-    /// Bytes received from the peer over the connection's life, TCP-level and
-    /// so inclusive of protocol overhead.
+    /// Payload bytes received from the peer over the connection's life,
+    /// counted by the TCP stack and so excluding TCP/IP header overhead.
     /// Available on: Linux (`tcpi_bytes_received`), macOS (`tcpi_rxbytes`).
     pub bytes_received: Option<u64>,
 }
