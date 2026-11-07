@@ -180,7 +180,8 @@ impl State {
 }
 
 /// Runs the tool until `shutdown` turns true. `bound_addr` receives the
-/// address the HTTP server listens on, for tests that bind port 0.
+/// address the HTTP server listens on, for tests that bind port 0, once the
+/// tool is ready: the listener is up and the event subscription exists.
 pub async fn run(
     args: Args,
     mut shutdown: watch::Receiver<bool>,
@@ -196,9 +197,6 @@ pub async fn run(
         .with_context(|| format!("listening on {}", args.listen))?;
     let addr = listener.local_addr().context("reading the bound address")?;
     tracing::info!(target: TARGET, %addr, "serving metrics at /metrics");
-    if let Some(tx) = bound_addr {
-        let _ = tx.send(addr);
-    }
     let server = tokio::spawn(server::serve(listener, metrics.registry.clone()));
 
     let nats = async_nats::connect(&args.nats_url)
@@ -211,6 +209,11 @@ pub async fn run(
         .with_context(|| format!("subscribing to {subject}"))?;
     nats.flush().await.context("flushing the subscription")?;
     tracing::info!(target: TARGET, url = %args.nats_url, subject, "connected to NATS");
+    // Core NATS has no replay, so a publish that lands before the
+    // subscription exists is lost: the address only goes out once it does.
+    if let Some(tx) = bound_addr {
+        let _ = tx.send(addr);
+    }
 
     let mut state = State::default();
     let result = loop {
