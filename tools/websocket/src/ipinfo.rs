@@ -123,7 +123,8 @@ mod tests {
     fn test_fixture_maps_prefixes() {
         let lookup = IpLookup::from_bytes(FIXTURE.to_vec()).unwrap();
         assert!(lookup.available());
-        // 250.0.0.0/8 -> AS1000 and 101.5.0.0/16 -> AS5 in the fixture.
+        // The fixture maps all of 128.0.0.0/1 to AS1000 and 101.0.0.0/13 in
+        // /16 pieces to AS1..AS8; everything else is unmapped (ASN 0).
         assert_eq!(
             lookup.lookup("250.1.2.3".parse().unwrap()).unwrap().asn,
             1000
@@ -136,6 +137,20 @@ mod tests {
                 .asn,
             1000
         );
+        // Inside 128.0.0.0/1, so the asmap does have an AS for these: not
+        // being globally routable is what holds them at 0.
+        assert_eq!(
+            lookup.lookup("192.168.0.1".parse().unwrap()).unwrap().asn,
+            0
+        );
+        assert_eq!(
+            lookup
+                .lookup("::ffff:169.254.1.1".parse().unwrap())
+                .unwrap()
+                .asn,
+            0
+        );
+        // Outside both mapped ranges, so the asmap itself answers 0.
         let unmapped = lookup.lookup("127.0.0.1".parse().unwrap()).unwrap();
         assert_eq!(unmapped.asn, 0);
         assert!(unmapped.description.is_empty());
