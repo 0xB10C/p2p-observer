@@ -189,18 +189,44 @@ mod tests {
         assert!(load(&path).is_empty());
     }
 
-    /// The reason for postcard over JSON.
+    /// A book shaped like a real one, for the size bound: absolute unix
+    /// timestamps in all four time fields, where the varints cost five bytes
+    /// each rather than the one or two a small fake number costs, and one
+    /// 32-byte onion key in ten.
+    fn realistic_sample() -> HashMap<PeerAddr, Entry> {
+        const NOW: u32 = 1_762_000_000;
+        let mut m = HashMap::new();
+        for i in 0..50u8 {
+            let n = u32::from(i);
+            let mut e = Entry::new(NOW - n * 600, 0b1101, Origin::Gossip);
+            e.failures = i % 4;
+            e.last_attempt = NOW - n * 300;
+            e.last_success = if i % 2 == 0 { NOW - 3600 } else { 0 };
+            e.next_attempt = NOW + 1800;
+            if i % 10 == 0 {
+                m.insert(PeerAddr::TorV3([i; 32], 8333), e);
+            } else {
+                m.insert(PeerAddr::Ipv4([10, 0, 0, i], 8333), e);
+            }
+        }
+        m
+    }
+
+    /// The reason for postcard over JSON, measured on the file `save` writes:
+    /// swapping the encoding for a verbose one has to fail here, which it
+    /// cannot if the test re-encodes the fixture itself. Operator snapshots
+    /// run at roughly 33 bytes per entry on mainnet and on signet alike.
     #[test]
     fn test_encoding_is_compact() {
-        let entries = sample();
-        let snapshot = Snapshot {
-            version: FORMAT_VERSION,
-            entries: entries.iter().map(|(k, e)| (*k, e.clone())).collect(),
-        };
-        let bytes = postcard::to_stdvec(&snapshot).unwrap();
-        let per_entry = bytes.len() / entries.len();
+        let dir = tmp_dir("compact");
+        let path = dir.path().join("addresses.bin");
+        let entries = realistic_sample();
+
+        save(&path, entries.iter()).unwrap();
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        let per_entry = on_disk / entries.len() as u64;
         assert!(
-            per_entry < 48,
+            per_entry < 40,
             "{per_entry} bytes per entry is larger than expected"
         );
     }
