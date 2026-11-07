@@ -228,9 +228,9 @@ struct Shared {
     /// The latest status update per network, so a client that subscribes
     /// between two polls is answered at once rather than after a minute.
     latest_status: StdRwLock<BTreeMap<String, Arc<str>>>,
-    /// Raised when a client subscribes to the status and there is nothing
-    /// cached to give it, so it waits for one round trip instead of for the
-    /// next interval.
+    /// Raised when a client subscribes to the status and the cache has
+    /// nothing for one of the networks known, so it waits for one round trip
+    /// instead of for the next interval.
     poll_now: Notify,
 }
 
@@ -621,16 +621,20 @@ async fn handle_client(stream: TcpStream, addr: SocketAddr, shared: Arc<Shared>)
                 }
                 // A page that wants the status wants it now, not at the next
                 // interval: give it what is cached, and ask for a poll when
-                // there is nothing to give.
+                // the cache does not cover every observer it should hear
+                // about. Per network, not "anything at all": with one of two
+                // observers answering, the client would otherwise not learn
+                // of the other until the interval.
                 if subs.connection_status {
-                    let cached: Vec<Arc<str>> = shared
-                        .latest_status
-                        .read()
-                        .expect("status lock")
-                        .values()
-                        .cloned()
-                        .collect();
-                    if cached.is_empty() {
+                    let (cached, complete) = {
+                        let networks = shared.networks.read().expect("networks lock");
+                        let latest = shared.latest_status.read().expect("status lock");
+                        (
+                            latest.values().cloned().collect::<Vec<Arc<str>>>(),
+                            networks.iter().all(|n| latest.contains_key(n)),
+                        )
+                    };
+                    if !complete {
                         shared.poll_now.notify_one();
                     }
                     for text in cached {
