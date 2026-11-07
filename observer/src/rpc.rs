@@ -240,7 +240,9 @@ impl Handler {
         let mut purged = 0;
         let mut save_error = None;
         for entry in entries {
-            let result = self.addrman.ban(entry).await.ok_or(GONE)?;
+            // A refusal is the operator's to see: an entry that cannot be
+            // banned is intent that would otherwise never take effect.
+            let result = self.addrman.ban(entry).await.ok_or(GONE)??;
             added += result.added;
             purged += result.purged;
             save_error = save_error.or(result.save_error);
@@ -499,6 +501,17 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&h.dispatch(Some("addresses.inspect"), &payload).await).unwrap();
         assert!(v["error"].as_str().unwrap().contains("unparseable"));
+
+        // A ban the list cannot store is an error rather than an answer
+        // saying nothing was added: the operator asked for a ban that would
+        // never have taken effect.
+        let payload = serde_json::to_vec(&[serde_json::json!({ "hosts": ["nonsense"] })]).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&h.dispatch(Some("banlist.add"), &payload).await).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("not an address"),
+            "{v}"
+        );
     }
 
     /// The sessions the registry holds, with the dialing count beside them.

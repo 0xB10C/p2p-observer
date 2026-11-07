@@ -126,11 +126,16 @@ $ nats request p2p-observer.signet.rpc.banlist.add '[{"nets":["1.2.3.4"]}]'
 {"added":1,"purged":0}
 ```
 
-Tor and I2P are banned by exact host:
+Tor and I2P are banned by exact host, written the way `addresses.list` prints
+them -- with the port, and in any case, since the stored ban is normalised to
+that spelling. A host that is not an address is refused rather than stored,
+because it could never match anything:
 
 ```bash
 $ nats request p2p-observer.signet.rpc.banlist.add '[{"hosts":["abc...xyz.onion:8333"]}]'
 {"added":1,"purged":1}
+$ nats request p2p-observer.signet.rpc.banlist.add '[{"hosts":["abc...xyz.onion"]}]'
+{"error":"not an address: abc...xyz.onion"}
 ```
 
 ## `banlist.list`

@@ -79,7 +79,9 @@ pub enum Command {
     },
     Ban {
         entry: BanEntry,
-        reply: oneshot::Sender<BanResult>,
+        /// `Err` when the entry itself cannot be banned, which the caller is
+        /// expected to report rather than count as zero additions.
+        reply: oneshot::Sender<std::result::Result<BanResult, String>>,
     },
     BanList {
         reply: oneshot::Sender<Vec<BanEntry>>,
@@ -207,7 +209,7 @@ impl Handle {
             .await
     }
 
-    pub async fn ban(&self, entry: BanEntry) -> Option<BanResult> {
+    pub async fn ban(&self, entry: BanEntry) -> Option<std::result::Result<BanResult, String>> {
         self.request(|reply| Command::Ban { entry, reply }).await
     }
 
@@ -375,7 +377,16 @@ impl<D: Dialer> Manager<D> {
                 let _ = reply.send(added);
             }
             Command::Ban { entry, reply } => {
-                let added = self.banlist.add(entry);
+                let added = match self.banlist.add(entry) {
+                    Ok(added) => added,
+                    // Nothing was stored, so there is nothing to save or
+                    // purge: the operator gets the reason instead of a count.
+                    Err(e) => {
+                        tracing::warn!(target: TARGET, "refused a ban: {e:#}");
+                        let _ = reply.send(Err(format!("{e:#}")));
+                        return;
+                    }
+                };
                 let purged = if added > 0 {
                     self.book.purge_banned(&self.banlist)
                 } else {
@@ -391,11 +402,11 @@ impl<D: Dialer> Manager<D> {
                         Some(format!("{e:#}"))
                     }
                 };
-                let _ = reply.send(BanResult {
+                let _ = reply.send(Ok(BanResult {
                     added,
                     purged,
                     save_error,
-                });
+                }));
             }
             Command::BanList { reply } => {
                 let _ = reply.send(self.banlist.entries().to_vec());
@@ -750,7 +761,7 @@ mod tests {
             },
             NOW,
         );
-        let result = rx.blocking_recv().unwrap();
+        let result = rx.blocking_recv().unwrap().unwrap();
         assert_eq!(result.added, 1);
         assert_eq!(result.purged, 2);
         assert!(result.save_error.is_none(), "{:?}", result.save_error);

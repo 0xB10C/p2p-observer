@@ -111,7 +111,9 @@ pub struct BanEntry {
     #[serde(default)]
     pub nets: Vec<IpNet>,
     /// Exact addresses, as rendered by `PeerAddr::Display`. Used for Tor and
-    /// I2P, which have no notion of a prefix to ban.
+    /// I2P, which have no notion of a prefix to ban. Normalised to that
+    /// rendering by [`Banlist::add`], which is the only spelling a match
+    /// against a live address can ever have.
     #[serde(default)]
     pub hosts: Vec<String>,
 }
@@ -208,7 +210,13 @@ impl Banlist {
     /// Add an entry, skipping networks and hosts already banned -- by an
     /// earlier entry or earlier in this one. Returns how many new ones were
     /// added.
-    pub fn add(&mut self, entry: BanEntry) -> usize {
+    ///
+    /// A host is stored as [`PeerAddr`] renders it, which is the spelling
+    /// [`Self::contains`] matches against, so an operator can paste an
+    /// address in any case the parser takes. A host that does not parse is an
+    /// error rather than an entry: it could match nothing, and a ban that
+    /// quietly does nothing is what this list exists not to do.
+    pub fn add(&mut self, entry: BanEntry) -> Result<usize> {
         // Checked against what this entry has collected so far as well as
         // against the list: a repeat inside one entry is still a repeat, and
         // storing it twice over-reports `len` for as long as the ban lives.
@@ -220,6 +228,9 @@ impl Banlist {
         }
         let mut hosts: Vec<String> = Vec::new();
         for host in entry.hosts {
+            let host = PeerAddr::parse(&host)
+                .with_context(|| format!("not an address: {host}"))?
+                .to_string();
             if !hosts.contains(&host) && !self.entries.iter().any(|e| e.hosts.contains(&host)) {
                 hosts.push(host);
             }
@@ -233,7 +244,7 @@ impl Banlist {
                 hosts,
             });
         }
-        added
+        Ok(added)
     }
 }
 
@@ -316,21 +327,57 @@ mod tests {
         assert!(!cidr.contains(&onion));
     }
 
+    /// A host is matched by its rendering, so a ban has to be stored in that
+    /// spelling or the operator's intent never takes effect.
+    #[test]
+    fn test_a_host_ban_is_normalised_on_the_way_in() {
+        let onion = PeerAddr::TorV3([3u8; 32], 8333);
+        let mut list = Banlist::from_entries(vec![]);
+
+        // `PeerAddr::parse` is case-insensitive, because an address pasted
+        // from somewhere else may arrive in any case. The ban list has to be
+        // too, or an upper-case paste is reported as banned and matches
+        // nothing.
+        let upper = onion.to_string().to_uppercase();
+        let added = list
+            .add(BanEntry {
+                comment: None,
+                nets: Vec::new(),
+                hosts: vec![upper],
+            })
+            .unwrap();
+        assert_eq!(added, 1);
+        assert!(list.contains(&onion));
+        assert_eq!(list.entries()[0].hosts, vec![onion.to_string()]);
+
+        // A host that is not an address can never match anything, so it is
+        // refused rather than stored and reported as a ban.
+        let err = list
+            .add(BanEntry {
+                comment: None,
+                nets: Vec::new(),
+                hosts: vec!["bad".to_owned()],
+            })
+            .expect_err("a host that cannot be parsed cannot be banned");
+        assert!(err.to_string().contains("bad"), "{err:#}");
+        assert_eq!(list.len(), 1, "and nothing was stored");
+    }
+
     #[test]
     fn test_add_skips_duplicates() {
         let mut list = Banlist::from_entries(vec![]);
-        assert_eq!(list.add(ban(&["10.0.0.0/8", "1.2.3.4/32"])), 2);
+        assert_eq!(list.add(ban(&["10.0.0.0/8", "1.2.3.4/32"])).unwrap(), 2);
         assert_eq!(list.len(), 2);
         // Both already present: nothing added, and no empty entry appended.
-        assert_eq!(list.add(ban(&["10.0.0.0/8"])), 0);
+        assert_eq!(list.add(ban(&["10.0.0.0/8"])).unwrap(), 0);
         assert_eq!(list.entries().len(), 1);
         // Partial overlap adds only what is new.
-        assert_eq!(list.add(ban(&["10.0.0.0/8", "9.9.9.9/32"])), 1);
+        assert_eq!(list.add(ban(&["10.0.0.0/8", "9.9.9.9/32"])).unwrap(), 1);
         assert_eq!(list.len(), 3);
         // A duplicate inside one entry counts once too, or `len` over-reports
         // the number of banned networks for as long as the list lives.
         let mut list = Banlist::from_entries(vec![]);
-        assert_eq!(list.add(ban(&["10.0.0.0/8", "10.0.0.0/8"])), 1);
+        assert_eq!(list.add(ban(&["10.0.0.0/8", "10.0.0.0/8"])).unwrap(), 1);
         assert_eq!(list.len(), 1);
     }
 
@@ -345,7 +392,8 @@ mod tests {
             comment: Some("bad ASN".to_owned()),
             nets: vec!["10.0.0.0/8".parse().unwrap()],
             hosts: vec![PeerAddr::TorV3([9u8; 32], 8333).to_string()],
-        });
+        })
+        .unwrap();
         list.save().unwrap();
         assert!(!path.with_extension("json.tmp").exists());
 
