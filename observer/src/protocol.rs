@@ -2636,14 +2636,68 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_a_pong_we_never_asked_for_is_counted_not_timed() {
-        let mut stats = ConnectionStats::new();
-        // The shape of the bug this prevents: nonce 0 would have produced an
-        // rtt_ms of the current unix time in milliseconds.
-        assert!(!stats.claim_pong(0));
-        assert_eq!(stats.unsolicited_pongs, 1);
-        assert!(stats.rtt_history.is_empty());
+    /// A pong we never asked for is counted, and never read as a round trip.
+    ///
+    /// The nonce is the millisecond the ping went out, so a pong naming one we
+    /// never sent is not a late answer: now minus it is unix time, and the
+    /// sample would land in the trillions. Driven through the handler rather
+    /// than the counter, because the counter cannot reach either the window or
+    /// the event -- only the early return in `handle_pong` keeps an invented
+    /// nonce out of both.
+    #[tokio::test]
+    async fn test_a_pong_we_never_asked_for_is_counted_not_timed() {
+        use crate::headertree::testing::regtest_params;
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let mut h = harness(tree);
+
+        h.conn.handle_pong(0);
+
+        assert_eq!(h.conn.stats.unsolicited_pongs, 1);
+        assert!(
+            h.conn.stats.rtt_history.is_empty(),
+            "a nonce we never sent was timed: {:?}",
+            h.conn.stats.rtt_history
+        );
+        assert!(
+            h.events.try_recv().is_err(),
+            "a nonce we never sent was published as a round trip"
+        );
+    }
+
+    /// The pong for a ping we did send is timed, once.
+    ///
+    /// The other side of that early return, and the only place the arithmetic
+    /// is held down without a NATS server: the nonce is when the ping went
+    /// out, so the sample is the time since -- milliseconds, not an epoch.
+    #[tokio::test]
+    async fn test_a_pong_we_asked_for_is_timed_and_published() {
+        use crate::headertree::testing::regtest_params;
+        let tree = Arc::new(RwLock::new(HeaderTree::new(regtest_params())));
+        let mut h = harness(tree);
+
+        let nonce = unix_ms();
+        h.conn.stats.record_ping(nonce);
+        h.conn.handle_pong(nonce);
+
+        assert_eq!(h.conn.stats.unsolicited_pongs, 0);
+        assert_eq!(h.conn.stats.rtt_history.len(), 1);
+
+        let ev = h.events.try_recv().expect("a round trip");
+        let Some(common::events::peer_event::Event::PingRtt(rtt)) = ev.event else {
+            panic!("expected a ping rtt, got {:?}", ev.event)
+        };
+        // A round trip over no network at all: what is left is this test's own
+        // elapsed milliseconds, so anything larger is unix time.
+        assert!(
+            rtt.rtt_ms < 10_000,
+            "rtt_ms {} is not a round trip",
+            rtt.rtt_ms
+        );
+        assert_eq!(h.conn.stats.rtt_history[0], rtt.rtt_ms as u32);
+        assert!(
+            h.events.try_recv().is_err(),
+            "one pong was published as more than one round trip"
+        );
     }
 
     #[test]
