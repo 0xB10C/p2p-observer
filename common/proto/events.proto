@@ -142,6 +142,10 @@ message Handshake {
 //
 // A self-announcement is identifiable offline — a single entry matching the
 // peer on the enclosing PeerEvent — with better information than we have here.
+//
+// A message with nothing in it produces no event at all: an empty addr, or an
+// addrv2 whose entry count could not be read, has no announcement to report
+// and no parse shortfall either.
 message AddressAnnouncement {
   // Which message carried these addresses. Not derivable from the entries: an
   // addrv2 message may still carry only IPv4.
@@ -163,7 +167,9 @@ message AddressAnnouncement {
   //
   // Always false on a message holding only the peer's own address: that is
   // its self-announcement, sent whether or not anyone asked, and it leaves the
-  // request outstanding for the message that answers it.
+  // request outstanding for the message that answers it. Also always false on
+  // a message holding no address we could parse, which is charged nothing
+  // either way and leaves the request outstanding for the same reason.
   bool solicited = 4;
   // How many of the entries above the rate limit discarded, so the gap between
   // what was announced and what the address book was offered is explicit

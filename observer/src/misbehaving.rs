@@ -433,10 +433,29 @@ async fn test_an_unparseable_payload_is_skipped_and_the_session_carries_on() {
     // 0xfd introduces a two-byte count, and nothing follows it.
     peer.send_raw(&frame("addrv2", &[0xfd], None)).await;
 
+    // Nothing was read out of that frame, so it is not the reply to our
+    // getaddr: the message that is has to still be solicited, and the junk
+    // must not come out as an announcement of its own.
+    peer.send(NetworkMessage::Addr(common::p2p::message::AddrPayload(
+        gossip(3),
+    )))
+    .await;
+
     // Still talking to us afterwards, which is the whole point.
     peer.send(ask_from(vec![nowhere(0)])).await;
     let answered = answers(&peer.hang_up_and_drain().await);
     assert_eq!(answered, vec![2]);
+
+    let announced = observed.announcements(1).await;
+    assert_eq!(
+        announced[0].addresses.len(),
+        3,
+        "the unreadable frame was published as an announcement"
+    );
+    assert!(
+        announced[0].solicited,
+        "the unreadable frame spent the getaddr exemption"
+    );
 
     let end = observed.disconnected().await;
     assert_eq!(reason(&end), DisconnectReason::PeerClosed);
