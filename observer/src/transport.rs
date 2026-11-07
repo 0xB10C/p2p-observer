@@ -37,15 +37,21 @@ pub trait TransportReader {
 /// read anyway. Bitcoin Core does the same: a message it cannot deserialize is
 /// logged and skipped.
 ///
-/// `None` when the command itself is not a command string. Then nothing about
-/// the frame can be trusted, and the session ends with a decode fault as
-/// before.
+/// `None` when the command itself is not a command string the decoder would
+/// have accepted. Then nothing about the frame can be trusted, and the session
+/// ends with a decode fault as before.
 fn undecodable(command: &[u8], payload: &[u8]) -> Option<NetworkMessage> {
-    let end = command
-        .iter()
-        .position(|b| *b == 0)
-        .unwrap_or(command.len());
-    let command = String::from_utf8(command[..end].to_vec()).ok()?;
+    // Read exactly as rust-bitcoin's decoder reads it: trim the NUL padding
+    // from the end rather than cutting at the first NUL, and require ASCII
+    // rather than UTF-8. Any other reading names a frame the decoder refused
+    // -- `ping` with a high byte after the padding is not a ping -- and that
+    // name is what the message is then counted under.
+    let end = command.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
+    let trimmed = &command[..end];
+    if !trimmed.is_ascii() {
+        return None;
+    }
+    let command = std::str::from_utf8(trimmed).ok()?.to_owned();
     let command = CommandString::try_from(command).ok()?;
     Some(NetworkMessage::Unknown {
         command,
@@ -595,6 +601,30 @@ mod tests {
         let err = reader.recv().await.unwrap_err();
         assert_eq!(fault_of(&err), Some(Fault::Decode));
         assert_eq!(reader.undecodable(), 0);
+    }
+
+    /// A command the decoder refuses is not handed up under a name read out
+    /// of part of it.
+    ///
+    /// The decoder trims a command from its last non-NUL byte and then
+    /// requires ASCII, so neither of these is a command: `ping` with a high
+    /// byte after the padding, and a name that is valid UTF-8 but not ASCII.
+    /// Truncating at the first NUL instead, and asking only for UTF-8, named
+    /// the first one `ping` and accepted the second -- a frame the decoder
+    /// refused came up under a legitimate command, was counted as one, and
+    /// was reported on the session as a message our parser is behind on. The
+    /// checksum guard does not catch it: the peer computes the checksum, and
+    /// the payload below is a perfectly good ping.
+    #[tokio::test]
+    async fn test_v1_a_command_the_decoder_refuses_is_not_named() {
+        for command in [b"ping\0\0\0\0\0\0\0\xff", b"\xc3\xa9ping\0\0\0\0\0\0"] {
+            let stream = frame(command, &7u64.to_le_bytes());
+            let mut reader = TransportV1Reader::new(&stream[..], Magic::REGTEST);
+
+            let err = reader.recv().await.unwrap_err();
+            assert_eq!(fault_of(&err), Some(Fault::Decode), "{command:?}");
+            assert_eq!(reader.undecodable(), 0, "{command:?}");
+        }
     }
 
     /// The v2 fallback names the command from the short id table or the
