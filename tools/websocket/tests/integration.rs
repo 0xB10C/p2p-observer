@@ -244,6 +244,91 @@ async fn test_status_updates_come_from_the_observer_rpc() {
     expect_silence(&mut events).await;
 }
 
+/// A network nothing is cached for is polled for, even when another network
+/// is cached.
+///
+/// The cache holds one status per network, so having something in it does not
+/// mean a subscribing client can be told about every observer out there. With
+/// two observers and one of them answering, a client that is handed only the
+/// cached half must still draw a poll for the other half, or it waits out the
+/// status interval -- which an operator may have set to an hour.
+#[tokio::test]
+async fn test_a_network_with_no_cached_status_is_polled_for() {
+    let Some(h) = Harness::start().await else {
+        eprintln!("skipping: NATS_SERVER_BINARY is not set");
+        return;
+    };
+
+    // Two observers: signet answers, and mainnet refuses, so nothing of
+    // mainnet is ever cached. Only the asking about mainnet is counted.
+    let asked = Arc::new(AtomicUsize::new(0));
+    let mut requests = h
+        .publisher
+        .subscribe("p2p-observer.*.rpc.connections.list")
+        .await
+        .unwrap();
+    let replier = h.publisher.clone();
+    let counted = Arc::clone(&asked);
+    let answering = tokio::spawn(async move {
+        while let Some(msg) = requests.next().await {
+            let signet = msg.subject.as_str().starts_with("p2p-observer.signet.");
+            if !signet {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }
+            let reply = if signet {
+                serde_json::json!({ "connected": 1, "dialing": 0, "connections": [] }).to_string()
+            } else {
+                r#"{"error":"not today"}"#.to_owned()
+            };
+            if let Some(reply_to) = msg.reply {
+                let _ = replier.publish(reply_to, reply.into()).await;
+            }
+        }
+    });
+
+    // Without --network the relay learns of an observer from its events, so
+    // one event of each has to arrive before there are two to poll.
+    let mut events = h.client(r#"{"handshakes":true}"#).await;
+    for network in ["signet", "mainnet"] {
+        h.publish(
+            network,
+            "handshake",
+            &event(1, "250.1.2.3:38333", handshake()),
+        )
+        .await;
+        next_json(&mut events, "handshake event").await;
+    }
+
+    // The first subscriber meets an empty cache, and fills signet's half of
+    // it. Mainnet's stays empty.
+    let mut first = h.client(r#"{"connection_status":true}"#).await;
+    let status = next_json(&mut first, "status update").await;
+    assert_eq!(status["status"]["network"], "signet");
+    let after_first = asked.load(Ordering::Relaxed);
+    assert!(after_first >= 1, "the relay never asked about mainnet");
+
+    // On-demand polls are at least two seconds apart, so wait the gap out:
+    // what is being tested is whether the next subscriber asks at all, not
+    // the rate limit.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let mut second = h.client(r#"{"connection_status":true}"#).await;
+    // It is handed the cached signet status at once, which is the cache
+    // doing its job.
+    let status = next_json(&mut second, "cached status update").await;
+    assert_eq!(status["status"]["network"], "signet");
+
+    let deadline = Instant::now() + WAIT;
+    while asked.load(Ordering::Relaxed) == after_first && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        asked.load(Ordering::Relaxed) > after_first,
+        "the cached signet status was answer enough, so mainnet was never asked about"
+    );
+    answering.abort();
+}
+
 #[tokio::test]
 async fn test_unsubscribed_kinds_are_not_sent() {
     let Some(h) = Harness::start().await else {
