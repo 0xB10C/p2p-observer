@@ -1028,12 +1028,20 @@ mod tests {
         server.abort();
     }
 
-    /// The attempt always reports back, so the manager can free the slot.
+    /// The attempt always reports back, so the manager can free the slot, and
+    /// it reports what actually happened.
+    ///
+    /// `counts_as_failure()` is no test of that: the `EndGuard` substitutes
+    /// `Failed(Reason::Other)` for an attempt that never called `finish`, so
+    /// a dropped `finish` or a `classify` that named the wrong reason both
+    /// satisfy it. The refused connect has one right answer on both sides of
+    /// the report -- the outcome the manager hears and the event the archive
+    /// keeps -- and this asks for it by name.
     #[tokio::test]
     async fn test_attempt_always_reports_an_outcome() {
         setup();
         // Nothing listening: the connection is refused immediately.
-        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
         let (handle, _g, mut life_rx, _c) = crate::addresses::channels();
         let addr = PeerAddr::Ipv4([127, 0, 0, 1], 1);
 
@@ -1050,10 +1058,26 @@ mod tests {
         match life_rx.try_recv().expect("no outcome reported") {
             crate::addresses::Lifecycle::Ended { addr: got, outcome } => {
                 assert_eq!(got, addr);
-                assert!(outcome.counts_as_failure());
+                assert_eq!(outcome, Outcome::Failed(Reason::ConnectionRefused));
             }
             other => panic!("unexpected message: {other:?}"),
         }
+
+        let event = event_rx.try_recv().expect("no event emitted");
+        let Some(common::events::peer_event::Event::ConnectionResult(result)) = event.event else {
+            panic!("expected a ConnectionResult, got: {:?}", event.event);
+        };
+        let Some(common::events::connection_result::Result::Failed(failed)) = result.result else {
+            panic!("expected Failed, got: {:?}", result.result);
+        };
+        assert_eq!(
+            failed.reason,
+            common::events::FailureReason::ConnectionRefused as i32
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "an attempt that never reached a session emits this and nothing else"
+        );
     }
 
     #[test]
