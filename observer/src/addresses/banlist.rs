@@ -205,19 +205,25 @@ impl Banlist {
         }
     }
 
-    /// Add an entry, skipping networks and hosts already covered. Returns how
-    /// many new ones were added.
+    /// Add an entry, skipping networks and hosts already banned -- by an
+    /// earlier entry or earlier in this one. Returns how many new ones were
+    /// added.
     pub fn add(&mut self, entry: BanEntry) -> usize {
-        let nets: Vec<IpNet> = entry
-            .nets
-            .into_iter()
-            .filter(|n| !self.entries.iter().any(|e| e.nets.contains(n)))
-            .collect();
-        let hosts: Vec<String> = entry
-            .hosts
-            .into_iter()
-            .filter(|h| !self.entries.iter().any(|e| e.hosts.contains(h)))
-            .collect();
+        // Checked against what this entry has collected so far as well as
+        // against the list: a repeat inside one entry is still a repeat, and
+        // storing it twice over-reports `len` for as long as the ban lives.
+        let mut nets: Vec<IpNet> = Vec::new();
+        for net in entry.nets {
+            if !nets.contains(&net) && !self.entries.iter().any(|e| e.nets.contains(&net)) {
+                nets.push(net);
+            }
+        }
+        let mut hosts: Vec<String> = Vec::new();
+        for host in entry.hosts {
+            if !hosts.contains(&host) && !self.entries.iter().any(|e| e.hosts.contains(&host)) {
+                hosts.push(host);
+            }
+        }
 
         let added = nets.len() + hosts.len();
         if added > 0 {
@@ -321,6 +327,11 @@ mod tests {
         // Partial overlap adds only what is new.
         assert_eq!(list.add(ban(&["10.0.0.0/8", "9.9.9.9/32"])), 1);
         assert_eq!(list.len(), 3);
+        // A duplicate inside one entry counts once too, or `len` over-reports
+        // the number of banned networks for as long as the list lives.
+        let mut list = Banlist::from_entries(vec![]);
+        assert_eq!(list.add(ban(&["10.0.0.0/8", "10.0.0.0/8"])), 1);
+        assert_eq!(list.len(), 1);
     }
 
     #[test]
