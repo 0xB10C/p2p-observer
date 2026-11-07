@@ -335,9 +335,6 @@ fn observe_pipeline(
         .observer_dropped_events
         .with_label_values(&[network])
         .set(event.dropped_events as i64);
-    if let Some(by_kind) = &event.dropped_by_kind {
-        observe_dropped_by_kind(network, by_kind, metrics);
-    }
 
     let net = state.network(network);
     match net.instance {
@@ -353,6 +350,12 @@ fn observe_pipeline(
         _ => {}
     }
     net.instance = Some(event.instance_id);
+
+    // After the restart reset, so the first event of a new run keeps the
+    // drops it reports instead of having them zeroed.
+    if let Some(by_kind) = &event.dropped_by_kind {
+        observe_dropped_by_kind(network, by_kind, metrics);
+    }
 }
 
 fn observe_dropped_by_kind(network: &str, dropped: &DroppedEvents, metrics: &Metrics) {
@@ -1381,11 +1384,24 @@ mod tests {
         );
         assert_eq!(counter(&m.observer_restarts_total, &[NET]), 0);
 
+        // The first event of a new run can already report drops of its
+        // own: the old run's counts go, the new run's stay.
         let mut second = event(1, 0, peer_event::Event::FeeFilter(FeeFilter::default()));
         second.instance_id = 8;
+        second.dropped_events = 3;
+        second.dropped_by_kind = Some(DroppedEvents {
+            ping_rtt: 3,
+            ..Default::default()
+        });
         observe(NET, &second, &m, &mut state, 0);
         assert_eq!(counter(&m.observer_restarts_total, &[NET]), 1);
-        assert_eq!(m.observer_dropped_events.with_label_values(&[NET]).get(), 0);
+        assert_eq!(m.observer_dropped_events.with_label_values(&[NET]).get(), 3);
+        assert_eq!(
+            m.observer_dropped_events_by_kind
+                .with_label_values(&[NET, "ping_rtt"])
+                .get(),
+            3
+        );
         assert_eq!(
             m.observer_dropped_events_by_kind
                 .with_label_values(&[NET, "address_announcement"])
