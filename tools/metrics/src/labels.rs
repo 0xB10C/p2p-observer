@@ -183,8 +183,12 @@ pub fn service_bits(services: u64) -> Vec<String> {
 
 /// The network of an address as the observer renders it: `1.2.3.4:8333`,
 /// `[2001:db8::1]:8333`, `<56 chars>.onion:8333`, `<52 chars>.b32.i2p:8333`,
-/// and CJDNS as an IPv6 address in fc00::/8.
+/// and `cjdns:[fc00::1]:8333`. A bare fc00::/8 address, which the observer
+/// does not print, still counts as CJDNS.
 pub fn address_net(addr: &str) -> &'static str {
+    // The observer prefixes CJDNS with its network name; the address
+    // behind it is an ordinary bracketed IPv6 in fc00::/8.
+    let addr = addr.strip_prefix("cjdns:").unwrap_or(addr);
     let Some((host, _port)) = addr.rsplit_once(':') else {
         return OTHER;
     };
@@ -287,9 +291,12 @@ mod tests {
     fn test_address_net() {
         assert_eq!(address_net("1.2.3.4:8333"), "ipv4");
         assert_eq!(address_net("[2001:db8::1]:8333"), "ipv6");
-        assert_eq!(address_net("[fc00::1]:8333"), "cjdns");
+        // As the observer renders a CJDNS peer.
+        assert_eq!(address_net("cjdns:[fc00::1]:8333"), "cjdns");
         assert_eq!(address_net("[fd00::1]:8333"), "ipv6");
         assert_eq!(address_net("2001:db8::1:8333"), "ipv6");
+        // Not the observer's rendering, but fc00::/8 is still CJDNS.
+        assert_eq!(address_net("[fc00::1]:8333"), "cjdns");
         assert_eq!(address_net("fc00::1:8333"), "cjdns");
         assert_eq!(
             address_net(&format!("{}.onion:8333", "a".repeat(56))),
