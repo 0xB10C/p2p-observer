@@ -1094,9 +1094,13 @@ mod tests {
         assert_eq!(blocks.first_seen("block0"), None);
         assert_eq!(blocks.first_seen("block1"), Some(1));
         assert_eq!(blocks.first_seen_ms.len(), RECENT_BLOCKS);
-        // A repeat sighting keeps the earlier time and does not grow the set.
+        // A repeat sighting keeps the earliest time, whichever side of the
+        // first sighting it falls on, and does not grow the set.
+        blocks.record("block1", 5);
+        assert_eq!(blocks.first_seen("block1"), Some(1));
         blocks.record("block1", 0);
         assert_eq!(blocks.first_seen("block1"), Some(0));
+        assert_eq!(blocks.first_seen_ms.len(), RECENT_BLOCKS);
         assert_eq!(blocks.order.len(), RECENT_BLOCKS);
     }
 
