@@ -72,7 +72,7 @@ pub(crate) fn prepare(max_dialing: usize) -> Result<(), String> {
     let floor = floor(max_dialing as u64);
     let (soft, hard) = current().map_err(|e| format!("cannot read the open file limit: {e}"))?;
 
-    let mut limit = match plan(soft, hard, floor) {
+    let asked = match plan(soft, hard, floor) {
         Plan::TooLow { hard, floor } => {
             return Err(format!(
                 "the open file limit allows at most {hard} descriptors, \
@@ -96,18 +96,15 @@ pub(crate) fn prepare(max_dialing: usize) -> Result<(), String> {
             }
         },
     };
-    if limit < floor {
-        return Err(format!(
-            "the open file limit is {limit} descriptors and {floor} are needed \
-             for {max_dialing} dials in flight plus {RESERVE} reserved"
-        ));
-    }
-
     // Re-read rather than trust the raise: the kernel is free to clamp, and a
-    // number we only believe is worse than no number at all here.
-    if let Ok((soft, _)) = current() {
-        limit = soft;
-    }
+    // number we only believe is worse than no number at all here -- the
+    // refusal below included, which is why the re-read feeds it.
+    let limit = granted(
+        asked,
+        current().ok().map(|(soft, _)| soft),
+        floor,
+        max_dialing,
+    )?;
     let headroom = limit.saturating_sub(floor);
     if limit == u64::MAX {
         tracing::info!(target: TARGET_MAIN,
@@ -121,6 +118,28 @@ pub(crate) fn prepare(max_dialing: usize) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// The limit we ended up with, or the refusal if it cannot cover the floor.
+///
+/// `asked` is what the raise aimed at and `reread` what the kernel reports
+/// afterwards; the decision is `reread`'s whenever we have it, because a
+/// kernel is free to clamp a raise -- macOS caps it at
+/// `kern.maxfilesperproc` -- and starting on a limit we only asked for is
+/// the failure this check exists to prevent.
+///
+/// A function of its arguments alone, so the clamp can be tested: no host
+/// this runs on will clamp a `setrlimit` on request.
+#[cfg(unix)]
+fn granted(asked: u64, reread: Option<u64>, floor: u64, max_dialing: usize) -> Result<u64, String> {
+    let limit = reread.unwrap_or(asked);
+    if limit < floor {
+        return Err(format!(
+            "the open file limit is {limit} descriptors and {floor} are needed \
+             for {max_dialing} dials in flight plus {RESERVE} reserved"
+        ));
+    }
+    Ok(limit)
 }
 
 /// Nothing to raise and nothing to check: a platform without the limit has no
@@ -219,6 +238,29 @@ mod tests {
                 floor: 264
             }
         );
+    }
+
+    /// The refusal is decided on the limit the kernel granted, not on the one
+    /// the raise asked for.
+    ///
+    /// A kernel may clamp a `setrlimit` rather than refuse it -- macOS caps
+    /// it at `kern.maxfilesperproc` -- and a clamp under the floor has to
+    /// refuse, not start with no headroom. No host this runs on clamps on
+    /// request, so what is pinned here is the decision `prepare` feeds its
+    /// re-read into rather than the syscall sequence.
+    #[cfg(unix)]
+    #[test]
+    fn test_the_granted_limit_decides_the_refusal() {
+        assert_eq!(granted(1_048_576, Some(4096), 264, 200), Ok(4096));
+        let err = granted(1_048_576, Some(100), 264, 200)
+            .expect_err("a raise clamped under the floor cannot be started on");
+        assert!(
+            err.contains("100"),
+            "{err}: names the limit we were granted"
+        );
+        assert!(err.contains("264"), "{err}: and the one we needed");
+        // Nothing to re-read: the number we asked for is all there is.
+        assert_eq!(granted(4096, None, 264, 200), Ok(4096));
     }
 
     /// `prepare` reads the real limit, raises it, and leaves the process able
