@@ -108,7 +108,15 @@ impl PeerAddr {
             }
             PeerAddr::TorV3(key, _) => key != &[0u8; 32],
             PeerAddr::I2p(hash, _) => hash != &[0u8; 32],
-            PeerAddr::Cjdns(b, _) => !Ipv6Addr::from(*b).is_unspecified(),
+            // The fc00::/8 prefix is what the variant claims. The same bytes
+            // outside it are an ordinary IPv6 address, which a plain
+            // `TcpStream::connect` reaches while the attempt is gated by the
+            // `cjdns` toggle and published as CJDNS; the prefix also
+            // excludes the unspecified address, so there is no separate
+            // check for that here. This is the one gate every address
+            // passes, gossiped or operator-supplied, which is why the check
+            // lives here rather than in `parse` and the addrv2 conversion.
+            PeerAddr::Cjdns(b, _) => Ipv6Addr::from(*b).octets()[0] == 0xfc,
         }
     }
 
@@ -385,6 +393,15 @@ mod tests {
         // CJDNS lives in fc00::/8, which the IPv6 arm rejects as unique-local.
         // Its own variant must not inherit that rejection.
         assert!(PeerAddr::parse("[fc00::1]:8333").unwrap().is_routable());
+        // The fc00::/8 prefix is what makes an address reachable over CJDNS,
+        // so an address outside it is not a CJDNS peer however it was
+        // tagged: dialling it would open an ordinary IPv6 connection and
+        // count, log and publish it as CJDNS.
+        let public = PeerAddr::parse("cjdns:[2001:db8::1]:8333").unwrap();
+        assert!(!public.is_routable());
+        // And the whole range is reachable, not only its first address.
+        let cjdns = PeerAddr::parse("cjdns:[fcff::1]:8333").unwrap();
+        assert!(cjdns.is_routable());
         assert!(!PeerAddr::TorV3([0u8; 32], 8333).is_routable());
         assert!(PeerAddr::TorV3([7u8; 32], 8333).is_routable());
     }
