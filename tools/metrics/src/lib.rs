@@ -1258,6 +1258,7 @@ mod tests {
             addresses: vec![
                 gossip("9.9.9.9:8333", 1, 900),
                 gossip("[2001:db8::1]:8333", 1 | 8, 1000),
+                gossip("cjdns:[fc00::1]:8333", 1, 1000),
                 gossip(&format!("{}.onion:8333", "a".repeat(56)), 0, 2000),
             ],
             solicited: true,
@@ -1272,13 +1273,14 @@ mod tests {
             0,
         );
         assert_eq!(counter(&m.address_announcements_total, &[NET, "addrv2"]), 1);
-        assert_eq!(histogram_sum(&m.address_announcement_entries, &[NET]), 5.0);
+        assert_eq!(histogram_sum(&m.address_announcement_entries, &[NET]), 6.0);
         assert_eq!(counter(&m.address_entries_total, &[NET, "ipv4"]), 1);
         assert_eq!(counter(&m.address_entries_total, &[NET, "ipv6"]), 1);
+        assert_eq!(counter(&m.address_entries_total, &[NET, "cjdns"]), 1);
         assert_eq!(counter(&m.address_entries_total, &[NET, "onion"]), 1);
         assert_eq!(
             counter(&m.address_entry_services_total, &[NET, "network"]),
-            2
+            3
         );
         assert_eq!(
             counter(&m.address_entry_services_total, &[NET, "witness"]),
@@ -1292,8 +1294,8 @@ mod tests {
             m.address_rate_limit_tokens.with_label_values(&[NET]).get(),
             3.5
         );
-        // Ages: 1000 - 900, 1000 - 1000, 1000 - 2000.
-        assert_eq!(histogram_count(&m.address_entry_age_seconds, &[NET]), 3);
+        // Ages: 1000 - 900, 1000 - 1000, 1000 - 1000, 1000 - 2000.
+        assert_eq!(histogram_count(&m.address_entry_age_seconds, &[NET]), 4);
         assert_eq!(histogram_sum(&m.address_entry_age_seconds, &[NET]), -900.0);
         assert_eq!(counter(&m.self_announcements_total, &[NET]), 0);
 
