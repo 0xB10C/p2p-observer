@@ -151,9 +151,9 @@ That is the observer's own `connections.list` reply (see
 autonomous system of each peer filled in exactly as on an event, so a field
 the observer adds later needs no change here. The tool keeps only the latest
 snapshot per network, to answer a client that subscribes between two polls at
-once rather than a minute later; subscribing when there is nothing cached asks
-for a poll straight away. Nothing is asked of an observer while no client is
-subscribed.
+once rather than a minute later; subscribing when nothing is cached for one of
+the networks known asks for a poll straight away. Nothing is asked of an
+observer while no client is subscribed.
 
 Which observers to ask comes from `--network`, or from the networks seen on
 the event stream when that is not given, so the first status update then waits
