@@ -474,7 +474,8 @@ async fn tor_connect(addr: &PeerAddr, cfg: &Config) -> Result<TcpStream> {
         .tor
         .proxy_addr
         .parse()
-        .context("invalid SOCKS5 proxy address")?;
+        .map_err(|e| anyhow::Error::new(e).context(Stage::ProxyAddrInvalid))
+        .with_context(|| format!("proxy_addr {:?}", cfg.networks.tor.proxy_addr))?;
 
     let target = addr.to_string();
     tracing::trace!(target: TARGET, %proxy, %target, "connecting via the Tor SOCKS5 proxy");
@@ -596,6 +597,9 @@ pub(crate) enum Stage {
     VersionHandshake,
     /// The Tor proxy is not answering at all.
     ProxyUnreachable,
+    /// The configured Tor proxy address is not a socket address, so there is
+    /// no proxy to reach.
+    ProxyAddrInvalid,
     /// This network is switched off in the config, or has no transport here.
     NetworkDisabled,
 }
@@ -610,6 +614,7 @@ impl std::fmt::Display for Stage {
             Stage::V2TransportHandshake => "BIP324 transport handshake failed",
             Stage::VersionHandshake => "version handshake failed",
             Stage::ProxyUnreachable => "Tor SOCKS5 proxy unreachable",
+            Stage::ProxyAddrInvalid => "configured Tor SOCKS5 proxy address is not an address",
             Stage::NetworkDisabled => "network disabled or unsupported",
         };
         f.write_str(s)
@@ -644,6 +649,12 @@ fn classify(err: &anyhow::Error, net: Net) -> Outcome {
     match stage_of(err) {
         Some(Stage::NetworkDisabled) => return Outcome::OurFault(OurFault::NetworkDisabled),
         Some(Stage::ProxyUnreachable) => return Outcome::OurFault(OurFault::ProxyUnreachable),
+        Some(Stage::ProxyAddrInvalid) => {
+            // A proxy address we cannot parse is a mistake in our config, and
+            // it fails every onion dial. Reported as an unreachable proxy
+            // because that is what it is from here: there is no proxy to try.
+            return Outcome::OurFault(OurFault::ProxyUnreachable);
+        }
         Some(Stage::TorProxyTimeout) => {
             // The onion service is only reachable through our proxy, so a
             // proxy that will not answer is our problem, not the peer's.
@@ -1486,7 +1497,28 @@ mod tests {
         assert!(format!("{err:#}").contains("Tor is disabled"));
     }
 
-    /// Minimal blocking executor for the one synchronous test above.
+    /// A proxy address we cannot parse is our configuration, not the onion
+    /// service's doing.
+    ///
+    /// One typo in `networks.tor.proxy_addr` fails every onion dial, and
+    /// counting those as failures would back off and eventually drop every
+    /// onion address in the book over a mistake of ours.
+    #[test]
+    fn test_an_unparseable_proxy_addr_is_our_fault() {
+        let mut cfg = test_config(mpsc::channel(1).0);
+        cfg.networks.tor.enabled = true;
+        cfg.networks.tor.proxy_addr = "not-an-address".to_owned();
+        let addr = PeerAddr::TorV3([7u8; 32], 8333);
+        let err =
+            futures_block_on(tor_connect(&addr, &cfg)).expect_err("the proxy address is not one");
+        assert_eq!(
+            classify(&err, Net::TorV3),
+            Outcome::OurFault(OurFault::ProxyUnreachable)
+        );
+        assert!(!classify(&err, Net::TorV3).counts_as_failure());
+    }
+
+    /// Minimal blocking executor for the synchronous tests above.
     fn futures_block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
