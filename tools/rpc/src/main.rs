@@ -114,7 +114,7 @@ enum Banlist {
         /// A CIDR network; a bare IP means /32 or /128. Repeatable
         #[arg(long = "net")]
         nets: Vec<String>,
-        /// An exact host, for Tor and I2P. Repeatable
+        /// An exact host with its port, for Tor and I2P. Repeatable
         #[arg(long = "host")]
         hosts: Vec<String>,
     },
