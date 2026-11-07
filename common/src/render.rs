@@ -934,13 +934,64 @@ mod tests {
     /// them -- which is how the handshake line came to overflow a subtraction
     /// on a version message carrying `i64::MIN`. One case of that was found by
     /// reading; this is the shape of test that finds the next one.
+    ///
+    /// Overflow is a panic only in a debug profile, so the line is also held
+    /// to its shape: whatever the fields were, it names the connection, says
+    /// which kind of event this is, and ends with when it happened.
     #[test]
     fn test_every_field_at_an_edge_still_renders() {
         for seed in 0..20_000u64 {
             let mut rng = Rng::new(seed);
             let event = edge_event(&mut rng);
             let line = event_line(&event);
-            assert!(!line.is_empty(), "seed {seed} rendered nothing");
+            match &event.event {
+                // Nothing to render but the envelope.
+                None => assert!(
+                    line.starts_with("unknown event from "),
+                    "seed {seed} rendered {line:?}"
+                ),
+                Some(inner) => {
+                    // The key that says which kind of event this is. Each one
+                    // is unique to the arm that prints it, so a line rendered
+                    // by the wrong arm does not carry it.
+                    let kind_key = match inner {
+                        peer_event::Event::Handshake(_) => " skew=",
+                        peer_event::Event::PingRtt(_) => " rtt=",
+                        peer_event::Event::BlockAnnouncement(_) => " type=",
+                        peer_event::Event::CompactBlockProbe(_) => " probe=",
+                        peer_event::Event::FeeFilter(_) => " feefilter=",
+                        peer_event::Event::SendCmpct(_) => " sendcmpct hb=",
+                        peer_event::Event::AddressAnnouncement(_) => " addresses=",
+                        peer_event::Event::ConnectionResult(_) => " result=",
+                    };
+                    assert!(
+                        line.starts_with(&format!("conn={} peer=", event.connection_id)),
+                        "seed {seed} rendered {line:?}"
+                    );
+                    assert!(
+                        line.contains(kind_key),
+                        "seed {seed} rendered no {kind_key:?} in {line:?}"
+                    );
+                    // When it happened closes the line, unless something was
+                    // lost -- then the count does.
+                    let ts = format!(" ts={}", event.timestamp_ms);
+                    if event.dropped_events == 0 {
+                        assert!(line.ends_with(&ts), "seed {seed} rendered {line:?}");
+                    } else {
+                        assert!(line.contains(&ts), "seed {seed} rendered {line:?}");
+                    }
+                }
+            }
+            // The loss count rides on every kind of line, and on no line that
+            // lost nothing.
+            if event.dropped_events > 0 {
+                assert!(
+                    line.contains(&format!(" dropped={}", event.dropped_events)),
+                    "seed {seed} rendered {line:?}"
+                );
+            } else {
+                assert!(!line.contains(" dropped="), "seed {seed} rendered {line:?}");
+            }
         }
     }
 
