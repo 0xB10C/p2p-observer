@@ -384,13 +384,35 @@ async fn test_an_address_handed_to_the_rpc_is_dialled_and_measured() {
     let Some(peer_event::Event::PingRtt(rtt)) = &found["ping_rtt"].event else {
         unreachable!()
     };
-    // A loopback round trip is fast but not instant in wall-clock terms; all
-    // this has to show is that the number was measured rather than defaulted.
+    // A sanity bound and nothing more: a loopback round trip is
+    // sub-millisecond, so a measured value and the `u64` default are the same
+    // number here and this cannot tell them apart. What it does catch is the
+    // nonce being reported as if it were a delta -- it is unix time, so the
+    // sample would land in the trillions.
     assert!(rtt.rtt_ms < 10_000, "implausible loopback rtt: {rtt:?}");
 
     // The session is live and the registry knows it, which is what the RPC
     // answers from -- no event says what is connected right now.
-    let conns = rpc(&client, "connections.list", "").await;
+    //
+    // This is also where the round trip being measured rather than defaulted
+    // shows: `rtt_ms` is null until a pong has been recorded against the ping
+    // that asked for it, and `updated_ms` is zero until the session refreshes
+    // the registry, which it does as it sends a ping -- so both become true
+    // within another ping interval, and neither can be reached by publishing
+    // a zero.
+    let conns = rpc_until(
+        &client,
+        "connections.list",
+        "",
+        "reported a measured round trip",
+        |conns| {
+            let Some(conn) = conns["connections"].as_array().and_then(|c| c.first()) else {
+                return false;
+            };
+            conn["rtt_ms"].is_number() && conn["updated_ms"].as_u64().unwrap_or(0) > 0
+        },
+    )
+    .await;
     let listed = conns["connections"]
         .as_array()
         .expect("connections is an array");
