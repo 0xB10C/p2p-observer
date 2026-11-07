@@ -135,6 +135,12 @@ Order of claim on a tick:
 
 Skipped: anything active, banned, on a disabled network, or not yet due.
 
+All three claims are bounded by the room left under `max_dialing`: being
+outside the dial budget is an exemption from the per-tick rate, not from the
+in-flight ceiling, because a reconnect costs the same socket and task as any
+other dial. A tick with no room starts nothing at all, and when less room is
+left than there is work due, the order above decides who goes.
+
 ### Why reconnects need a cap
 
 The design notes took *all* due reconnects, which is unbounded. After any

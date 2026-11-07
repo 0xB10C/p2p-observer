@@ -61,7 +61,7 @@ fn main() {
         let mut book = filled(n);
         let len = book.len();
         bench(&format!("pick(10) over {len} entries"), 9, || {
-            book.pick(NOW + 100, 10, &nets, &banlist)
+            book.pick(NOW + 100, 10, 10, &nets, &banlist)
         });
     }
 
@@ -80,7 +80,7 @@ fn main() {
         bench(
             &format!("pick(10) over {len} entries, a tenth of them due"),
             9,
-            || book.pick(NOW + 100, 10, &nets, &banlist),
+            || book.pick(NOW + 100, 10, 10, &nets, &banlist),
         );
     }
 

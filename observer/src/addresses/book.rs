@@ -624,20 +624,26 @@ impl Book {
 
     /// Choose addresses to dial.
     ///
-    /// One pass over the book. Due reconnects to good addresses are taken
-    /// first, outside `budget` but capped by MAX_RECONNECTS_PER_TICK; the
-    /// remaining classes share `budget` by weight, with fractional shares
-    /// carried between ticks as credit. Picked addresses are marked Dialing
-    /// here, so the same address cannot be handed out twice.
+    /// One pass over the book. `room` is the hard cap: however many dials may
+    /// still be in flight, and no class is exempt from it. `budget` is the
+    /// per-tick rate, and only the three budgeted classes go through it --
+    /// manual addresses and due reconnects to good addresses are taken
+    /// outside it (reconnects capped by MAX_RECONNECTS_PER_TICK), in that
+    /// order of claim on `room`. The budgeted classes share what `budget`
+    /// and `room` leave by weight, with fractional shares carried between
+    /// ticks as credit. Picked addresses are marked Dialing here, so the same
+    /// address cannot be handed out twice.
     pub fn pick(
         &mut self,
         now: u32,
         budget: usize,
+        room: usize,
         nets: &EnabledNets,
         banlist: &Banlist,
     ) -> Vec<Dial> {
-        let mut manual = Reservoir::new(budget);
-        let mut reconnect = Reservoir::new(policy::MAX_RECONNECTS_PER_TICK);
+        debug_assert!(budget <= room, "the dial rate cannot exceed the room");
+        let mut manual = Reservoir::new(room);
+        let mut reconnect = Reservoir::new(policy::MAX_RECONNECTS_PER_TICK.min(room));
         let mut by_class = [
             Reservoir::new(budget),
             Reservoir::new(budget),
@@ -680,14 +686,21 @@ impl Book {
             by_class[CLASS_WAS_GOOD].items.len(),
             by_class[CLASS_BAD].items.len(),
         ];
-        let take = self.allocate(budget, available);
+        // Whatever manual and reconnects claimed comes off the budget before
+        // it is split, so no class is charged credit for a dial that the
+        // ceiling then drops.
+        let claimed = manual.items.len() + reconnect.items.len();
+        let take = self.allocate(budget.min(room.saturating_sub(claimed)), available);
 
-        let mut out = Vec::with_capacity(budget + reconnect.items.len() + manual.items.len());
+        let mut out = Vec::with_capacity(budget + claimed);
         out.extend(manual.items);
         out.extend(reconnect.items);
         for (i, res) in by_class.into_iter().enumerate() {
             out.extend(res.items.into_iter().take(take[i]));
         }
+        // The ceiling is a ceiling: priority order decides who fits under it
+        // when more is due than there is room for.
+        out.truncate(room);
 
         for dial in &out {
             self.record_dialing(dial.addr, now);
@@ -817,7 +830,7 @@ mod tests {
         insert(&mut t, addr, Class::Unknown);
 
         // First pick hands it out and marks it active.
-        let first = t.pick(NOW, 10, &EnabledNets::all(), &bl);
+        let first = t.pick(NOW, 10, 10, &EnabledNets::all(), &bl);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].addr, addr);
 
@@ -826,7 +839,7 @@ mod tests {
         for tick in 0..5 {
             release_all(&mut t);
             t.active.insert(addr, Phase::Dialing);
-            let again = t.pick(NOW + tick, 10, &EnabledNets::all(), &bl);
+            let again = t.pick(NOW + tick, 10, 10, &EnabledNets::all(), &bl);
             assert!(
                 again.is_empty(),
                 "active address picked again on tick {tick}"
@@ -836,7 +849,7 @@ mod tests {
         // Once the attempt ends it becomes eligible again.
         t.record_ended(addr, NOW, Outcome::OurFault(OurFault::NetworkUnreachable));
         release_all(&mut t);
-        assert_eq!(t.pick(NOW, 10, &EnabledNets::all(), &bl).len(), 1);
+        assert_eq!(t.pick(NOW, 10, 10, &EnabledNets::all(), &bl).len(), 1);
     }
 
     #[test]
@@ -851,7 +864,7 @@ mod tests {
             hosts: Vec::new(),
         }]);
 
-        let picked = t.pick(NOW, 10, &EnabledNets::all(), &bl);
+        let picked = t.pick(NOW, 10, 10, &EnabledNets::all(), &bl);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].addr, ip(1, 2, 3, 4));
     }
@@ -869,7 +882,7 @@ mod tests {
             cjdns: false,
             i2p: false,
         };
-        let picked = t.pick(NOW, 10, &nets, &empty_banlist());
+        let picked = t.pick(NOW, 10, 10, &nets, &empty_banlist());
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].addr.net(), Net::Ipv4);
     }
@@ -882,11 +895,11 @@ mod tests {
         t.entries.get_mut(&addr).unwrap().next_attempt = NOW + 100;
 
         assert!(
-            t.pick(NOW, 10, &EnabledNets::all(), &empty_banlist())
+            t.pick(NOW, 10, 10, &EnabledNets::all(), &empty_banlist())
                 .is_empty()
         );
         assert_eq!(
-            t.pick(NOW + 100, 10, &EnabledNets::all(), &empty_banlist())
+            t.pick(NOW + 100, 10, 10, &EnabledNets::all(), &empty_banlist())
                 .len(),
             1
         );
@@ -1428,8 +1441,9 @@ mod tests {
         }
 
         // A budget of 2 still gets the manual address and the due reconnects
-        // on top, because staying connected is the point.
-        let picked = t.pick(NOW, 2, &EnabledNets::all(), &bl);
+        // on top, because staying connected is the point. Room for a hundred
+        // dials, so the ceiling is not what is being measured here.
+        let picked = t.pick(NOW, 2, 100, &EnabledNets::all(), &bl);
         assert!(picked.len() > 2, "reconnects were squeezed into the budget");
         assert!(picked.iter().any(|d| d.addr == ip(9, 9, 9, 9)));
         let goods = picked
@@ -1457,7 +1471,9 @@ mod tests {
             insert(&mut t, addr, Class::Good);
         }
 
-        let picked = t.pick(NOW + 30 * DAY, 1, &EnabledNets::all(), &bl);
+        // Room for a thousand, so MAX_RECONNECTS_PER_TICK is what has to stop
+        // the burst rather than the in-flight ceiling.
+        let picked = t.pick(NOW + 30 * DAY, 1, 1000, &EnabledNets::all(), &bl);
         assert!(
             picked.len() <= policy::MAX_RECONNECTS_PER_TICK + 1,
             "unbounded reconnect burst: {} dials in one tick",
@@ -1481,7 +1497,7 @@ mod tests {
         // One dial per tick: the case a per-batch percentage cannot express.
         for _ in 0..1000 {
             release_all(&mut t);
-            for dial in t.pick(NOW, 1, &EnabledNets::all(), &bl) {
+            for dial in t.pick(NOW, 1, 1, &EnabledNets::all(), &bl) {
                 match dial.addr {
                     PeerAddr::Ipv4([10, 0, ..], _) => counts[CLASS_UNKNOWN] += 1,
                     PeerAddr::Ipv4([10, 1, ..], _) => counts[CLASS_WAS_GOOD] += 1,
@@ -1519,7 +1535,7 @@ mod tests {
         }
         for _ in 0..20 {
             release_all(&mut t);
-            assert_eq!(t.pick(NOW, 10, &EnabledNets::all(), &bl).len(), 10);
+            assert_eq!(t.pick(NOW, 10, 10, &EnabledNets::all(), &bl).len(), 10);
         }
     }
 
@@ -1531,7 +1547,7 @@ mod tests {
             insert(&mut t, ip(10, 0, 0, i), Class::Unknown);
         }
 
-        let picked = t.pick(NOW, 7, &EnabledNets::all(), &bl);
+        let picked = t.pick(NOW, 7, 7, &EnabledNets::all(), &bl);
         assert_eq!(picked.len(), 7);
         // Being dialled is not a result: these are still unknown until one
         // arrives, which is also what keeps the class weights honest.
@@ -1546,14 +1562,32 @@ mod tests {
         }
     }
 
+    /// Zero is zero for every class, not only for the budgeted ones: manual
+    /// addresses and due reconnects are outside the per-tick rate, not
+    /// outside the in-flight ceiling.
     #[test]
     fn test_empty_table_and_zero_budget_are_fine() {
         let mut t = Book::new(100, 1);
         let bl = empty_banlist();
-        assert!(t.pick(NOW, 10, &EnabledNets::all(), &bl).is_empty());
+        assert!(t.pick(NOW, 10, 10, &EnabledNets::all(), &bl).is_empty());
 
         insert(&mut t, ip(1, 2, 3, 4), Class::Unknown);
-        assert!(t.pick(NOW, 0, &EnabledNets::all(), &bl).is_empty());
+        insert(&mut t, ip(1, 2, 3, 5), Class::WasGood);
+        insert(&mut t, ip(1, 2, 3, 6), Class::Bad);
+        insert(&mut t, ip(1, 2, 3, 7), Class::Good);
+        t.insert_manual(NOW, &[ip(9, 9, 9, 9)]);
+
+        // No room: nothing goes out, whatever its claim on the tick.
+        assert!(t.pick(NOW, 0, 0, &EnabledNets::all(), &bl).is_empty());
+        assert_eq!(t.dialing_count(), 0);
+
+        // Room but no rate -- what a tick at a dial rate of zero looks like.
+        // The budgeted classes wait; the manual address and the due reconnect
+        // go out, in that order.
+        let picked = t.pick(NOW, 0, 10, &EnabledNets::all(), &bl);
+        assert_eq!(picked.len(), 2, "picked: {picked:?}");
+        assert_eq!(picked[0].addr, ip(9, 9, 9, 9));
+        assert_eq!(picked[1].addr, ip(1, 2, 3, 7));
     }
 
     #[test]
