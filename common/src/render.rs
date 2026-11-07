@@ -1020,24 +1020,52 @@ mod tests {
     ///
     /// Most are refused by the decoder; protobuf is permissive enough that
     /// plenty are not, and those carry whatever the encoding allowed.
+    ///
+    /// Pure noise that decodes is almost always the empty message, which says
+    /// nothing about the branches that render an actual event. So half of
+    /// these start as a real encoding with a few bits flipped: a mutation
+    /// mostly still decodes, and what comes back has a kind.
     #[test]
     fn test_arbitrary_bytes_that_decode_as_an_event_render() {
-        let mut rng = Rng::new(99);
-        let mut decoded = 0;
-        for _ in 0..20_000 {
-            let len = rng.below(64);
-            let bytes = rng.bytes(len);
-            if let Ok(event) = PeerEvent::decode(&bytes[..]) {
-                decoded += 1;
-                assert!(!event_line(&event).is_empty());
+        let mut with_event = 0;
+        for seed in 0..20_000u64 {
+            let mut rng = Rng::new(seed);
+            let bytes = if rng.one_in(2) {
+                let len = rng.below(64);
+                rng.bytes(len)
+            } else {
+                let mut bytes = edge_event(&mut rng).encode_to_vec();
+                if !bytes.is_empty() {
+                    for _ in 0..=rng.below(3) {
+                        let at = rng.below(bytes.len());
+                        bytes[at] ^= 1 << rng.below(8);
+                    }
+                }
+                bytes
+            };
+            let Ok(event) = PeerEvent::decode(&bytes[..]) else {
+                continue;
+            };
+            let line = event_line(&event);
+            if event.event.is_some() {
+                with_event += 1;
+                assert!(
+                    line.starts_with(&format!("conn={} peer=", event.connection_id)),
+                    "seed {seed} rendered {line:?}"
+                );
+            } else {
+                assert!(
+                    line.starts_with("unknown event from "),
+                    "seed {seed} rendered {line:?}"
+                );
             }
         }
-        // Or the assertion above is about nothing. Most random bytes are not a
-        // protobuf message; a couple of hundred that are is plenty to be
-        // rendering something.
+        // Or the assertions above are about the empty message, whose envelope
+        // line is already pinned above. What this test is for is a kind of
+        // event assembled by something other than the observer.
         assert!(
-            decoded > 200,
-            "only {decoded} of 20000 inputs decoded as an event"
+            with_event > 2_000,
+            "only {with_event} of 20000 inputs decoded as an event with a kind"
         );
     }
 }
