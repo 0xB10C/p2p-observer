@@ -21,7 +21,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::anyhow::{Context, Result};
 use common::clap::Parser;
@@ -179,9 +179,46 @@ impl State {
     }
 }
 
+/// How long the readiness probe below waits for the server to answer.
+///
+/// Generous, because it is a loopback round trip and the only cost of waiting
+/// is a slower start; a server that does not answer at all is a failure worth
+/// reporting rather than sitting in forever.
+const READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Waits until the server has registered what this client has subscribed to,
+/// so that nothing published from here on can be missed.
+///
+/// `Client::flush` does not do that. It empties this client's write buffer and
+/// returns, and the server reads each connection on its own, so a publisher on
+/// another connection can still be served first -- and core NATS has no
+/// replay, so what it sent is gone. A message to ourselves settles it: a
+/// single connection's commands are handled in order, so by the time the echo
+/// comes back the subscription sent before it is registered.
+async fn await_subscription(nats: &async_nats::Client) -> Result<()> {
+    let inbox = nats.new_inbox();
+    let mut echo = nats
+        .subscribe(inbox.clone())
+        .await
+        .with_context(|| format!("subscribing to {inbox}"))?;
+    nats.publish(inbox, Vec::<u8>::new().into())
+        .await
+        .context("publishing the readiness probe")?;
+    nats.flush().await.context("flushing the readiness probe")?;
+    match tokio::time::timeout(READY_TIMEOUT, echo.next()).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(common::anyhow::anyhow!(
+            "the readiness probe's own subscription ended"
+        )),
+        Err(_) => Err(common::anyhow::anyhow!(
+            "NATS did not answer the readiness probe within {READY_TIMEOUT:?}"
+        )),
+    }
+}
+
 /// Runs the tool until `shutdown` turns true. `bound_addr` receives the
 /// address the HTTP server listens on, for tests that bind port 0, once the
-/// tool is ready: the listener is up and the event subscription exists.
+/// tool is ready: the listener is up and the server has the subscription.
 pub async fn run(
     args: Args,
     mut shutdown: watch::Receiver<bool>,
@@ -207,10 +244,10 @@ pub async fn run(
         .subscribe(subject.clone())
         .await
         .with_context(|| format!("subscribing to {subject}"))?;
-    nats.flush().await.context("flushing the subscription")?;
+    await_subscription(&nats).await?;
     tracing::info!(target: TARGET, url = %args.nats_url, subject, "connected to NATS");
-    // Core NATS has no replay, so a publish that lands before the
-    // subscription exists is lost: the address only goes out once it does.
+    // Core NATS has no replay, so a publish that lands before the server has
+    // the subscription is lost: the address only goes out once it has it.
     if let Some(tx) = bound_addr {
         let _ = tx.send(addr);
     }

@@ -429,3 +429,37 @@ async fn test_network_filter() {
         &[("network", "mainnet"), ("kind", "fee_filter")]
     )));
 }
+
+/// An event published the moment the tool reports ready is counted.
+///
+/// The window this closes is microseconds wide: the subscription is already
+/// on the wire, it is the server that has not read it yet, and it reads the
+/// publisher's connection in its own time. So one round proves little, and
+/// this takes ten: against a readiness signal that only flushed the client's
+/// write buffer, an event is lost in most runs.
+#[tokio::test]
+async fn test_an_event_published_at_readiness_is_not_lost() {
+    for round in 0..10 {
+        let Some(h) = Harness::start(Some("signet")).await else {
+            eprintln!("NATS_SERVER_BINARY not set, skipping");
+            return;
+        };
+        h.publish(
+            "signet",
+            "fee_filter",
+            &event(1, 0, peer_event::Event::FeeFilter(FeeFilter::default())),
+        )
+        .await;
+        let m = h
+            .scrape_until(&sample(
+                "p2pobserver_fee_filters_total",
+                &[("network", "signet")],
+            ))
+            .await;
+        assert_eq!(
+            m[&sample("p2pobserver_fee_filters_total", &[("network", "signet")])],
+            1.0,
+            "round {round}"
+        );
+    }
+}
