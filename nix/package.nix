@@ -37,7 +37,7 @@ rustPlatform.buildRustPackage {
   # from the rust-bitcoin git revision that bip324 pins. That pair is also why
   # the flake needs a nixpkgs with the fixed vendor layout -- on nixos-25.11
   # the fetcher collides on the directory name and the build never starts.
-  cargoHash = "sha256-G7gHTc5SrJeOcTbT3aQaPVyO38EN5qTbElC1wFTg8CU=";
+  cargoHash = "sha256-tjXJFwdpyfLkYzsqfJOeONsnB3cMs816LVI9YCSYamU=";
 
   # protoc for prost-build in common/build.rs
   nativeBuildInputs = [ protobuf ];
